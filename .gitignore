@@ -1,0 +1,15 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Agent scratch space (prompt-free capture dir; see the Task Packet contract)
+/.tmp/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local agent overrides
+.claude/settings.local.json

@@ -1,0 +1,20 @@
+{
+  "name": "superpowers",
+  "description": "Repo-vendored Superpowers skills library: brainstorming, implementation planning, TDD, systematic debugging, parallel execution, and code-review workflows. Forked from obra/superpowers v6.0.3 with local edits; Claude auto-discovers skills/ and hooks/hooks.json from this plugin root.",
+  "version": "6.0.3-gh-pr-tracker",
+  "author": {
+    "name": "Jesse Vincent (upstream), gh-pr-tracker (local edits)",
+    "email": "jesse@fsck.com"
+  },
+  "homepage": "https://github.com/obra/superpowers",
+  "repository": "https://github.com/obra/superpowers",
+  "license": "MIT",
+  "keywords": [
+    "skills",
+    "tdd",
+    "debugging",
+    "planning",
+    "collaboration",
+    "workflows"
+  ]
+}

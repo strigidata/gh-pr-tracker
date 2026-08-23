@@ -1,0 +1,23 @@
+{
+  "name": "superpowers",
+  "version": "6.0.3-gh-pr-tracker",
+  "description": "Repo-vendored Superpowers skills for Codex: planning, TDD, debugging, and collaboration workflows. Forked from obra/superpowers v6.0.3 with local edits.",
+  "author": {
+    "name": "Jesse Vincent (upstream), gh-pr-tracker (local edits)",
+    "email": "jesse@fsck.com",
+    "url": "https://github.com/obra"
+  },
+  "homepage": "https://github.com/obra/superpowers",
+  "repository": "https://github.com/obra/superpowers",
+  "license": "MIT",
+  "keywords": [
+    "skills",
+    "planning",
+    "tdd",
+    "debugging",
+    "code-review",
+    "workflow"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks-codex.json"
+}

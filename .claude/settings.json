@@ -1,0 +1,51 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill",
+      "WebFetch",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo doc:*)",
+      "Bash(cargo tree:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git worktree list:*)",
+      "Bash(git merge-base:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh run view:*)",
+      "Bash(gh api:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/rust-type-design-reminder.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "extraKnownMarketplaces": {
+    "gh-pr-tracker-local": {
+      "source": {
+        "source": "directory",
+        "path": "./.agents/plugins"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "superpowers@gh-pr-tracker-local": true
+  }
+}

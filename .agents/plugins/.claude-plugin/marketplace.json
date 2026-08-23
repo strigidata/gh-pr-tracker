@@ -1,0 +1,15 @@
+{
+  "name": "gh-pr-tracker-local",
+  "description": "In-repo plugins, vendored and team-edited, distributed through the committed repo so every clone and worktree gets the same versions.",
+  "owner": {
+    "name": "gh-pr-tracker"
+  },
+  "plugins": [
+    {
+      "name": "superpowers",
+      "source": "./superpowers",
+      "description": "Vendored Superpowers skills: planning, TDD, systematic debugging, and collaboration workflows. Forked from obra/superpowers v6.0.3 with local edits.",
+      "version": "6.0.3-gh-pr-tracker"
+    }
+  ]
+}

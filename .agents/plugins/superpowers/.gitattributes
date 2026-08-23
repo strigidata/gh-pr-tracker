@@ -1,0 +1,6 @@
+# Hook scripts are executed by bash; the .cmd wrapper is a polyglot parsed by
+# both cmd.exe and bash. They must keep LF line endings regardless of the user's
+# core.autocrlf, or the bash portion breaks.
+hooks/session-start text eol=lf
+hooks/session-start-codex text eol=lf
+hooks/run-hook.cmd text eol=lf

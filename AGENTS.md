@@ -1,0 +1,188 @@
+# AGENTS.md
+
+Project instructions for AI coding agents (Claude Code, Codex, OpenCode, Cursor, etc.).
+`CLAUDE.md` symlinks here.
+
+## Project overview
+
+`gh-pr-tracker` is a Rust console tool that monitors the state of GitHub pull
+requests and renders a live-updating table.
+
+It ships in two layers, and the split is load-bearing:
+
+- **A library crate** — fetches, models, and reduces PR state. It owns the
+  GitHub client, the domain types, and the polling logic. It knows nothing
+  about terminals. A future Mac/Linux GUI is a first-class consumer of this
+  crate, so its public API is a real contract with a caller that does not exist
+  yet and cannot be refactored alongside you.
+- **A CLI binary** — argument parsing, config resolution, terminal rendering,
+  and process lifecycle.
+
+Anything that assumes a terminal, an ANSI code, or a TTY belongs in the binary.
+If the library needs it, the abstraction is wrong.
+
+## Core tenets
+
+1. **Correctness of displayed state.** The table is the product. A wrong cell is
+   worse than a missing one, and a stale cell that looks fresh is worse than
+   both. Failure must always be distinguishable from an empty result.
+2. **Illegal states are unrepresentable.** Prefer a type that cannot express a
+   wrong value over a runtime check that rejects one. Rust's newtypes, enums,
+   and typestate all compile away, so this costs nothing at runtime.
+3. **We reuse existing patterns and make code reusable.** Smaller functions,
+   smaller modules, one owner per concept.
+4. **Clean code, DDD, and TDD.** A behavior change starts with a failing test.
+5. **Respect the user's rate limit and their terminal.** Conditional requests
+   and backoff are not optimizations; they are correctness. A crash must restore
+   the terminal.
+
+## Skills location
+
+- Canonical project skills live in `.agents/skills`.
+- `.claude/skills` and `.codex/skills` are symlinks to `../.agents/skills`, so
+  every host discovers the same skills.
+- Add or update project skills only in `.agents/skills` to avoid drift.
+
+### Superpowers workflows are a repo-vendored LOCAL plugin (not global)
+
+- The `superpowers:*` workflow skills (`brainstorming`, `writing-plans`,
+  `subagent-driven-development`, `test-driven-development`, `executing-plans`,
+  `systematic-debugging`, `requesting-code-review`,
+  `finishing-a-development-branch`, etc.) come from the **repo-tracked**
+  vendored plugin at `.agents/plugins/superpowers/` (forked from
+  obra/superpowers v6.0.3, MIT, with local edits), registered as
+  `superpowers@gh-pr-tracker-local` via the `gh-pr-tracker-local` marketplace
+  in `.claude/settings.json`.
+- `.agents/skills/superpowers` is a **symlink** into that plugin's `skills/`,
+  so there is a single source with no copy that can drift. Edit the real files
+  under `.agents/plugins/superpowers/skills/<name>/`.
+- Invoking `superpowers:<name>` loads this **local, canonical** content. Do not
+  treat the `superpowers:` prefix as "global".
+
+## Project skills
+
+| Skill | Use for |
+| --- | --- |
+| `rust-best-practices` | Canonical Rust rules. Load before writing or reviewing any `.rs` file. |
+| `code-review` | The multi-agent review gate. Run before `/verify`. |
+| `verify` | The full verification suite. Definition of done before pushing. |
+| `merge-main-and-verify` | Merging `origin/main` into a standalone branch. |
+| `github-stacked-pr` | Native stacked PRs. The only place a rebase is allowed. |
+| `fix-comments` | Fetch, fix, and reply to PR review comments. |
+| `skill-creator` | Authoring or editing any skill under `.agents/skills`. |
+
+Routing between the two branch workflows is exclusive:
+
+```text
+Standalone branch:                merge-main-and-verify
+Confirmed native stack:           github-stacked-pr
+```
+
+## NEVER SKIP: Definition of Done
+
+A change is done only when the PR head commit has green CI and no unresolved
+review comments. Pushing is one step in the loop, not the end of it.
+
+1. Behavior change → failing test first.
+2. `/code-review` — the soft gate. Triage findings against the authorized scope.
+3. `/verify` — format, clippy, build, tests, docs, and a real CLI smoke run.
+4. Push, then watch CI: `gh pr checks <pr> --watch`.
+5. `/fix-comments` for review feedback, then back to step 3.
+
+`origin/main` is the stable baseline. If a gate surfaces a problem outside the
+branch's authorized scope, do not silently fix it from the feature branch.
+Report the concrete failure, explain why it appears unrelated, propose the
+smallest fix or carve-out, and get explicit authorization.
+
+## Working style
+
+- **Branch responsibility.** You own the full scope of changes already in the
+  branch and any failure they cause. You do not own unrelated `origin/main`
+  behavior. Report, propose, get authorization — then fix.
+- **Verify before asserting.** Never claim a test, CI, or code state ("passed",
+  "pre-existing", "already fixed") from memory. Re-run the exact command or
+  re-read the source and cite the evidence.
+- **Surgical scope.** Make the smallest change that satisfies the request. No
+  speculative features, abstractions, or refactors beyond the task. Clean up
+  only what your change touched.
+- **Illegal states, and how far to chase them.** New and rewritten types must
+  make illegal states unrepresentable — not negotiable, no permission needed.
+  For existing types the rule binds on **blast radius**, not on "the diff
+  touched this file": fix a type your change constructs, or whose invariant your
+  change depends on. A type you merely read stays as it is. When the fix would
+  exceed roughly 10 files, stop and hand over a refactor: propose a branch,
+  name the invariant being closed, and paste the call-site list the compiler
+  produced. Do not file it as an issue — deferred type debt filed as an issue
+  does not get done.
+- **Aggressive DRY.** Before writing code, ask how the codebase already does
+  this. Reuse it or extract a shared helper. This applies to types: reuse an
+  existing type rather than adding a parallel one that exists only to be mapped
+  into another shape.
+- **No legacy without callers.** Do not leave `#[deprecated]` or dead code with
+  no usages. Remove it, but confirm with `AskUserQuestion` first.
+- **Mocking is a last resort.** Prefer extracting a pure function. Never mock a
+  type this project owns.
+- **Do not blindly agree.** If you disagree, say so via `AskUserQuestion`. Do
+  not make decisions on the user's behalf when they have not responded.
+- **Branch discipline.** Never commit directly to `main`. Use a feature branch
+  or worktree and open a PR.
+
+## Code standards
+
+### Writing code
+
+Before writing or refactoring Rust, load `rust-best-practices`. It is the
+canonical rule set (unwrap, panics, error types, borrowing, `pub` surface,
+rustdoc, async discipline, function size) with worked examples. It is not
+restated here.
+
+**Governing principle: make illegal states unrepresentable.** See the
+`Illegal States` rule category for newtypes, smart constructors, sum types, and
+typestate.
+
+Project-specific rules not covered by that skill:
+
+- Never add `#[allow(clippy::...)]` to silence a warning. Fix the code, or raise
+  the lint-level question as a config change. The one carve-out is generated
+  code, which must carry a comment saying so.
+- Never disable a lint or add `#[allow(dead_code)]` without user confirmation.
+- Use constants over magic numbers. Check for an existing constant first.
+- Extract shared types to a `types.rs` in the owning module.
+- A GitHub API enum is never a bare `String`, and never gets a `_ =>` arm
+  without an explicit `Unknown(String)` variant. GitHub adds values.
+
+### Paths and structure
+
+- Crates live under `crates/`. The library and the binary are separate crates.
+- Nothing terminal-related may be reachable from the library crate's public API.
+- Docs live under `docs/`. Scripts live under `scripts/`. Do not create new
+  top-level directories without saying why.
+- `Cargo.lock` is committed. Every CI and verification command passes
+  `--locked`.
+
+### Errors
+
+- Library: a `thiserror` enum, `#[non_exhaustive]`, with `#[source]` preserved.
+- Binary: `anyhow` at the top level, with a readable error chain on stderr.
+- No error `Display` text may contain a token, a URL with credentials, or an
+  absolute path from a developer's machine.
+
+### Output discipline
+
+- Human-facing chatter and diagnostics go to **stderr**. Stdout is the data
+  channel.
+- Honor `NO_COLOR`, `CLICOLOR=0`, and a `--color` flag. Never emit ANSI codes
+  when stdout is not a TTY.
+- Never launch the interactive table when stdin/stdout is not a TTY. Fall back
+  to a one-shot render.
+- Exit codes are a contract. Distinguish at minimum: success, no results, usage
+  error, auth failure, network/API failure.
+
+### Testing
+
+- Unit tests in `#[cfg(test)] mod tests` at the bottom of the file under test.
+  Integration tests in `tests/`.
+- No network access in tests. Use a recorded fixture or a local test server.
+- No real sleeps to wait for a condition in async tests. Use a controlled clock.
+- Table-driven over copy-paste once there are three similar cases.
+- A regression test that never went red proves nothing.
