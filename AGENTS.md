@@ -5,34 +5,50 @@ Project instructions for AI coding agents (Claude Code, Codex, OpenCode, Cursor,
 
 ## Project overview
 
-`gh-pr-tracker` is a Rust console tool that monitors the state of GitHub pull
-requests and renders a live-updating table.
+`gh-pr-tracker` watches GitHub pull requests and interrupts a developer at the
+moment they are blocking their team — or being blocked by their own finished
+work.
 
-It ships in two layers, and the split is load-bearing:
+Current state: **pre-implementation.** The approved design and the
+validation-first plan live in
+[`docs/plans/2026-08-23-pr-nudge-validation-design.md`](docs/plans/2026-08-23-pr-nudge-validation-design.md).
+Read it before writing code. The first deliverable is a batch PR-latency audit
+tool, not the watcher.
 
-- **A library crate** — fetches, models, and reduces PR state. It owns the
-  GitHub client, the domain types, and the polling logic. It knows nothing
-  about terminals. A future Mac/Linux GUI is a first-class consumer of this
-  crate, so its public API is a real contract with a caller that does not exist
-  yet and cannot be refactored alongside you.
-- **A CLI binary** — argument parsing, config resolution, terminal rendering,
-  and process lifecycle.
+The split is load-bearing:
 
-Anything that assumes a terminal, an ANSI code, or a TTY belongs in the binary.
-If the library needs it, the abstraction is wrong.
+- **Library crates** — fetch, model, and reduce PR state, then decide which
+  changes deserve an interruption. They know nothing about terminals. The macOS
+  SwiftUI app consumes them over a UniFFI boundary and a hosted backend will
+  consume them unchanged, so their public API is a real contract with callers
+  that do not exist yet and cannot be refactored alongside you.
+- **Shells** — a CLI/TUI binary, and later a native macOS menubar app. Argument
+  parsing, config resolution, rendering, notifications, process lifecycle.
+
+Anything that assumes a terminal, an ANSI code, or a TTY belongs in a shell.
+If a library crate needs it, the abstraction is wrong. `prtrack-core`
+specifically does no IO at all.
 
 ## Core tenets
 
-1. **Correctness of displayed state.** The table is the product. A wrong cell is
-   worse than a missing one, and a stale cell that looks fresh is worse than
-   both. Failure must always be distinguishable from an empty result.
-2. **Illegal states are unrepresentable.** Prefer a type that cannot express a
+1. **The interruption is the product, not the table.** No team is unblocked
+   because a dashboard was accurate. They are unblocked because someone was
+   poked at the right moment and acted. The table is a debugging view of the
+   state that drives the nudge.
+2. **Correctness of that state.** A wrong cell is worse than a missing one, and
+   a stale cell that looks fresh is worse than both. Failure must always be
+   distinguishable from an empty result — an empty table that means "GitHub is
+   down" is a lie to the user.
+3. **A false nudge costs more than a missed one.** Notification fatigue gets the
+   tool uninstalled, and an uninstalled tool unblocks nobody. When in doubt, stay
+   quiet.
+4. **Illegal states are unrepresentable.** Prefer a type that cannot express a
    wrong value over a runtime check that rejects one. Rust's newtypes, enums,
    and typestate all compile away, so this costs nothing at runtime.
-3. **We reuse existing patterns and make code reusable.** Smaller functions,
+5. **We reuse existing patterns and make code reusable.** Smaller functions,
    smaller modules, one owner per concept.
-4. **Clean code, DDD, and TDD.** A behavior change starts with a failing test.
-5. **Respect the user's rate limit and their terminal.** Conditional requests
+6. **Clean code, DDD, and TDD.** A behavior change starts with a failing test.
+7. **Respect the user's rate limit and their terminal.** Conditional requests
    and backoff are not optimizations; they are correctness. A crash must restore
    the terminal.
 
