@@ -39,6 +39,56 @@ while open has close to zero value under this thesis.
   PR exists."*
   ([dev.to](https://dev.to/code-board/review-latency-is-a-visibility-problem-not-a-people-problem-14d3))
 
+### Our own repository, measured
+
+Measured 2026-08-23 with [`scripts/pr-latency.sh`](../../scripts/pr-latency.sh)
+against `example-org/example-repo`. **Pull requests merged before 2026-08-06 were
+subject to a different review process and are not a valid baseline.** Everything
+below is the current process: 180 merged PRs, 175 human-reviewed.
+
+**Settled wait** — from the author's last push to the first human review. This is
+the only part of the delay a nudge could remove; measuring from PR-open
+overstates it badly, because authors keep pushing while they wait (15.5h p50
+from open versus 5.3h settled).
+
+| | p50 | p75 | p90 | p95 | max |
+|---|---|---|---|---|---|
+| Settled wait | **5.3h** | 16.5h | **40.8h** | 58.5h | 216.6h |
+
+**27 of 175 PRs (15%) waited more than 24 hours** after the author had stopped
+touching them. Twelve waited more than 48.
+
+Three findings follow, and they shape the product more than anything in the
+market research:
+
+**1. The median is healthy; the tail is not.** 5.3h to be looked at is fine. A
+tool that nudged on every PR would fire constantly on PRs that are doing fine,
+and get muted. **A threshold at ~24h fires on 15% and stays silent on 85%.**
+This is a tail product, not a dashboard.
+
+**2. PR size does not predict the wait.** Settled wait by churn: `<200` lines
+p50 3.2h / p90 30.5h; `>5k` lines p50 4.8h / p90 31.5h. Essentially flat. **The
+wait is not review effort, it is attention** — which is precisely the
+"visibility problem, not a people problem" thesis, and it kills the obvious
+objection that the answer is smaller pull requests.
+
+**3. Latency is degrading week over week under the current process**, as review
+demand rose against flat reviewer capacity:
+
+| week of | merged | settled p50 | settled p90 |
+|---|---|---|---|
+| 2026-08-06 | 72 | 3.9h | 22.6h |
+| 2026-08-13 | 61 | 6.2h | 42.4h |
+| 2026-08-20 | 46 | 11.6h | 48.4h |
+
+**This is a confound for Stage 2 and must not be ignored.** A before/after
+comparison against a static baseline would credit any improvement to the
+intervention while the underlying trend is worsening. Compare against the
+extrapolated trend, or run long enough for the trend to be visible in both arms.
+
+Author self-block, by contrast, is small under the current process: n=35,
+p50 0.3h, p90 2.8h, max 19.9h. It is real but it is not where the time goes.
+
 ### The commercial picture is hostile
 
 - **Every local desktop GitHub-PR app is free.** Neat, GitBar,
@@ -96,10 +146,12 @@ Secondary unknowns:
 
 ## 4. Plan: validate before building the product
 
-### Stage 1 — PR latency audit (first deliverable, see §5)
+### Stage 1 — PR latency audit — **DONE 2026-08-23**
 
-Measure the last ~4 months of our own repository. Produces the baseline, the
-measurement instrument for every later stage, and a sales artifact.
+Baseline measured; see §2. The shell reference implementation is
+[`scripts/pr-latency.sh`](../../scripts/pr-latency.sh), which is what Stage 2
+must re-run verbatim so the comparison is like-for-like. The Rust tool in §5
+supersedes it as a distributable artifact, not as a different measurement.
 
 ### Stage 2 — substitution test
 
@@ -172,21 +224,28 @@ before/after comparison proves nothing.
 
 | Metric | Definition | Nudge it maps to |
 |---|---|---|
-| Time to first review | first review submitted − review requested (or `ready_for_review`) | "You are blocking someone" |
-| **Author self-block** | merged − (approved **and** CI green) | "It is ready, go merge it" |
+| **Settled wait** | first human review − author's last push before it | **"You are blocking someone"** |
+| Settled wait by PR size | the above, bucketed by churn | proves attention vs effort |
+| Open → first human review | first human review − `ready_for_review` | context only; overstates |
+| Author self-block | merged − last approval, when approver ≠ merger | "It is ready, go merge it" |
 | Red dwell | CI failed → next push | "Your PR just went red" |
-| Idle ratio | time with zero activity ÷ total lifetime | the 78% figure, for our repo |
 
-Report **p50 and p90**, not the mean. The tail is where the pain lives.
+Report **p50, p90 and the count over threshold**, never the mean. The tail is
+the product.
+
+**Settled wait is the metric to watch**, and it replaces author self-block as
+the headline. Measured against our own repository, self-block is p50 0.3h while
+settled wait is p50 5.3h with a p90 of 40.8h — two orders of magnitude apart at
+the median. Measuring from PR-open instead of last-push inflates p50 from 5.3h
+to 15.5h, because authors keep pushing while they wait; a number inflated 3× is
+one a buyer will correctly reject.
+
+Human reviewers only. AI reviewers respond in ~4 minutes and would mask the
+entire signal if counted.
 
 Exclusions and edge cases: skip draft time before `ready_for_review`, exclude
-bot-authored PRs, count re-review cycles separately, handle PRs closed without
-merge.
-
-**Author self-block is the metric to watch.** Nobody measures it, GitHub does
-not nudge on it, and it is pure waste — the work is done and approved and just
-sitting there. If that number is bad in our repo, it is the most defensible
-reason for this product to exist.
+bot-authored PRs, exclude bot and self reviews when finding the first review,
+count re-review cycles separately, handle PRs closed without merge.
 
 ### Deferred
 

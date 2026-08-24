@@ -3,7 +3,11 @@
 > **For Agents:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 > Load `rust-best-practices` before writing any `.rs` file.
 
-**Goal:** A batch CLI that measures PR latency over a GitHub repo's recent history, producing the baseline number that Stage 1 of the validation plan needs.
+**Goal:** A distributable batch CLI that measures PR latency over a GitHub repo's recent history.
+
+**Status note:** Stage 1's baseline is already measured. [`scripts/pr-latency.sh`](../../scripts/pr-latency.sh) is a working shell reference implementation, validated against 875 real PRs. **This Rust tool must reproduce its numbers exactly** — it is a distributable single binary a prospect can run without installing anything, not a different measurement. Treat the script as the executable specification and diff the two outputs in Task 11.
+
+**Primary metric changed after measurement.** Settled wait (last push → first human review) replaces author self-block as the headline. Real data: settled wait p50 5.3h / p90 40.8h, author self-block p50 0.3h. Measuring from PR-open instead of last-push inflates p50 from 5.3h to 15.5h because authors keep pushing while they wait. Task 4 below is now the *second* metric, not the first.
 
 **Architecture:** A pure metrics engine over normalised fact types, fed by a thin GitHub GraphQL client. The engine does no IO and is developed first, against hand-written fixtures. The network layer is added afterwards and converts wire types into domain types exactly once, at the boundary.
 
@@ -68,7 +72,15 @@ Dependency direction is strictly `prtrack-cli → {prtrack-github, prtrack-audit
 
 ### Scale contract
 
-Target: a repo with ~500 merged PRs in 4 months. Phase A is one query per page of 25 PRs, so ~20 queries. At an estimated 20–50 points each that is 400–1,000 points against a 5,000/hour budget — a full run costs well under one hour of quota. **Measure with the `rateLimit` block rather than trusting this estimate.** Memory is bounded by holding one page at a time and folding into an accumulator; do not collect all PRs before computing.
+**Measured, not estimated.** A full run over `example-org/example-repo` — 875 merged PRs across four months, paginated 50 at a time with `reviews(first: 20)` and `timelineItems(last: 20)` — cost **1 point per page, ~18 points total** against a 5,000/hour budget.
+
+The original estimate in this plan was 400–1,000 points. That was wrong by a factor of ~30, because GitHub divides the summed connection sizes by 100 and rounds, so modest page sizes collapse to a cost of 1. **Two consequences:** page sizes can be generous without penalty, and a hosted version could audit a large organisation for almost nothing — which materially improves the "connect your GitHub" lead-magnet idea.
+
+Real constraint discovered instead: **the search API caps at 1000 results per query.** Beyond that, slice by merge date and run again. Never silently report a truncated population.
+
+Memory is bounded by holding one page at a time and folding into an accumulator; do not collect all PRs before computing.
+
+**Pagination is flaky.** One page in nine failed during the live run with a malformed response. Retry with backoff and verify `.data.search` exists before parsing; a dropped page silently shrinks the population.
 
 ### Rejected alternatives
 
