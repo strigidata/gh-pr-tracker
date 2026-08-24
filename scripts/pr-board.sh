@@ -38,6 +38,7 @@ query($owner:String!, $name:String!) {
           nodes { requestedReviewer { __typename ... on User { login } ... on Team { slug } } } }
         latestReviews(first: 10) { nodes { state author { login } submittedAt } }
         reviewThreads(first: 100) { totalCount nodes { isResolved isOutdated } }
+        comments(first: 1) { totalCount }
         commits(last: 1) { nodes { commit {
           committedDate
           statusCheckRollup { state contexts(first: 1) {

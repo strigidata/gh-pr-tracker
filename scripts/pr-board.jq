@@ -44,6 +44,7 @@ def pad($s; $w): $s + (" " * (if ($w - ($s|vis)) > 0 then ($w - ($s|vis)) else 1
         n: $p.number, url: $p.url, author: ($p.author.login // "unknown"), draft: $p.isDraft,
         fail: $fail, run: $run, ok: $ok, tot: ($fail + $run + $ok),
         threads:   ([ $p.reviewThreads.nodes[]? | select(.isResolved | not) ] | length),
+        comments:  ($p.comments.totalCount // 0),
         mergeable: $p.mergeable, msg: $p.mergeStateStatus, decision: $p.reviewDecision,
         wanted: $wanted,
         blockers: ([ $p.latestReviews.nodes[]? | select(.state == "CHANGES_REQUESTED") | .author.login ]),
@@ -53,6 +54,8 @@ def pad($s; $w): $s + (" " * (if ($w - ($s|vis)) > 0 then ($w - ($s|vis)) else 1
       })
 | map(
     . + {
+      conv: ((if .threads > 0 then RED + "\(.threads)" + R else DIM + "0" + R end)
+             + DIM + "\u00b7\(.comments)" + R),
       ci: (
         if   .draft    then DIM + "draft" + R
         elif .fail > 0 then RED + "x \(.fail)/\(.tot)" + R + (if .run > 0 then DIM + " +\(.run)" + R else "" end)
@@ -111,10 +114,10 @@ def pad($s; $w): $s + (" " * (if ($w - ($s|vis)) > 0 then ($w - ($s|vis)) else 1
 | ([ $all[] | select(.mine | not) | select(.draft) ]             | sort_by(.pushed) | reverse) as $odrafts
 | ([ $all[] | select(.mine | not) | select(.forme | not) | select(.draft | not) ]) as $else
 
-| def row: (if .draft or .ready >= 30 then DIM else "" end) + pad("#\(.n)"; 7) + pad(.author[0:13]; 14) + pad(.ci; 15) + pad("\(.threads)"; 4)
+| def row: (if .draft or .ready >= 30 then DIM else "" end) + pad("#\(.n)"; 7) + pad(.author[0:13]; 14) + pad(.ci; 15) + pad(.conv; 8)
          + pad(.mg; 11) + pad(.blocked; 40) + age(.pushed) + R;
   def head($t; $n): BOLD + $t + R + DIM + "  (\($n))" + R;
-  def cols: DIM + pad("PR"; 7) + pad("AUTHOR"; 14) + pad("CI"; 15) + pad("THR"; 4)
+  def cols: DIM + pad("PR"; 7) + pad("AUTHOR"; 14) + pad("CI"; 15) + pad("OPEN.CMT"; 8)
                 + pad("MERGE"; 11) + pad("WHY IT CANNOT MERGE"; 40) + "SINCE PUSH" + R;
 
   head("YOUR PRS"; ($mine | length)),
@@ -130,4 +133,5 @@ def pad($s; $w): $s + (" " * (if ($w - ($s|vis)) > 0 then ($w - ($s|vis)) else 1
   "",
   (DIM + "\($all|length) open  ·  \($else|length) others' PRs you are not a reviewer on"
        + "  ·  \([ $all[] | select(.blocked | test("READY TO MERGE")) ] | length) ready to merge"
-       + "  ·  \([ $all[] | select(.mergeable == "CONFLICTING") | select(.draft|not) ] | length) conflict with main (\([ $all[] | select(.mergeable == "CONFLICTING") | select(.draft|not) | select(.fail > 0) ] | length) hidden behind red CI)" + "  ·  \([ $review[] | select(.ready < 30) ] | length) reviewable now" + R)
+       + "  ·  \([ $all[] | select(.mergeable == "CONFLICTING") | select(.draft|not) ] | length) conflict with main (\([ $all[] | select(.mergeable == "CONFLICTING") | select(.draft|not) | select(.fail > 0) ] | length) hidden behind red CI)" + "  ·  \([ $review[] | select(.ready < 30) ] | length) reviewable now" + R),
+  (DIM + "OPEN.CMT = unresolved inline threads . total comments   |   merge state shown only once CI is green" + R)
