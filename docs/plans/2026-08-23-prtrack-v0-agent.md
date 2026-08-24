@@ -1,269 +1,247 @@
-# prtrack v0 — the nudge agent
+# prtrack v0 — the PR board
 
 > **For Agents:** REQUIRED SUB-SKILL: Use superpowers:executing-plans.
 > Load `rust-best-practices` before writing any `.rs` file.
 
-**Supersedes** [`2026-08-23-prtrack-audit.md`](2026-08-23-prtrack-audit.md) as the
-active plan. The audit tool is deferred: `scripts/pr-latency.sh` already covers
-the internal measurement need, and a distributable audit binary only matters
-once there are prospects to hand it to.
+**Supersedes** [`2026-08-23-prtrack-audit.md`](2026-08-23-prtrack-audit.md).
+This document replaces an earlier draft of itself that described a one-shot
+nudge model. That model was wrong: PR state moves, so a single notification per
+PR is useless, and firing per-PR would have sent nineteen misdirected messages
+on the first real run because the failing checks were not the authors' fault.
 
-**Goal:** A local agent that fires one OS notification when a pull request has
-been ready and unreviewed past a threshold, and then shuts up about it.
+**Goal:** A binary that shows every open PR and the reason it cannot merge yet,
+derived from the repository's own branch protection rules — then, on `--watch`,
+notifies when that reason changes.
 
-**Architecture:** A pure rule engine over normalised facts, wrapped by a poll
-loop and a notification shell. The engine is developed first against fixtures
-and does no IO. Delivery is swappable — OS notification in v0, Slack or a hosted
-backend later — because the engine only emits events.
+**Architecture:** A pure decision core over normalised facts and a policy,
+wrapped by a query layer and a renderer. The core does no IO and takes `now` as
+a parameter. Delivery is swappable because the core only emits state and
+transitions.
 
 **Tech stack:** Rust 2021, `reqwest` + `serde` (hand-written wire types),
-`chrono`, `notify-rust`, `clap`, `thiserror` in libs, `anyhow` in the binary.
+`chrono`, `clap`, `notify-rust`, `thiserror` in libs, `anyhow` in the binary.
 
-**In v0:** the agent, plus `prtrack status` — a plain one-shot render to stdout.
-`watch -n 300 prtrack status` is the self-updating dashboard, for free.
-
-**Not in v0:** a real TUI (ratatui, raw mode, alternate screen, resize handling,
-terminal restore), menubar app, config files, packaging, code signing, App
-Store, GitLab, Slack, hosted anything. Env vars and a state file are enough.
-
-**Why `status` is not optional.** A nudge-only agent that has been silent for
-three days is indistinguishable from a dead one — expired token, broken query,
-crashed process, all look exactly like "nothing crossed the threshold." Tenet 2
-says failure must always be distinguishable from an empty result, and a
-background agent with no liveness signal violates it. `status` is also the only
-way to tune the threshold without guessing, and the only demo artifact that is
-not "trust me, it beeps."
+**The specification already exists and works.** [`scripts/pr-board.sh`](../../scripts/pr-board.sh)
+and [`scripts/pr-board.jq`](../../scripts/pr-board.jq) implement all of this
+against the live repo. **Treat them as the executable spec.** Task 8's
+acceptance test is that the Rust output matches the script's on the same repo.
 
 ---
 
-## Why this shape
+## Why the board, and why policy-driven
 
-Measured against `example-org/example-repo` (see the
-[design doc](2026-08-23-pr-nudge-validation-design.md) §2): settled wait p50
-5.3h, p90 40.8h, and **15% of PRs wait over 24h after the author stopped
-touching them**. PR size does not predict the wait, so this is an attention
-problem, not an effort problem.
+Measured on `example-org/example-repo`, 37 open PRs (see the
+[design doc](2026-08-23-pr-nudge-validation-design.md) §2 for the latency
+baseline):
 
-That dictates the design. **The agent must stay silent for the 85% that are
-fine.** A tool that nudges on every PR reproduces the firehose-channel failure
-mode that already demonstrably does not work on this team. One message, once,
-per PR that crosses the line.
+**Only 4 of ~60 checks are required.** Painting all failures red misdiagnosed
+three PRs. `#4225` had been waiting five days for a review while the board
+blamed its author for an advisory failure. `#3449` is approved, has
+advisory-only failures, conflicts with main, and has sat untouched for 21 days —
+invisible until the rules were read.
 
-GitHub cannot express this at any frequency setting: its reminders are a
-*digest of everything awaiting you* at clock times. Set that to every 30 minutes
-and you get the same list sixteen times a day. The difference is not cadence,
-it is **per-PR state**.
+**Silence in the policy means "we cannot tell", not "nothing matters."** When no
+required checks are configured, or the PR targets a branch the rule does not
+cover (a stacked PR aimed at another feature branch), every failing check is
+treated as blocking.
 
-## The rule, stated precisely
+## The decision core
 
-For each open PR, with `settled = now − last_push`:
+### `PolicyRules`
 
-| Condition | Event |
-|---|---|
-| Viewer is a requested reviewer, has not reviewed, `settled > threshold` | `NudgeReviewer` |
-| Viewer is the author, **no reviewer requested**, `settled > threshold` | `NudgeAuthorUnassigned` |
-| Otherwise | nothing |
+From `branchProtectionRules` matching the default branch. All fields optional —
+a repository may have no protection at all.
 
-**De-duplication key is `(pr_number, event_kind, head_sha)`.** Firing is recorded
-against that key and never repeated. Using the head SHA means a push
-automatically re-arms the nudge — the author changed something, the clock
-restarts, no separate cooldown logic needed. This is the whole state machine.
+```
+required_checks: Vec<CheckName>     // empty => fall back to "everything blocks"
+required_approvals: u32
+requires_conversation_resolution: bool
+requires_code_owner_reviews: bool
+requires_strict_status_checks: bool // false => "behind" does not block
+dismisses_stale_reviews: bool
+```
 
-Unassigned PRs nudge the **author**, not a channel and not a round-robin pick.
-An unassigned PR is an author-side omission; the tool should say so rather than
-make staffing decisions.
+### Check classification
+
+A PR is **governed** when its base ref matches the rule's pattern *and* the rule
+lists required checks. For a governed PR, a failing check blocks only if its
+name is in `required_checks`; otherwise it is **advisory**. For an ungoverned
+PR, every failing check blocks.
+
+Failing states: `FAILURE`, `ERROR`, `TIMED_OUT`, `STARTUP_FAILURE`,
+`ACTION_REQUIRED`. Running states: `IN_PROGRESS`, `QUEUED`, `PENDING`,
+`WAITING`, `EXPECTED`. Check runs report `conclusion`; status contexts report
+`state`; both must be handled and neither is a bare `String`.
+
+### `BlockedReason` — the ladder, first match wins
+
+```
+1  Draft
+2  ChangesRequested { by: Vec<Login> }
+3  RequiredCheckFailing { count }
+4  UnresolvedThreads { count }        only when requires_conversation_resolution
+5  ApprovedButConflicting             the invalidation case
+6  ApprovedCiRunning
+7  ReadyToMerge
+8  CiRunning
+9  WaitingForReview { from: Vec<Login> }
+10 NobodyAssigned
+```
+
+This is an enum, not a string. Rendering is a separate concern from deciding.
+
+### Sections
+
+| Section | Membership | Sort |
+|---|---|---|
+| Your PRs | author == viewer | action urgency, then oldest push. Drafts last. |
+| Need your review | viewer in requested reviewers, not a draft, not yours | reviewability, then oldest push |
+| Other drafts | someone else's draft | newest first |
+
+Action urgency: ready-to-merge, conflicting, changes-requested, required-check-
+failing, unresolved-threads, CI-running, everything else, drafts.
+
+Reviewability: a PR blocked on its own author is not reviewable however green
+its CI is — those sort last and render dimmed. On the live repo that is the
+difference between a section of thirteen rows and the four that are actionable.
 
 ## Crates
 
 ```
 crates/
-  prtrack-core/     facts → settled wait → rule → NudgeEvent   (pure, no IO)
-  prtrack-github/   open-PR query, wire types, TryFrom
-  prtrack-agent/    poll loop · state file · notification delivery
+  prtrack-core/     PolicyRules · PrFacts · classify · BlockedReason · sections   (pure, no IO)
+  prtrack-github/   query, wire types, TryFrom
+  prtrack-cli/      render · board · watch
 ```
 
-`prtrack-core` does no IO and takes `now` as a parameter. Untestable-by-clock is
-the most common way a rule engine like this rots.
-
-**Note:** this queries **open** PRs. The audit script queries merged ones. The
-fields differ — `headRefOid` and `reviewRequests` matter here, `mergedAt` and
-`mergedBy` do not.
+`prtrack-core` depends on nothing else and takes `now` as a parameter.
 
 ---
 
-## Task 1: De-risk the notification path FIRST
+## Task 1: Workspace, lints, newtypes
 
-The only unknown that could blow the one-day estimate. Do it before anything
-else; if it fails, the whole delivery choice changes.
+Workspace `Cargo.toml` with the strict clippy standard repeated per crate per
+`AGENTS.md`. Then `PrNumber`, `Login`, `RepoRef`, `CheckName`, `HeadSha` — smart
+constructors, private fields, TDD.
 
-A bare binary has no bundle identifier and macOS **silently drops** the
-notification ([notify-rust#132](https://github.com/hoodie/notify-rust/issues/132)).
+`CheckName` and `HeadSha` are newtypes specifically because both are strings
+that must never be interchangeable with each other or with a `Login`.
 
-**Step 1:** New workspace, `crates/prtrack-agent` with a `main.rs` that sends
-one notification via `notify-rust`, calling
-`set_application(&get_bundle_identifier_or_default("Terminal"))` on macOS first.
+## Task 2: `PolicyRules`
 
-**Step 2:** `cargo run -p prtrack-agent`. A notification must actually appear.
+TDD. Cases: full rule as this repo has it; no rule at all; rule present but
+`requiresStatusChecks: false`; rule present with an empty required list.
 
-**Step 3:** Do not discard the `Result` — unwrapping the error surfaces the
-missing-bundle case directly. If nothing appears, check System Settings →
-Notifications for Terminal, and confirm Focus is off.
+The last two must both yield "no required checks", because the fallback depends
+on it.
 
-**Step 4:** Commit `chore: verify macos notification delivery path`.
+## Task 3: Check classification
 
-Ship a real `.app` bundle later; note that TCC permission is keyed to bundle ID
-plus signature, so a stable ad-hoc signature (`codesign -s -`) beats none.
+`classify(checks, policy, governed) -> Classified { blocking, advisory, running, passing }`
 
-## Task 2: Workspace, lints, domain newtypes
+TDD, and these cases are the ones that were wrong in the shell prototype's first
+draft:
 
-Reuse Tasks 1–2 of the audit plan verbatim: workspace `Cargo.toml` with the
-strict clippy standard repeated per crate, then `PrNumber`, `Login`, `RepoRef`
-with smart constructors and private fields. TDD, same five steps.
+- governed, failing check on the required list → blocking
+- governed, failing check not on the list → advisory
+- **ungoverned → every failing check blocking** (the fallback)
+- policy with empty required list → every failing check blocking
+- status context vs check run, both failing → both counted
+- a check both failing and re-running → counted once, as running
+- unknown check state string → not silently dropped; treat as running and
+  surface it
 
-Add `HeadSha` as a newtype here — it is the de-duplication key and must not be
-interchangeable with any other string.
+## Task 4: `BlockedReason`
 
-## Task 3: Open-PR fact types
+TDD the ten-rung ladder above. One test per rung plus the precedence pairs that
+actually bit: changes-requested outranks required-check-failing; unresolved
+threads are skipped entirely when the policy does not require resolution;
+approved-and-conflicting outranks ready-to-merge.
 
-```rust
-pub struct OpenPrFacts {
-    pub number: PrNumber,
-    pub head: HeadSha,
-    pub author: Author,                     // Human(Login) | Bot(Login)
-    pub ready_at: Option<DateTime<Utc>>,
-    pub last_push: DateTime<Utc>,
-    pub requested_reviewers: Vec<Login>,
-    pub human_reviews: Vec<ReviewFact>,     // bot reviews already filtered out
-}
-```
+## Task 5: Sections and sort keys
 
-`Author` is an enum so bot filtering is a `match`, not a string-suffix check at
-call sites. Bot reviews are filtered at the boundary — AI reviewers respond in
-~4 minutes and would mask the entire signal.
+TDD. Cases: your draft sorts below your non-drafts; a PR you authored *and* are
+requested on appears only under Your PRs; a PR blocked on its author sorts below
+a clean one in the review section even with better CI; someone else's non-draft
+PR you are not requested on appears in no section but is counted.
 
-TDD the `ReviewState` enum with an explicit `Unknown(String)` variant, per
-`AGENTS.md`.
+## Task 6: GitHub query and wire types
 
-## Task 4: Settled wait (pure)
+Port the query from `scripts/pr-board.sh` verbatim, including the
+`application/vnd.github.merge-info-preview+json` Accept header, which
+`mergeStateStatus` still requires.
 
-`settled_wait(facts, now) -> Duration`, clamped at zero.
+Wire types `pub(crate)`, converted once with `TryFrom`. Record a fixture from
+the live repo; **no network in tests**. Regenerate fixtures, never hand-edit.
 
-Table cases: never pushed since ready; pushed after ready; `last_push` in the
-future (clock skew — clamp, do not go negative); still a draft (no wait, drafts
-are not waiting on anyone).
+Measured cost is ~1 point per 50 PRs with aggregate counts, ~50 with full
+context nodes. The budget is a non-issue; pagination reliability is not — one
+page in nine failed during the latency audit, so retry with backoff and verify
+`.data` before parsing.
 
-## Task 5: The rule engine — the heart of the product
+## Task 7: Renderer
 
-`evaluate(facts, viewer, config, now, already_fired) -> Option<NudgeEvent>`
+Column widths must measure **visible** width, ignoring ANSI. Getting this wrong
+is what broke the shell prototype's alignment.
 
-Table cases, and these are the specification:
+Honour `NO_COLOR`, `CLICOLOR=0`, and `--color`, and emit no ANSI when stdout is
+not a TTY, per `AGENTS.md`.
 
-- reviewer requested, no review, over threshold → `NudgeReviewer`
-- reviewer requested, **has** reviewed → nothing
-- under threshold → nothing
-- already fired for this `(pr, kind, head_sha)` → nothing
-- already fired, then **head_sha changed** → fires again
-- author, no reviewers requested, over threshold → `NudgeAuthorUnassigned`
-- author, reviewers requested → nothing (not the author's problem)
-- draft → nothing
-- bot-authored PR → nothing
+The policy line renders first: what is enforced, so the reader can trust the
+rest of the screen.
 
-Nine cases. If any is wrong the product is either silent or spam.
-
-## Task 6: GitHub open-PR query
-
-```graphql
-query($owner:String!, $name:String!) {
-  rateLimit { cost remaining }
-  repository(owner:$owner, name:$name) {
-    pullRequests(first: 50, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
-      nodes {
-        number isDraft headRefOid
-        author { __typename login }
-        reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } } } }
-        reviews(first: 20) { nodes { submittedAt state author { __typename login } } }
-        timelineItems(last: 10, itemTypes: [PULL_REQUEST_COMMIT, READY_FOR_REVIEW_EVENT]) {
-          nodes { __typename
-            ... on PullRequestCommit { commit { committedDate } }
-            ... on ReadyForReviewEvent { createdAt } } }
-      }
-    }
-  }
-}
-```
-
-Wire types are `pub(crate)` and converted once with `TryFrom`. Test against a
-recorded fixture; **no network in tests**.
-
-Measured cost is ~1 point per page — the budget is a non-issue. Retry with
-backoff and verify `.data` exists before parsing: one page in nine failed during
-the audit run, and a dropped page silently shrinks the population.
-
-## Task 7: State file
-
-JSON at the platform data dir. `Vec<FiredKey>` where
-`FiredKey = (PrNumber, NudgeKind, HeadSha)`. Load on start, append on fire,
-write atomically (temp file + rename) so a crash mid-write cannot corrupt it.
-
-Prune entries for PRs no longer open, or the file grows forever.
-
-## Task 8: Agent loop
-
-`prtrack watch --repo owner/name --threshold 24h --interval 5m`
-
-Token from `GITHUB_TOKEN`/`GH_TOKEN`, **never argv** — argv is world-readable
-via `ps`. Manual `Debug` impl on the client that redacts it.
-
-Log every evaluation decision at `debug` — while tuning the threshold you will
-want to know why it stayed silent, and that is invisible otherwise.
-
-## Task 9: `prtrack status`
-
-Reads the state file the agent writes. Renders and exits. No raw mode, no
-alternate screen, no ANSI when stdout is not a TTY.
+## Task 8: `prtrack board` and the acceptance test
 
 ```
-prtrack — example-org/example-repo          last poll 3m ago  ·  next in 2m
-
-  WAITING ON YOU
-    #4331  22h  ▸ 2h to threshold   doc: reconcile ASC 350-60 support claims
-    #4290   6h                      fix: harden aws infrastructure security
-
-  NUDGED, STILL UNREVIEWED
-    #4024  47h  nudged 23h ago      refactor: split projector persistence
-
-  YOUR PRS, UNASSIGNED
-    #4318  31h  ▸ nudged            feat: add IAS 2 period-close foundation
-
-  4 open PRs tracked · 1 nudge fired today
+prtrack board --repo owner/name [--format text|json]
 ```
 
-**`last poll Nm ago` is the most important element on the screen** — it is the
-liveness signal that distinguishes a quiet agent from a dead one. Render it
-first, and colour it as an error past two poll intervals.
+**Acceptance:** run `scripts/pr-board.sh example-org/example-repo` and
+`prtrack board --repo example-org/example-repo` and diff. Modulo the timestamp
+line, they must match. If they differ, the Rust is wrong until proven otherwise
+— the script is the validated artefact.
 
-Show `▸ Nh to threshold` for PRs approaching the line. Silence should be
-*explained*, not merely absent; that is what makes the threshold tunable.
+`--format json` emits no ANSI and no progress. Distinct exit codes for success,
+no results, usage error, auth failure, API failure.
 
-Exit codes are distinct for: rendered fine, no state file (agent never ran),
-and stale state (agent is dead).
+## Task 9: macOS notification spike
 
-## Task 10: Run it for real
+Five minutes, and it gates Task 10's design. A bare binary has no bundle
+identifier and macOS **silently drops** the notification
+([notify-rust#132](https://github.com/hoodie/notify-rust/issues/132)). Call
+`set_application()` with a borrowed bundle id first; do not discard the
+`Result`, since the error names the problem. A real `.app` comes later — note
+that TCC permission is keyed to bundle id plus signature, so a stable ad-hoc
+signature beats none.
 
-Point it at `example-org/example-repo` with a deliberately low threshold (1h) for
-the first hour to prove it fires at all, then set it to 24h and leave it running.
+## Task 10: `--watch`
 
-**Record, for a week:** every nudge fired, and whether the PR was reviewed
-within 30 minutes after. That table is the Stage 4 kill-criteria evidence, and
-it is the only reason any of this is being built.
+Redraw in place on an interval. Persist the previous snapshot, diff it, and
+notify on **transitions that matter**, not on a timer:
+
+- became `ReadyToMerge`
+- became `ApprovedButConflicting` ← the invalidation case, currently invisible
+- a required check went red
+- you were newly requested as a reviewer
+- approval dismissed by a push (needs `dismisses_stale_reviews`)
+
+State file written atomically (temp + rename); prune entries for closed PRs.
+Token from `GITHUB_TOKEN`/`GH_TOKEN`, never argv. Manual `Debug` on the client
+that redacts it.
 
 ---
 
-## Open questions, deliberately unresolved
+## Known gaps, deliberately unresolved
 
-- Whether one nudge is enough or the tail needs escalation. Start with one;
-  the data will say.
-- Whether 24h is the right threshold. It fires on 15% of PRs at the measured
-  baseline, which feels right, but it is a guess until observed.
-- Team-wide delivery. Local notifications only reach whoever runs the agent;
-  the other reviewers' p90s stay unmeasured until there is a shared channel.
+- **`dismisses_stale_reviews` is read and displayed but not acted on.** The
+  board cannot yet distinguish "never approved" from "was approved until someone
+  pushed". Given `#3449`, that distinction is worth having.
+- Comment counts do not indicate whether a discussion is *settled*. A truer
+  signal — last comment by someone other than the author, and no push since —
+  is computable but is a feature, not a column tweak.
+- Rulesets (the newer mechanism) are ignored. This repo has one, disabled, so
+  classic branch protection is authoritative. A repo using rulesets only would
+  currently read as unprotected and fall back to "everything blocks", which is
+  safe but wrong.
+- Only the rule matching the default branch is consulted; other patterns are
+  ignored and their PRs fall back.
