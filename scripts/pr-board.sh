@@ -26,10 +26,17 @@ query($owner:String!, $name:String!) {
   rateLimit { cost remaining }
   viewer { login }
   repository(owner:$owner, name:$name) {
+    defaultBranchRef { name }
+    branchProtectionRules(first: 5) {
+      nodes { pattern
+        requiresApprovingReviews requiredApprovingReviewCount
+        requiresConversationResolution
+        requiresStatusChecks requiresStrictStatusChecks requiredStatusCheckContexts
+        requiresCodeOwnerReviews dismissesStaleReviews } }
     pullRequests(first: 50, states: OPEN, orderBy:{field: UPDATED_AT, direction: DESC}) {
       totalCount
       nodes {
-        number title url isDraft createdAt headRefOid
+        number title url isDraft createdAt headRefOid baseRefName
         author { login }
         reviewDecision
         mergeable
@@ -41,9 +48,10 @@ query($owner:String!, $name:String!) {
         comments(first: 1) { totalCount }
         commits(last: 1) { nodes { commit {
           committedDate
-          statusCheckRollup { state contexts(first: 1) {
-            checkRunCount checkRunCountsByState { state count }
-            statusContextCount statusContextCountsByState { state count } } } } } }
+          statusCheckRollup { state contexts(first: 100) { nodes {
+            __typename
+            ... on CheckRun { name conclusion status }
+            ... on StatusContext { context state } } } } } } }
       }
     }
   }
