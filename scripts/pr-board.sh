@@ -24,6 +24,7 @@ RESP=$(gh api graphql \
   -f query='
 query($owner:String!, $name:String!) {
   rateLimit { cost remaining }
+  viewer { login }
   repository(owner:$owner, name:$name) {
     pullRequests(first: 50, states: OPEN, orderBy:{field: UPDATED_AT, direction: DESC}) {
       totalCount
