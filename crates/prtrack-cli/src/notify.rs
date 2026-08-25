@@ -50,27 +50,37 @@ const FOCUS_ASSERTIONS: &str = "Library/DoNotDisturb/DB/Assertions.json";
 /// Never fails: an unreadable or unfamiliar file is [`Focus::Unknown`]. This is
 /// a courtesy check on a private file, and a tool that refused to run because
 /// Apple moved a JSON file would be worse than one that shrugs.
+///
+/// Written as two definitions rather than one body with a `cfg` inside it,
+/// because the two are genuinely different functions: one reads a file and one
+/// is a constant. Folding them together makes the constant look like work, and
+/// clippy is right to say so.
+#[cfg(target_os = "macos")]
 #[must_use]
 pub fn focus() -> Focus {
-    #[cfg(not(target_os = "macos"))]
-    {
-        Focus::Unknown
-    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return Focus::Unknown;
+    };
+    let path = std::path::Path::new(&home).join(FOCUS_ASSERTIONS);
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Focus::Unknown;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Focus::Unknown;
+    };
+    read_focus(&parsed)
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        let Some(home) = std::env::var_os("HOME") else {
-            return Focus::Unknown;
-        };
-        let path = std::path::Path::new(&home).join(FOCUS_ASSERTIONS);
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            return Focus::Unknown;
-        };
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            return Focus::Unknown;
-        };
-        read_focus(&parsed)
-    }
+/// Always [`Focus::Unknown`]: Focus is a macOS idea, and no other platform has
+/// anything this could report on.
+///
+/// Not [`Focus::Clear`], which would claim nothing is suppressing notifications
+/// — a claim this cannot make. Linux has its own way of swallowing them and
+/// [`prepare`] reports that one.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub const fn focus() -> Focus {
+    Focus::Unknown
 }
 
 /// Picks the active mode out of the assertions document.
