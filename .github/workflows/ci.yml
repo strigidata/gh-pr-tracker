@@ -140,12 +140,18 @@ jobs:
           "$BIN" --version
           # Static, or it is not portable and the musl target bought nothing.
           #
-          # Asserted with `file`, not `ldd`. glibc's ldd prints "statically
-          # linked" for a musl-static binary rather than "not a dynamic
-          # executable", so the obvious ldd check reports a correct build as
-          # broken -- which it did, on the first run of this job.
+          # Tested as a property rather than a phrase. Two earlier versions of
+          # this check asserted on the exact wording of `ldd` and then of
+          # `file`, and both failed a binary that was already correct: glibc's
+          # ldd says "statically linked" where the obvious guess is "not a
+          # dynamic executable", and file says "static-pie linked" where the
+          # obvious guess is "statically linked". The property that actually
+          # matters is that nothing is resolved at load time, which is visible
+          # as the absence of any `=>` in ldd's output.
           file "$BIN"
-          if ! file "$BIN" | grep -q "statically linked"; then
-            echo "expected a static binary, got:"; file "$BIN"; exit 1
+          if ldd "$BIN" 2>&1 | grep -q "=>"; then
+            echo "expected no shared library dependencies, got:"
+            ldd "$BIN"
+            exit 1
           fi
-          echo "linux: static, and it runs"
+          echo "linux: no dynamic dependencies, and it runs"
