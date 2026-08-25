@@ -38,8 +38,49 @@ jobs:
   gate:
     uses: ./.github/workflows/ci.yml
 
-  release:
+  # Debian is a target machine, so a release without a Linux artefact is a
+  # release half the team cannot install. Built on Linux natively rather than
+  # cross-compiled from the macOS runner, because `ring` compiles C and cross
+  # toolchains are a source of failures nobody wants to debug at release time.
+  linux:
     needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build a static binary
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          cargo build --release --locked -p prtrack-cli --target x86_64-unknown-linux-musl
+          BIN=target/x86_64-unknown-linux-musl/release/prtrack
+          "$BIN" --version
+          # Same property the gate asserts: nothing resolved at load time, so it
+          # runs on a Debian older than the one that built it.
+          if ldd "$BIN" 2>&1 | grep -q "=>"; then
+            echo "expected no shared library dependencies"; ldd "$BIN"; exit 1
+          fi
+          mkdir -p dist && cp "$BIN" dist/prtrack
+
+      - name: Package
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          NAME="prtrack-$TAG-linux-x86_64"
+          tar -czf "$NAME.tar.gz" -C dist prtrack
+          sha256sum "$NAME.tar.gz" >"$NAME.tar.gz.sha256"
+          cat "$NAME.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: prtrack-*-linux-x86_64.tar.gz*
+
+  release:
+    needs: [gate, linux]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -94,6 +135,11 @@ jobs:
           lipo -info dist/prtrack
           ./dist/prtrack --version
 
+      - name: Collect the Linux artefact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux
+
       - name: Package
         id: package
         env:
@@ -114,36 +160,63 @@ jobs:
         run: |
           set -euo pipefail
           cat >notes.md <<'NOTES'
-          A universal macOS binary — Apple Silicon and Intel in one file.
-
           ## Install
 
+          **macOS** — one universal binary, Apple Silicon and Intel:
+
           ```bash
-          gh release download TAG_PLACEHOLDER --repo strigidata/gh-pr-tracker --pattern '*.tar.gz'
+          gh release download TAG_PLACEHOLDER --repo strigidata/gh-pr-tracker --pattern '*macos*.tar.gz'
           tar -xzf prtrack-TAG_PLACEHOLDER-macos-universal.tar.gz
           xattr -d com.apple.quarantine prtrack   # see below
           install -m 755 prtrack /usr/local/bin/prtrack
           ```
 
-          ## Why the `xattr` line
+          **Linux** — statically linked, so it runs on any glibc, including a
+          Debian older than the machine that built it:
+
+          ```bash
+          gh release download TAG_PLACEHOLDER --repo strigidata/gh-pr-tracker --pattern '*linux*.tar.gz'
+          tar -xzf prtrack-TAG_PLACEHOLDER-linux-x86_64.tar.gz
+          sudo install -m 755 prtrack /usr/local/bin/prtrack
+          ```
+
+          ## Why macOS needs the `xattr` line
 
           This binary is **not signed or notarized**. macOS quarantines anything
-          downloaded from the internet and will refuse to run it with "cannot be
-          opened because the developer cannot be verified". Removing the
-          attribute is the fix, and you should only do that for a binary you
-          trust the origin of — which, for a private repo you have access to,
-          you do.
+          downloaded from the internet and refuses to run it with "cannot be
+          opened because the developer cannot be verified". Clearing the
+          attribute is the fix, and you should only do it for a binary whose
+          origin you trust — which, for a private repo you have access to, you
+          do.
 
-          Signing costs an Apple Developer Program membership and a notarization
-          step in this workflow. It is the gate to giving this to anyone outside
-          the team, not a nicety.
+          Signing needs an Apple Developer Program membership and a
+          notarization step in this workflow. It is the gate to giving this to
+          anyone outside the team, not a nicety. Linux has no equivalent
+          obstacle.
 
-          ## Then
+          ## Use
 
           ```bash
           export GH_TOKEN=...          # or GITHUB_TOKEN; never passed as a flag
           prtrack board --repo owner/name
           prtrack board --repo owner/name --watch
+          ```
+
+          `--watch` polls every five minutes and notifies only when a pull
+          request crosses a threshold that matters — became ready to merge, went
+          from approved to conflicting, a required check went red, a review was
+          requested of you, an approval was dismissed by a push.
+
+          Notifications are quietly swallowed by a macOS Focus mode, and on
+          Linux they need a desktop session with a D-Bus notification daemon.
+          `prtrack` says so at startup in both cases rather than letting you
+          conclude it is broken.
+
+          ## Verify what you downloaded
+
+          ```bash
+          shasum -a 256 -c prtrack-TAG_PLACEHOLDER-macos-universal.tar.gz.sha256
+          sha256sum -c prtrack-TAG_PLACEHOLDER-linux-x86_64.tar.gz.sha256
           ```
           NOTES
           sed -i '' "s/TAG_PLACEHOLDER/$TAG/g" notes.md
@@ -153,4 +226,6 @@ jobs:
             --title "$TAG" \
             --notes-file notes.md \
             "$NAME.tar.gz" \
-            "$NAME.tar.gz.sha256"
+            "$NAME.tar.gz.sha256" \
+            prtrack-*-linux-x86_64.tar.gz \
+            prtrack-*-linux-x86_64.tar.gz.sha256
