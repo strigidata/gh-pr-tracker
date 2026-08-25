@@ -167,8 +167,7 @@ jobs:
           ```bash
           gh release download TAG_PLACEHOLDER --repo strigidata/gh-pr-tracker --pattern '*macos*.tar.gz'
           tar -xzf prtrack-TAG_PLACEHOLDER-macos-universal.tar.gz
-          xattr -d com.apple.quarantine prtrack   # see below
-          install -m 755 prtrack /usr/local/bin/prtrack
+          install -m 755 prtrack "$(brew --prefix)/bin/prtrack"   # or any dir on your PATH
           ```
 
           **Linux** — statically linked, so it runs on any glibc, including a
@@ -177,17 +176,20 @@ jobs:
           ```bash
           gh release download TAG_PLACEHOLDER --repo strigidata/gh-pr-tracker --pattern '*linux*.tar.gz'
           tar -xzf prtrack-TAG_PLACEHOLDER-linux-x86_64.tar.gz
-          sudo install -m 755 prtrack /usr/local/bin/prtrack
+          install -m 755 prtrack ~/.local/bin/prtrack             # or sudo into /usr/local/bin
           ```
 
-          ## Why macOS needs the `xattr` line
+          `/usr/local/bin` is **not** writable without `sudo` on Apple Silicon,
+          which is why the Homebrew prefix is used above. Any directory on your
+          `PATH` will do.
 
-          This binary is **not signed or notarized**. macOS quarantines anything
-          downloaded from the internet and refuses to run it with "cannot be
-          opened because the developer cannot be verified". Clearing the
-          attribute is the fix, and you should only do it for a binary whose
-          origin you trust — which, for a private repo you have access to, you
-          do.
+          ## Signing
+
+          This binary is **not signed or notarized**. Downloaded with `gh` as
+          above that does not matter — the API is not LaunchServices, so nothing
+          tags the file. Downloaded through a **browser** it is quarantined and
+          macOS refuses to run it, which needs `xattr -d com.apple.quarantine
+          prtrack` first.
 
           Signing needs an Apple Developer Program membership and a
           notarization step in this workflow. It is the gate to giving this to

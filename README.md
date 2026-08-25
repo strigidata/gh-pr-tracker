@@ -37,18 +37,34 @@ history.
 # macOS — one universal binary, Apple Silicon and Intel
 gh release download --repo strigidata/gh-pr-tracker --pattern '*macos*.tar.gz'
 tar -xzf prtrack-*-macos-universal.tar.gz
-xattr -d com.apple.quarantine prtrack     # not signed yet; see below
-install -m 755 prtrack /usr/local/bin/prtrack
+install -m 755 prtrack "$(brew --prefix)/bin/prtrack"   # or any dir on your PATH
 
 # Linux — statically linked, runs on any glibc
 gh release download --repo strigidata/gh-pr-tracker --pattern '*linux*.tar.gz'
 tar -xzf prtrack-*-linux-x86_64.tar.gz
-sudo install -m 755 prtrack /usr/local/bin/prtrack
+install -m 755 prtrack ~/.local/bin/prtrack             # or sudo into /usr/local/bin
 ```
 
-The macOS binary is **not signed or notarized**, so macOS quarantines it and
-refuses to run it until the attribute is cleared. That is the gate to
-distributing outside the team, not a nicety.
+`/usr/local/bin` is **not** writable without `sudo` on Apple Silicon, which is
+why the Homebrew prefix is used above. Any directory on your `PATH` will do.
+
+Verify what you downloaded:
+
+```bash
+shasum -a 256 -c prtrack-*-macos-universal.tar.gz.sha256   # sha256sum -c on Linux
+```
+
+The macOS binary is **not signed or notarized**. Downloaded with `gh` as above
+that does not matter — the API is not LaunchServices, so nothing tags the file.
+Downloaded through a **browser** it is quarantined and macOS refuses to run it
+with "cannot be opened because the developer cannot be verified", which needs:
+
+```bash
+xattr -d com.apple.quarantine prtrack
+```
+
+Signing removes the caveat entirely and is the gate to distributing outside the
+team, not a nicety. Linux has no equivalent obstacle.
 
 ## Use
 
