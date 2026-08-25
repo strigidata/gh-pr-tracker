@@ -21,5 +21,6 @@ pub mod json;
 pub mod notify;
 pub mod render;
 pub mod state;
+pub mod update;
 pub mod watch;
 pub mod width;

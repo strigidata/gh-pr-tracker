@@ -25,8 +25,9 @@ use prtrack_cli::json::BoardJson;
 use prtrack_cli::notify;
 use prtrack_cli::render::BoardText;
 use prtrack_cli::state::WatchState;
+use prtrack_cli::update;
 use prtrack_cli::watch::{already_waiting, tick, Nudged};
-use prtrack_core::{Board, BoardRow, BranchName, Login, PolicyRules};
+use prtrack_core::{Board, BoardRow, BranchName, Login, PolicyRules, RepoRef};
 use prtrack_github::{GitHubClient, RepositoryFacts};
 
 /// A failure, and the number it should leave behind.
@@ -194,6 +195,16 @@ async fn watch_forever(
                 for nudged in tick(&mut state, &judged, &viewer) {
                     deliver(&nudged, stderr_palette);
                 }
+
+                // Once per poll, which the one-hour cache turns into once an
+                // hour. A watcher left running for days is exactly who most
+                // needs telling that it has been superseded.
+                if let Some(notice) = check_for_update(&client, Utc::now().timestamp())
+                    .await
+                    .notice()
+                {
+                    eprintln!("{notice}");
+                }
                 if let Err(reason) = state.save(path) {
                     eprintln!(
                         "prtrack: could not save what was seen ({reason}); the next poll \
@@ -345,9 +356,61 @@ fn state_path(args: &BoardArgs) -> Result<std::path::PathBuf, Trouble> {
     )))
 }
 
+/// Where the version check keeps its answer.
+///
+/// One file per machine, not per repository: which `prtrack` is newest does not
+/// depend on what it is watching, and a per-repository cache would ask GitHub
+/// once an hour for every repository somebody watches.
+///
+/// Returns `None` where there is nowhere to keep it, which costs one request
+/// per run and is not worth refusing to start over.
+fn update_cache_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".local").join("state"))
+        })
+        .map(|base| base.join("prtrack").join("update-check.json"))
+}
+
+/// Asks GitHub whether a newer release exists, at most once an hour.
+///
+/// Every failure is [`update::Update::Unknown`], which prints nothing. This is
+/// a courtesy on top of the tool's actual job, and it must never be the reason
+/// somebody sees an error — a token that cannot see the release repository, an
+/// unreachable GitHub, a repository with no releases yet: all silent.
+async fn check_for_update(client: &GitHubClient, now: i64) -> update::Update {
+    let path = update_cache_path();
+
+    if let Some(cached) = path.as_deref().and_then(update::read_cache) {
+        if cached.fresh_at(now) {
+            return update::compare(update::running(), cached.latest.as_deref());
+        }
+    }
+
+    let Ok(repo) = RepoRef::parse(&update::release_repo()) else {
+        return update::Update::Unknown;
+    };
+    let Ok(latest) = client.latest_release(&repo).await else {
+        return update::Update::Unknown;
+    };
+
+    if let Some(path) = path.as_deref() {
+        update::write_cache(
+            path,
+            &update::Cached {
+                checked_at: now,
+                latest: latest.clone(),
+            },
+        );
+    }
+    update::compare(update::running(), latest.as_deref())
+}
+
 /// Fetches a repository's open pull requests and writes the board.
 fn board(args: &BoardArgs) -> Result<Exit, Trouble> {
-    let facts = fetch(args)?;
+    let (facts, update_notice) = fetch(args)?;
     let (viewer, default_branch, default_rule, pairs) = facts.into_parts();
 
     // Each row keeps the rule that judged it: the JSON reports `governed` and
@@ -366,11 +429,18 @@ fn board(args: &BoardArgs) -> Result<Exit, Trouble> {
         default_branch.as_ref(),
         &default_rule,
     );
+
+    // Under the board, so it is the last thing read rather than the first. On
+    // stderr, so `--format json | jq` never sees it.
+    if let Some(notice) = update_notice {
+        eprintln!("{notice}");
+    }
+
     Ok(outcome(&board, &viewer))
 }
 
 /// Asks GitHub, and says which kind of failure it was if it will not answer.
-fn fetch(args: &BoardArgs) -> Result<RepositoryFacts, Trouble> {
+fn fetch(args: &BoardArgs) -> Result<(RepositoryFacts, Option<String>), Trouble> {
     // The token is read from the environment and never from a flag. An
     // argument is visible to every process on the machine through `ps` and
     // survives in shell history; see `prtrack_cli::cli`.
@@ -394,12 +464,21 @@ fn fetch(args: &BoardArgs) -> Result<RepositoryFacts, Trouble> {
                 .context(format!("could not read {} from GitHub", args.repo)),
         })?;
 
-    RepositoryFacts::try_from(fetched).map_err(|source| Trouble {
+    // Computed here, where the runtime and the client already exist, but *not*
+    // printed here: it belongs under the board rather than over it, and the
+    // board is written by the caller.
+    let notice = runtime
+        .block_on(check_for_update(&client, Utc::now().timestamp()))
+        .notice();
+
+    let facts = RepositoryFacts::try_from(fetched).map_err(|source| Trouble {
         // A payload we cannot read is GitHub's answer being wrong, not the
         // caller's command line, so it is retryable in the same sense a 500 is.
         exit: Exit::Api,
         cause: anyhow::Error::new(source).context("GitHub's answer could not be read"),
-    })
+    })?;
+
+    Ok((facts, notice))
 }
 
 /// Writes the board to stdout in the shape that was asked for.

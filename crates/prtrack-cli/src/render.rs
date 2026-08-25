@@ -125,9 +125,17 @@ impl BoardText<'_> {
             clauses.push("a push dismisses approvals".to_owned());
         }
 
+        // The version leads the line. It is the answer to "which build am I
+        // looking at", which is the first question asked the moment two people
+        // compare screens or somebody reports something already fixed.
         self.palette.paint(
             Style::Dim,
-            &format!("policy on {}: {}", self.default_branch, clauses.join(" | ")),
+            &format!(
+                "prtrack {} | policy on {}: {}",
+                crate::update::running(),
+                self.default_branch,
+                clauses.join(" | ")
+            ),
         )
     }
 
@@ -1263,11 +1271,14 @@ mod tests {
 
         assert_eq!(
             rendered,
-            Ok(
-                "policy on main: 2 required checks | 1 approval(s) | threads must be resolved \
-                | a code owner must approve | a push dismisses approvals"
-                    .to_owned()
-            )
+            // Built from the same source the renderer reads, so a version bump
+            // does not edit three tests.
+            Ok(format!(
+                "prtrack {} | policy on main: 2 required checks | 1 approval(s) \
+                 | threads must be resolved | a code owner must approve \
+                 | a push dismisses approvals",
+                crate::update::running()
+            ))
         );
     }
 
@@ -1287,11 +1298,11 @@ mod tests {
 
         assert_eq!(
             rendered,
-            Ok(
-                "policy on main: NO required checks - every failure treated as blocking \
-                | 0 approval(s)"
-                    .to_owned()
-            )
+            Ok(format!(
+                "prtrack {} | policy on main: NO required checks \
+                 - every failure treated as blocking | 0 approval(s)",
+                crate::update::running()
+            ))
         );
     }
 
@@ -1433,9 +1444,9 @@ mod tests {
         assert_eq!(
             rendered,
             Ok(format!(
-                "\u{1b}[2m{}\u{1b}[0m",
-                "policy on main: NO required checks - every failure treated as blocking \
-                 | 0 approval(s)"
+                "\u{1b}[2mprtrack {} | policy on main: NO required checks \
+                 - every failure treated as blocking | 0 approval(s)\u{1b}[0m",
+                crate::update::running()
             ))
         );
     }

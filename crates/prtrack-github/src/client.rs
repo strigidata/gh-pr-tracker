@@ -146,6 +146,68 @@ impl GitHubClient {
         Self { timeout, ..self }
     }
 
+    /// The tag of the newest published release, or `None` where there is none.
+    ///
+    /// Reuses this client's token, which is the point: `prtrack` already
+    /// requires a token that can read the repository, so a private repository's
+    /// releases are visible to exactly the people who can install from them. No
+    /// public endpoint, no second credential, and nothing to run.
+    ///
+    /// # Errors
+    ///
+    /// A repository with no releases yet answers `404`, which is `Ok(None)`
+    /// rather than a failure — "nothing published" is an answer. Anything else
+    /// is reported, so a caller can tell a refused token from an empty release
+    /// list. Callers that treat this as a courtesy should discard the error;
+    /// a version check must never be why the tool did not run.
+    ///
+    /// The REST base is derived from the configured GraphQL endpoint by
+    /// dropping `/graphql`, which is right for github.com. GitHub Enterprise
+    /// serves REST under `/api/v3` and is **untested here**.
+    pub async fn latest_release(&self, repo: &RepoRef) -> Result<Option<String>, GitHubError> {
+        let base = self
+            .endpoint
+            .as_str()
+            .strip_suffix("/graphql")
+            .unwrap_or(self.endpoint.as_str());
+        let url = format!(
+            "{base}/repos/{}/{}/releases/latest",
+            repo.owner(),
+            repo.name()
+        );
+
+        let response = self
+            .http
+            .get(&url)
+            .header(ACCEPT, "application/vnd.github+json")
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(GitHubError::Transport)?;
+
+        // Not retried, unlike the board fetch. This is a courtesy check on a
+        // one-hour cache; a failed attempt costs nothing and the next one is
+        // along shortly, where retrying would spend the rate limit that the
+        // actual work needs.
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(GitHubError::UnexpectedStatus {
+                status: response.status().as_u16(),
+            });
+        }
+
+        // Read, then parse, so a transport failure and a malformed body stay
+        // in different buckets — `reqwest`'s combined `json()` collapses them.
+        let raw = response.bytes().await.map_err(GitHubError::Transport)?;
+        let body: serde_json::Value = serde_json::from_slice(&raw).map_err(GitHubError::Decode)?;
+        Ok(body
+            .get("tag_name")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned))
+    }
+
     /// Fetches every open pull request in `repo`, following the list across as
     /// many pages as it takes.
     ///
