@@ -386,9 +386,20 @@ impl Board {
         board
             .other_drafts
             .sort_by_key(|row| (Reverse(row.facts.last_push), row.facts.number.get()));
-        board
-            .not_waiting_on_you
-            .sort_by_key(|row| row.facts.number.get());
+        // Not by number. These are rendered under the review section now, and
+        // the useful order there is the same question that section asks: what
+        // would it help most for somebody to pick up? A pull request nobody has
+        // been asked to review is the one that stalls indefinitely, so it leads;
+        // one already assigned to other people is somebody else's job and
+        // follows.
+        board.not_waiting_on_you.sort_by_key(|row| {
+            (
+                !row.facts.requested_reviewers.is_empty(),
+                row.reviewability(),
+                row.facts.last_push,
+                row.facts.number.get(),
+            )
+        });
 
         board
     }
@@ -435,8 +446,16 @@ impl Board {
         &self.other_drafts
     }
 
-    /// Everything else — somebody else's open work that has not been put in
-    /// front of the viewer.
+    /// Somebody else's open work that nobody has asked the viewer about.
+    ///
+    /// Rendered under [`Board::needs_your_review`] rather than hidden, because
+    /// "ready for review and nobody assigned" is the state that stalls longest
+    /// and it is invisible everywhere else. Unclaimed first, then work already
+    /// assigned to other people.
+    ///
+    /// No row here is claiming the viewer was asked for anything; the reason
+    /// column says `NOBODY ASSIGNED` or names whoever *was* asked, so the two
+    /// groups stay distinguishable without a sub-heading.
     ///
     /// Ordered by pull request number, since no urgency applies. Usually
     /// counted rather than rendered; see the type's documentation for why it is

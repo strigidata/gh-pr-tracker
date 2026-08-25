@@ -95,19 +95,29 @@ impl BoardText<'_> {
     pub fn render(&self) -> String {
         let mut lines: Vec<String> = vec![self.policy_line(), String::new()];
 
+        // Other people's work first. The board exists to stop somebody being
+        // blocked by you, and what you are holding up outranks what you are
+        // waiting on — your own rows are still there, one screen-glance lower.
+        //
+        // Work nobody asked you about is appended rather than hidden: "ready
+        // for review, nobody assigned" is the state that stalls longest and it
+        // shows up nowhere else. No sub-heading, because each row's reason
+        // already says `NOBODY ASSIGNED` or names whoever *was* asked.
+        let review: Vec<BoardRow> = self
+            .board
+            .needs_your_review()
+            .iter()
+            .chain(self.board.not_waiting_on_you())
+            .cloned()
+            .collect();
+        lines.extend(self.section("NEED YOUR REVIEW", &review, "nothing waiting on you", true));
+        lines.push(String::new());
         lines.extend(self.section("YOUR PRS", self.board.yours(), "nothing open", true));
         lines.push(String::new());
         // Directly under your open work, because it is the same question asked
         // one step earlier: what have you got going, and what have you not
         // asked for yet.
         lines.extend(self.section("YOUR DRAFTS", self.board.your_drafts(), "none", true));
-        lines.push(String::new());
-        lines.extend(self.section(
-            "NEED YOUR REVIEW",
-            self.board.needs_your_review(),
-            "nothing waiting on you",
-            true,
-        ));
         lines.push(String::new());
         // No column header: nobody scans a draft they do not own for its CI.
         lines.extend(self.section("OTHER DRAFTS", self.board.other_drafts(), "none", false));
