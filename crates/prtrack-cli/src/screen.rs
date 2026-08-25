@@ -278,6 +278,35 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_line_erases_the_row_it_replaces_rather_than_hiding_behind_it() {
+        // The worst case of the same bug, and the one that reads as a missing
+        // feature rather than as corruption: the blank line between sections is
+        // the *shortest* line a frame contains, so without its own erase the
+        // row underneath shows through completely and the separator appears to
+        // have been removed.
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut screen = Screen::new(&mut sink, true);
+            screen.redraw("HEADING\n\nNEXT SECTION");
+        }
+        let out = String::from_utf8_lossy(&sink).into_owned();
+
+        // Three lines, three erases — the empty one included. Counting is the
+        // check: it is the line with nothing in it that is easiest to skip.
+        assert_eq!(
+            out.matches(CLEAR_LINE).count(),
+            3,
+            "the blank line is erased like any other"
+        );
+
+        // And it really is empty rather than absent: two newlines in a row.
+        assert!(
+            out.contains(&format!("HEADING{CLEAR_LINE}\n{CLEAR_LINE}\n")),
+            "the separator is written, then erased, then followed by the next line"
+        );
+    }
+
+    #[test]
     fn the_cursor_is_hidden_while_watching_and_given_back_on_the_way_out() {
         let out = written(true, "board", "Next update in 5 seconds");
         assert!(
