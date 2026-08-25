@@ -87,6 +87,13 @@ pub enum Style {
     Dim,
     /// Something is wrong and somebody must act.
     Red,
+    /// Something is failing but cannot hold the merge. Red, because it is a
+    /// failure and calling it grey reads as "fine"; lighter than [`Style::Red`],
+    /// because it is not what anybody is waiting on.
+    LightRed,
+    /// Work in progress. Amber rather than yellow, to match the colour GitHub
+    /// uses for a check that is still running.
+    Orange,
     /// Nothing is in the way.
     Green,
     /// Waiting on something that will finish by itself.
@@ -105,6 +112,12 @@ impl Style {
             Self::Bold => Some("\u{1b}[1m"),
             Self::Dim => Some("\u{1b}[2m"),
             Self::Red => Some("\u{1b}[31m"),
+            // 256-colour, because neither shade exists in the original eight.
+            // A terminal without 256-colour support is rare enough in 2026 that
+            // the alternative -- reusing yellow for two different meanings --
+            // costs more than it saves.
+            Self::LightRed => Some("\u{1b}[38;5;210m"),
+            Self::Orange => Some("\u{1b}[38;5;208m"),
             Self::Green => Some("\u{1b}[32m"),
             Self::Yellow => Some("\u{1b}[33m"),
             Self::Blue => Some("\u{1b}[34m"),

@@ -175,9 +175,16 @@ impl BoardText<'_> {
 
     /// One pull request as a row of columns.
     ///
-    /// A row the viewer cannot act on is drawn entirely dim — see
-    /// [`Palette::dimmed`]. Each cell is padded after it is painted, using the
-    /// width it *shows* rather than the bytes it holds.
+    /// A row the viewer cannot act on is drawn dim — see [`Palette::dimmed`] —
+    /// **except its status cells**. CI and open threads keep their colour in
+    /// every row, because the two say different things: the dim means "you
+    /// cannot act on this", and the colour means "this is what is wrong". A
+    /// dimmed row is still the fastest place to see that six required checks
+    /// are red, and flattening that to grey hid the one fact the column exists
+    /// to carry.
+    ///
+    /// Each cell is padded after it is painted, using the width it *shows*
+    /// rather than the bytes it holds.
     fn row_line(&self, row: &BoardRow) -> String {
         let facts = row.facts();
         let is_draft = facts.draft_state == DraftState::Draft;
@@ -206,8 +213,9 @@ impl BoardText<'_> {
                 &palette.paint(Style::Plain, truncate_to(author, AUTHOR_CELLS)),
                 AUTHOR_COLUMN
             ),
-            pad_to(&checks_cell(row, is_draft, palette), CI_COLUMN),
-            pad_to(&threads_cell(row, self.rules, palette), THREADS_COLUMN),
+            // `self.palette`, not the dimmed one: see the note above.
+            pad_to(&checks_cell(row, is_draft, self.palette), CI_COLUMN),
+            pad_to(&threads_cell(row, self.rules, self.palette), THREADS_COLUMN),
             pad_to(&merge_cell(row, is_draft, palette), MERGE_COLUMN),
             pad_to(&reason_cell(row.reason(), palette), REASON_COLUMN),
             palette.paint(Style::Plain, &self.age_of(row)),
@@ -295,13 +303,16 @@ fn checks_cell(row: &BoardRow, is_draft: bool, palette: Palette) -> String {
     } else if blocking > 0 {
         let mut cell = palette.paint(Style::Red, &format!("x {blocking}"));
         if advisory > 0 {
-            cell.push_str(&palette.paint(Style::Dim, &format!("+{advisory}")));
+            // Coloured, not grey: the `+1` is a real failure. Lighter than the
+            // blocking count beside it so the eye still lands on the number
+            // that decides whether this merges.
+            cell.push_str(&palette.paint(Style::LightRed, &format!("+{advisory}")));
         }
         cell
     } else if advisory > 0 {
-        palette.paint(Style::Dim, &format!("! {advisory} adv"))
+        palette.paint(Style::LightRed, &format!("! {advisory} adv"))
     } else if running > 0 {
-        palette.paint(Style::Yellow, &format!("~ {running}/{total} run"))
+        palette.paint(Style::Orange, &format!("~ {running}/{total} run"))
     } else if total == 0 {
         palette.paint(Style::Dim, "no checks")
     } else {
@@ -389,9 +400,9 @@ fn reason_cell(reason: &BlockedReason, palette: Palette) -> String {
         }
         BlockedReason::Conflicting => palette.paint(Style::Red, "conflicting - rebase first"),
         BlockedReason::BehindBase => palette.paint(Style::Yellow, "approved - UPDATE BRANCH"),
-        BlockedReason::ApprovedCiRunning => palette.paint(Style::Yellow, "approved - CI running"),
+        BlockedReason::ApprovedCiRunning => palette.paint(Style::Orange, "approved - CI running"),
         BlockedReason::ReadyToMerge => palette.paint(Style::Green, "READY TO MERGE"),
-        BlockedReason::CiRunning => palette.paint(Style::Yellow, "CI running"),
+        BlockedReason::CiRunning => palette.paint(Style::Orange, "CI running"),
         BlockedReason::MergeabilityNotKnown => palette.paint(Style::Dim, "mergeability not known"),
         BlockedReason::WaitingForReview { from } => palette.paint(
             Style::Blue,
@@ -937,12 +948,19 @@ mod tests {
     }
 
     #[test]
-    fn a_row_nobody_can_act_on_stays_dim_the_whole_way_across() {
-        // Opening such a row with a dim code and letting the cells' own
-        // colours reset it stops the dimming at the first coloured cell. A row
-        // that is half dim reads as two rows.
+    fn a_row_nobody_can_act_on_is_dim_except_where_it_says_what_is_wrong() {
+        // Two meanings share a row and neither may swallow the other. The dim
+        // says "you cannot act on this"; the colour in the CI and thread cells
+        // says "this is what is wrong". Flattening everything to grey was the
+        // first attempt and it hid the fact the column exists to carry -- a row
+        // with six failing required checks read as unremarkable.
+        //
+        // What must not happen is a cell reasserting a colour *and* resetting,
+        // which ends the row's dimming early and leaves the rest reading as
+        // ordinary. That is why the prose cells are checked separately below.
         let rendered = Login::parse("octocat").and_then(|me| {
             let mut failing = open_pr(1, "octocat")?;
+            failing.unresolved_threads = 2;
             failing.checks = vec![prtrack_core::Check::new(
                 CheckName::parse("Preview CI Gate")?,
                 prtrack_core::CheckState::parse("FAILURE"),
@@ -955,21 +973,23 @@ mod tests {
         assert_eq!(
             row.as_ref().map(|line| line.contains("\u{1b}[2m")),
             Ok(true),
-            "the row must be dim"
+            "the row is still dim"
         );
-        for colour in [
-            "\u{1b}[31m",
-            "\u{1b}[32m",
-            "\u{1b}[33m",
-            "\u{1b}[34m",
-            "\u{1b}[35m",
-        ] {
-            assert_eq!(
-                row.as_ref().map(|line| line.contains(colour)),
-                Ok(false),
-                "no cell may reassert {colour:?} and end the row's dimming"
-            );
-        }
+
+        // The blocking count keeps its red, in a row that is otherwise dim.
+        assert_eq!(
+            row.as_ref().map(|line| line.contains("\u{1b}[31m")),
+            Ok(true),
+            "a failing required check stays red even where the row is dim"
+        );
+
+        // And the reason column -- prose, not status -- does not fight it.
+        assert_eq!(
+            row.as_ref()
+                .map(|line| line.contains("\u{1b}[34m") || line.contains("\u{1b}[35m")),
+            Ok(false),
+            "prose cells stay dim; only status cells keep colour"
+        );
     }
 
     #[test]
