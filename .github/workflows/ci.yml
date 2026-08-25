@@ -1,0 +1,87 @@
+name: CI
+
+# The gate `AGENTS.md` calls the Definition of Done. Until this existed the rule
+# could not be satisfied at all, because there was nowhere for CI to be green.
+#
+# Every step passes `--locked`. A build that silently updates `Cargo.lock` is not
+# the build anybody reviewed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # So a release can be cut from a commit known to be green rather than assumed.
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A CI failure that only says "error" costs a re-run to diagnose.
+  RUST_BACKTRACE: 1
+
+concurrency:
+  # A second push to the same branch makes the first run's answer irrelevant.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    # macOS because the notification path is macOS-only and links AppKit, so a
+    # Linux-only gate would not compile the crate that matters most.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Ordered cheapest-first: a formatting failure is instant to detect and
+      # makes clippy's output diff-noisy if left in.
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --all-features --locked
+
+      - name: Docs
+        # A broken intra-doc link means a comment references something that no
+        # longer exists, so it is a failure rather than a warning.
+        run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # A green suite does not prove the binary works. These are the properties
+      # a test cannot reach: that the process starts, that its exit codes are
+      # the contract, and that piped output is data rather than escapes.
+      - name: Smoke — the binary answers without a token
+        run: |
+          set -u
+          cargo build --release --locked -p prtrack-cli
+
+          ./target/release/prtrack-cli --version
+          ./target/release/prtrack-cli --help >/dev/null
+
+          # `--help` and `--version` are successes. This regressed once already,
+          # exiting 2 and claiming the command line could not be read.
+          ./target/release/prtrack-cli --help >/dev/null 2>&1
+          test $? -eq 0 || { echo "--help must exit 0"; exit 1; }
+
+          # No token is an auth failure, distinct from a usage error and from a
+          # network one. The exit code is the only part a script can read.
+          env -u GH_TOKEN -u GITHUB_TOKEN ./target/release/prtrack-cli \
+            board --repo octo-org/example >/dev/null 2>/tmp/err.txt
+          code=$?
+          test $code -eq 3 || { echo "no token must exit 3, got $code"; cat /tmp/err.txt; exit 1; }
+          grep -q "GH_TOKEN" /tmp/err.txt || { echo "the message must name the variable"; exit 1; }
+
+          # A token must never reach stderr, however the run fails.
+          if grep -qE "ghp_|github_pat_" /tmp/err.txt; then
+            echo "a credential reached stderr"; exit 1
+          fi
