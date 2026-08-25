@@ -663,26 +663,15 @@ that redacts it.
 
 ---
 
-## Suspended: CI and the Definition of Done
+## CI and the Definition of Done — no longer suspended
 
-This repository has **no git remote and no CI**, so `AGENTS.md`'s Definition of
-Done — "the PR head commit has green CI and no unresolved review comments" —
-cannot currently be satisfied. Both are deliberately deferred, not overlooked.
+This section recorded that the repository had no remote and no CI, so the
+Definition of Done could not be satisfied. Both now exist: the repository is
+`strigidata/gh-pr-tracker`, `.github/workflows/ci.yml` gates every push on macOS
+and Linux, and `.github/workflows/release.yml` cuts a release from a `vN.N.N`
+tag. `AGENTS.md` is the current statement of the rule; this entry is kept only
+so the gap in the record is explained rather than mysterious.
 
-Consequences to keep in view while that holds:
-
-- The per-task gate is the two reviews (spec, then code quality) plus the three
-  local verification commands. There is no third gate.
-- `rust-version` was removed from the root manifest. An MSRV nothing tests is a
-  promise that breaks silently. It returns with the CI job that checks it.
-- prtrack cannot yet be pointed at its own repository, so dogfooding is limited
-  to `example-org/example-repo`.
-
-When it is pushed, it goes **private under the `strigidata` org**.
-
-Reinstating this is a task in its own right: create the repo, push, add
-`.github/workflows/ci.yml` running fmt, `clippy -D warnings`, and tests on both
-stable and the declared MSRV, then restore `rust-version`.
 
 ## Known gaps, deliberately unresolved
 

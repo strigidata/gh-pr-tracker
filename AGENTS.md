@@ -9,11 +9,30 @@ Project instructions for AI coding agents (Claude Code, Codex, OpenCode, Cursor,
 moment they are blocking their team — or being blocked by their own finished
 work.
 
-Current state: **pre-implementation.** The approved design and the
-validation-first plan live in
-[`docs/plans/2026-08-23-pr-nudge-validation-design.md`](docs/plans/2026-08-23-pr-nudge-validation-design.md).
-Read it before writing code. The first deliverable is a batch PR-latency audit
-tool, not the watcher.
+Current state: **shipped and in use.** `prtrack board` renders the board,
+`--watch` polls and notifies on transitions, and releases are cut from CI for
+macOS and Linux. See [`README.md`](README.md) for what it does and
+[`docs/plans/`](docs/plans/) for why it does it that way — the plan documents
+are a **historical record of decisions**, not instructions; where they disagree
+with this file or the code, they are the ones that are wrong.
+
+```
+crates/prtrack-core     no IO, no clock, no terminal. Newtypes, the
+                        thirteen-rung ladder, the board's sections and
+                        ordering, and the --watch transition rules.
+crates/prtrack-github   transport. Wire types, pagination, retry, policy
+                        resolution, and the conversion into domain facts.
+crates/prtrack-cli      the shell. The `prtrack` binary plus a library half
+                        holding the renderer, colour, exit codes, state file,
+                        notifications and the update check.
+scripts/                two surviving tools: check-states.sh, which fails when
+                        the repository produces a check state the crate does
+                        not know, and pr-latency.sh.
+```
+
+The binary is named `prtrack`, not `prtrack-cli`. The shell prototype that
+served as this port's oracle has been deleted; it is recoverable from history
+if a second implementation is ever needed to diff against.
 
 The split is load-bearing:
 
@@ -51,6 +70,33 @@ specifically does no IO at all.
 7. **Respect the user's rate limit and their terminal.** Conditional requests
    and backoff are not optimizations; they are correctness. A crash must restore
    the terminal.
+
+## NEVER: real identities anywhere in this repository
+
+**No real account name, organisation, repository name, pull request title or
+CI job name goes into this repository. Anywhere.** Not in code, not in tests,
+not in fixtures, not in documentation, not in a README example, not in a commit
+message.
+
+Use the examples the crate already uses: `octocat`, `hubot`, `monalisa`,
+`octodev`, `example-org/example-repo`. Casing matters where a test turns on it —
+`OCTOCAT` against `octocat` — so do not flatten a pair to one spelling.
+
+This has been violated three times: recorded fixtures, then the core's own
+doctests, then a README written *after* both were cleaned. Each fix needed a
+history rewrite, and a rewrite is only cheap while nothing is published. The
+rule is absolute because the cost is asymmetric: using `octocat` costs nothing,
+and using a colleague's login costs a `filter-repo` run and a force-push, or is
+permanent.
+
+Before any commit that adds an example, a fixture, or documentation:
+
+```bash
+git grep -niE "your-org|a-colleague|real-repo-name"   # must return nothing
+```
+
+Recording a fixture goes through `crates/prtrack-github/tests/fixtures/record.sh`,
+which redacts by default. Never hand-edit a fixture.
 
 ## Skills location
 
@@ -102,8 +148,18 @@ review comments. Pushing is one step in the loop, not the end of it.
 1. Behavior change → failing test first.
 2. `/code-review` — the soft gate. Triage findings against the authorized scope.
 3. `/verify` — format, clippy, build, tests, docs, and a real CLI smoke run.
-4. Push, then watch CI: `gh pr checks <pr> --watch`.
+4. Push, then watch CI: `gh run list --limit 1` / `gh run view <id>`.
 5. `/fix-comments` for review feedback, then back to step 3.
+
+CI is `.github/workflows/ci.yml`: a macOS gate carrying fmt, clippy, build,
+tests, docs and a smoke run, plus a Linux job building the static musl artefact
+the release ships. **Both must be green.** A macOS-only gate once let a Linux
+build that never compiled sit on `main` for an hour.
+
+A release is `.github/workflows/release.yml`, triggered by a `vN.N.N` tag whose
+version must match `prtrack-cli`'s. Cut a release only from a commit whose CI is
+already green, and remember the version bump — a tag ten minutes ahead of a fix
+ships the bug.
 
 `origin/main` is the stable baseline. If a gate surfaces a problem outside the
 branch's authorized scope, do not silently fix it from the feature branch.
@@ -141,7 +197,20 @@ smallest fix or carve-out, and get explicit authorization.
 - **Do not blindly agree.** If you disagree, say so via `AskUserQuestion`. Do
   not make decisions on the user's behalf when they have not responded.
 - **Branch discipline.** Never commit directly to `main`. Use a feature branch
-  or worktree and open a PR.
+  or worktree and open a PR. The exception is an explicit instruction from the
+  user, which has happened once, for a squash-merge.
+- **Stage the files you edited, not the directory.** `git add crates/some-crate`
+  is harmless until somebody else is working in that crate, at which point it
+  silently absorbs their half-finished work into your commit. That is how a
+  signature change landed without its call site and broke `main`.
+- **Say so before editing a file scoped to another agent**, even when it is
+  clean. Clean is a fact about the tree; announcing is a fact about the team,
+  and only the second one stops two people reasoning about different histories.
+- **No destructive git operation while uncommitted work exists in a shared
+  tree.** `stash`, `checkout --`, `reset --hard` and `clean` are all destructive
+  when somebody may write between your two steps. Commit first so a revert
+  restores rather than destroys, or snapshot to `/tmp` with `cp`. To read a
+  committed file without touching the tree, use `git show HEAD:path`.
 
 ## Code standards
 
@@ -170,6 +239,10 @@ Project-specific rules not covered by that skill:
 ### Paths and structure
 
 - Crates live under `crates/`. The library and the binary are separate crates.
+- The `prtrack-cli` crate has both a `lib.rs` and a `main.rs`: the renderer and
+  its friends live in the library half so they can be tested, and `main.rs` is
+  wiring only. Nothing in that library is reusable outside this binary and it
+  says so.
 - Nothing terminal-related may be reachable from the library crate's public API.
 - Docs live under `docs/`. Scripts live under `scripts/`. Do not create new
   top-level directories without saying why.
@@ -199,6 +272,51 @@ Project-specific rules not covered by that skill:
 - Unit tests in `#[cfg(test)] mod tests` at the bottom of the file under test.
   Integration tests in `tests/`.
 - No network access in tests. Use a recorded fixture or a local test server.
-- No real sleeps to wait for a condition in async tests. Use a controlled clock.
 - Table-driven over copy-paste once there are three similar cases.
 - A regression test that never went red proves nothing.
+
+**Verify by mutation, not by reading.** Break the thing on purpose and watch a
+test fail. Every vacuous test found in this project was invisible to review and
+surfaced only this way. A test written specifically to close a gap, which does
+not reach the gap, is worse than none: it converts an open question into a
+settled one.
+
+The recurring shapes, each of which cost a real bug here:
+
+- **A probe already in normal form cannot test normalisation.** A fixture chosen
+  to be tidy is thereby chosen to be inert.
+- **When a test distinguishes two identifiers, the fixture must use the same
+  text for both.** A team slug that cannot collide with a login passes whether
+  the code compares accounts or rendered names.
+- **A recorded fixture cannot cover a value the recorded repository does not
+  produce.** Anything defined by an *absence* needs a synthetic case.
+- **A two-reading fixture cannot tell "fired on the transition" from "fired on
+  the condition."** A before and an after answer identically; the third reading
+  is the one that discriminates.
+- **A guard that cannot fire is worse than no guard**, because the code then
+  lies about where the protection lives. Delete it rather than test around it.
+- **Do not assert on a tool's phrasing.** `ldd` says "statically linked" where
+  the guess is "not a dynamic executable"; `file` says "static-pie linked".
+  Assert the property, not the sentence.
+
+**"No real sleeps" forbids waiting, not measuring.** A test that sleeps until a
+condition might have happened is slow and flaky in both directions. A test
+asserting a *lower bound* on elapsed time, to prove a backoff actually slept,
+can only be pushed further from failure by a loaded machine — that is allowed,
+with the reason recorded beside it.
+
+**`#[tokio::test(start_paused = true)]` and real socket IO are incompatible.**
+Paused time auto-advances to the next timer whenever the runtime is idle, and a
+test talking to a mock server is idle almost continuously — so the clock jumps
+to the client's own request timeout and the request fails having never been
+slow. Use virtual time only where nothing touches a socket; prefer restructuring
+so the logic under test is a pure function over a fetch *outcome*.
+
+**Run one mutation harness at a time.** It edits a file in place and restores it
+afterwards, so it holds a whole-file lock that nothing enforces. Two at once
+corrupt each other, and committing first does not help because both write after
+the commit.
+
+**A green gate describes the bytes on disk when its slowest step started.** If
+anything may be writing to the tree, re-run against a clean `git archive`
+export before believing it.
