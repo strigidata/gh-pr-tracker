@@ -177,8 +177,16 @@ impl Reviewability {
 /// there is always exactly one to find.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
-    /// The viewer wrote it.
+    /// The viewer wrote it, and it is open for review.
     Yours,
+    /// The viewer wrote it, and it is still a draft.
+    ///
+    /// Separate from [`Section::Yours`] rather than sorted to the bottom of it,
+    /// because the two answer different questions. Your open work is what
+    /// somebody is waiting on; your drafts are what you have not asked anybody
+    /// for yet, and mixing them makes the first list longer than the thing it
+    /// is measuring.
+    YourDrafts,
     /// Somebody else's draft.
     OtherDrafts,
     /// Somebody else's work, open for review, with the viewer asked for one.
@@ -197,7 +205,10 @@ impl Section {
     /// review it — a draft is not ready for the review section by definition.
     fn of(facts: &PrFacts, viewer: &Login) -> Self {
         if facts.author.as_ref() == Some(viewer) {
-            return Self::Yours;
+            return match facts.draft_state {
+                DraftState::Draft => Self::YourDrafts,
+                DraftState::ReadyForReview => Self::Yours,
+            };
         }
         match facts.draft_state {
             DraftState::Draft => return Self::OtherDrafts,
@@ -322,6 +333,7 @@ impl BoardRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Board {
     yours: Vec<BoardRow>,
+    your_drafts: Vec<BoardRow>,
     needs_your_review: Vec<BoardRow>,
     other_drafts: Vec<BoardRow>,
     not_waiting_on_you: Vec<BoardRow>,
@@ -338,6 +350,7 @@ impl Board {
     pub fn assemble(rows: Vec<BoardRow>, viewer: &Login) -> Self {
         let mut board = Self {
             yours: Vec::new(),
+            your_drafts: Vec::new(),
             needs_your_review: Vec::new(),
             other_drafts: Vec::new(),
             not_waiting_on_you: Vec::new(),
@@ -346,6 +359,7 @@ impl Board {
         for row in rows {
             let group = match Section::of(&row.facts, viewer) {
                 Section::Yours => &mut board.yours,
+                Section::YourDrafts => &mut board.your_drafts,
                 Section::NeedsYourReview => &mut board.needs_your_review,
                 Section::OtherDrafts => &mut board.other_drafts,
                 Section::NotWaitingOnYou => &mut board.not_waiting_on_you,
@@ -363,6 +377,12 @@ impl Board {
                 row.facts.number.get(),
             )
         });
+        // Both draft sections run newest-push first: a draft is a thing you
+        // are still working on, so the one you touched last is the one you
+        // meant to come back to.
+        board
+            .your_drafts
+            .sort_by_key(|row| (Reverse(row.facts.last_push), row.facts.number.get()));
         board
             .other_drafts
             .sort_by_key(|row| (Reverse(row.facts.last_push), row.facts.number.get()));
@@ -373,13 +393,27 @@ impl Board {
         board
     }
 
-    /// The viewer's own pull requests, most urgent first and drafts last.
+    /// The viewer's own pull requests that are open for review, most urgent
+    /// first.
     ///
     /// Ordered by [`ActionUrgency`], then by the oldest push, so that among
     /// equally urgent work the thing that has been waiting longest comes first.
+    ///
+    /// Drafts are **not** here — see [`Board::your_drafts`]. They were once
+    /// sorted to the bottom of this list, which made it longer than the thing
+    /// it measures: what somebody else is waiting on.
     #[must_use]
     pub fn yours(&self) -> &[BoardRow] {
         &self.yours
+    }
+
+    /// The viewer's own drafts, newest push first.
+    ///
+    /// Nobody is waiting on these, so they are not ordered by urgency — the
+    /// useful order is the one you were last working in.
+    #[must_use]
+    pub fn your_drafts(&self) -> &[BoardRow] {
+        &self.your_drafts
     }
 
     /// Somebody else's open pull requests with the viewer asked for a review,
@@ -419,6 +453,7 @@ impl Board {
     #[must_use]
     pub const fn total(&self) -> usize {
         self.yours.len()
+            + self.your_drafts.len()
             + self.needs_your_review.len()
             + self.other_drafts.len()
             + self.not_waiting_on_you.len()
@@ -523,7 +558,8 @@ mod tests {
         // are the point: a pull request that can merge is the *most* urgent
         // thing on your list, because one click ends somebody else's wait —
         // while the ladder that produced it calls that the happiest answer it
-        // has. A draft is last, because nobody is behind it.
+        // has. The draft in this fixture is *not* in the result: it belongs to
+        // `your_drafts` now, and its absence here is the point.
         //
         // Numbers descend and pushes descend as urgency worsens, so the
         // expected order is neither the number order nor the push order. Both
@@ -602,19 +638,22 @@ mod tests {
 
         assert_eq!(
             order,
-            Ok(vec![110, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10]),
+            Ok(vec![110, 100, 90, 80, 70, 60, 50, 40, 30, 20]),
             "mergeable first, then the one-click fix, draft last"
         );
     }
 
     #[test]
-    fn your_draft_sits_below_your_open_work_however_healthy_it_looks() {
-        // The narrow version of the ladder above, kept separate because it is
-        // the case a reader checks first. The draft is approved with a clean
-        // merge — everything that would otherwise make it the most urgent row
-        // on the board — and it still sorts last, because a draft is not
-        // asking anybody for anything.
-        let order = Login::parse("octocat").and_then(|me| {
+    fn your_draft_is_its_own_section_however_healthy_it_looks() {
+        // The draft is approved with a clean merge -- everything that would
+        // otherwise make it the most urgent row on the board -- and it is still
+        // not in the list of work somebody is waiting on, because a draft is
+        // not asking anybody for anything.
+        //
+        // It used to sort to the bottom of `yours` instead. That made the list
+        // longer than the thing it measures, and a count of "your open work"
+        // that includes drafts answers a question nobody asked.
+        let split = Login::parse("octocat").and_then(|me| {
             let mut healthy_draft = open_pr(1, "octocat")?;
             healthy_draft.draft_state = DraftState::Draft;
             healthy_draft.review_decision = Some(ReviewDecision::Approved);
@@ -624,13 +663,37 @@ mod tests {
             ordinary.last_push = at(10);
 
             let board = board_for(vec![healthy_draft, ordinary], &me);
-            Ok::<_, InvalidValue>(numbers(board.yours()))
+            Ok::<_, InvalidValue>((numbers(board.yours()), numbers(board.your_drafts())))
+        });
+
+        assert_eq!(
+            split,
+            Ok((vec![2], vec![1])),
+            "the draft is yours, and it is not open work"
+        );
+    }
+
+    #[test]
+    fn your_drafts_run_newest_first_like_everybody_else_s() {
+        // Nobody is waiting on a draft, so urgency is the wrong order for them.
+        // The useful one is the order you were last working in.
+        let order = Login::parse("octocat").and_then(|me| {
+            let mut oldest = open_pr(1, "octocat")?;
+            oldest.draft_state = DraftState::Draft;
+            oldest.last_push = at(0);
+
+            let mut newest = open_pr(2, "octocat")?;
+            newest.draft_state = DraftState::Draft;
+            newest.last_push = at(100);
+
+            let board = board_for(vec![oldest, newest], &me);
+            Ok::<_, InvalidValue>(numbers(board.your_drafts()))
         });
 
         assert_eq!(
             order,
             Ok(vec![2, 1]),
-            "a draft sorts last even when it is approved and mergeable"
+            "the one you touched last comes first"
         );
     }
 
@@ -890,6 +953,7 @@ mod tests {
 
             Ok::<_, InvalidValue>((
                 numbers(board.yours()),
+                numbers(board.your_drafts()),
                 numbers(board.needs_your_review()),
                 numbers(board.other_drafts()),
                 numbers(board.not_waiting_on_you()),
@@ -899,7 +963,7 @@ mod tests {
 
         assert_eq!(
             assembled,
-            Ok((vec![2, 1], vec![3], vec![4], vec![5, 6], 6)),
+            Ok((vec![2], vec![1], vec![3], vec![4], vec![5, 6], 6)),
             "each pull request belongs to exactly one section, and all six are still on the board"
         );
     }

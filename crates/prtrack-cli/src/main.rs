@@ -24,6 +24,7 @@ use prtrack_cli::exit::Exit;
 use prtrack_cli::json::BoardJson;
 use prtrack_cli::notify;
 use prtrack_cli::render::BoardText;
+use prtrack_cli::screen::{self, Screen};
 use prtrack_cli::state::WatchState;
 use prtrack_cli::update;
 use prtrack_cli::watch::{already_waiting, tick, Nudged};
@@ -163,6 +164,12 @@ async fn watch_forever(
     let mut state = remembered(path);
     let mut first_poll = true;
 
+    // The board is repainted in place rather than printed again underneath, so
+    // the terminal shows one board rather than a transcript of every poll. The
+    // screen restores the cursor when this function returns by any route.
+    let interactive = args.format == Format::Text && std::io::stdout().is_terminal();
+    let mut screen = Screen::new(std::io::stdout(), interactive);
+
     // Resolved for *stderr*, which is where a nudge goes. It is a different
     // stream from the board's and can be redirected on its own, so borrowing
     // stdout's answer would write escapes into a log the moment somebody ran
@@ -179,13 +186,22 @@ async fn watch_forever(
                     .collect();
                 let board =
                     Board::assemble(judged.iter().map(|(row, _)| row.clone()).collect(), &viewer);
-                write_board(
-                    args,
-                    &board,
-                    &judged,
-                    default_branch.as_ref(),
-                    &default_rule,
-                );
+
+                match default_branch
+                    .as_ref()
+                    .map(|branch| board_text(args, &board, branch, &default_rule))
+                {
+                    Some(rendered) => screen.redraw(&rendered),
+                    // JSON, or a repository with no default branch. Neither is
+                    // a board to repaint, so fall back to writing it out.
+                    None => write_board(
+                        args,
+                        &board,
+                        &judged,
+                        default_branch.as_ref(),
+                        &default_rule,
+                    ),
+                }
 
                 if first_poll {
                     announce_first_poll(&judged, &viewer);
@@ -225,7 +241,29 @@ async fn watch_forever(
             }
         }
 
-        tokio::time::sleep(interval).await;
+        // The countdown, ticking under the board. Broken into one-second steps
+        // rather than one long sleep so the line can be rewritten as it counts,
+        // and so `Updating...` appears the moment the wait ends rather than
+        // after the fetch that follows it.
+        //
+        // Ctrl-C is raced against every step. Without it the process dies on
+        // the signal, `Screen`'s destructor never runs, and the shell the user
+        // returns to has an invisible cursor with no way to know why — the
+        // failure `AGENTS.md` means by "a crash must restore the terminal".
+        let seconds = i64::try_from(interval.as_secs()).unwrap_or(i64::MAX);
+        for remaining in (1..=seconds).rev() {
+            screen.status_line(&screen::countdown(remaining));
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                result = tokio::signal::ctrl_c() => {
+                    // An unavailable handler is not a reason to keep running:
+                    // the user asked to stop either way.
+                    drop(result);
+                    return Ok(Exit::Informational);
+                }
+            }
+        }
+        screen.status_line(&screen::updating());
     }
 }
 
@@ -482,6 +520,28 @@ fn fetch(args: &BoardArgs) -> Result<(RepositoryFacts, Option<String>), Trouble>
 }
 
 /// Writes the board to stdout in the shape that was asked for.
+/// Renders the board as the text `--watch` repaints, or `None` where there is
+/// no default branch to name.
+///
+/// Split from [`write_board`] because a watcher hands the text to
+/// [`Screen::redraw`] rather than printing it: printing appends, and appending
+/// is the thing `--watch` is not supposed to do.
+fn board_text(
+    args: &BoardArgs,
+    board: &Board,
+    default_branch: &BranchName,
+    default_rule: &PolicyRules,
+) -> String {
+    BoardText {
+        board,
+        rules: default_rule,
+        default_branch: default_branch.as_str(),
+        now: Utc::now(),
+        palette: palette(args),
+    }
+    .render()
+}
+
 fn write_board(
     args: &BoardArgs,
     board: &Board,
@@ -496,17 +556,7 @@ fn write_board(
             // policy line would be a sentence about nothing. It is omitted
             // rather than given a placeholder, because a line naming a branch
             // is a line a reader will believe.
-            let text = default_branch.map(|branch| {
-                BoardText {
-                    board,
-                    rules: default_rule,
-                    default_branch: branch.as_str(),
-                    now: Utc::now(),
-                    palette: palette(args),
-                }
-                .render()
-            });
-            match text {
+            match default_branch.map(|branch| board_text(args, board, branch, default_rule)) {
                 Some(rendered) => print!("{rendered}"),
                 None => eprintln!(
                     "prtrack: this repository has no default branch, so there is no policy \

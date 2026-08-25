@@ -110,6 +110,10 @@ impl BoardJson<'_> {
         }
         json!({
             "mine": listed(self.board.yours(), "mine"),
+            // Separate from `mine`, and from `drafts` which is everybody
+            // else's: a consumer counting what somebody is waiting on wants
+            // neither of the other two.
+            "mine_drafts": listed(self.board.your_drafts(), "mine_drafts"),
             "review": listed(self.board.needs_your_review(), "review"),
             "drafts": listed(self.board.other_drafts(), "drafts"),
             "neither": listed(self.board.not_waiting_on_you(), "neither"),
@@ -392,7 +396,8 @@ mod tests {
         assert_eq!(
             sections,
             Ok(json!({
-                "mine":    [{"n": 2, "section": "mine"}, {"n": 1, "section": "mine"}],
+                "mine":    [{"n": 2, "section": "mine"}],
+                "mine_drafts": [{"n": 1, "section": "mine_drafts"}],
                 "review":  [{"n": 3, "section": "review"}],
                 "drafts":  [{"n": 4, "section": "drafts"}],
                 "neither": [{"n": 5, "section": "neither"}],
@@ -629,7 +634,7 @@ mod tests {
             "required_approvals",
             "required_checks",
         ];
-        const ORACLE_SECTIONS: [&str; 4] = ["drafts", "mine", "neither", "review"];
+        const SECTION_KEYS: [&str; 5] = ["drafts", "mine", "mine_drafts", "neither", "review"];
 
         fn keys(value: &Value) -> Vec<String> {
             value
@@ -655,7 +660,7 @@ mod tests {
         );
         assert_eq!(
             at("/sections"),
-            Ok(ORACLE_SECTIONS.map(str::to_owned).to_vec())
+            Ok(SECTION_KEYS.map(str::to_owned).to_vec())
         );
         assert_eq!(at("/prs/0"), Ok(PR_KEYS.map(str::to_owned).to_vec()));
     }

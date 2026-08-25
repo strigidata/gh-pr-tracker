@@ -76,6 +76,11 @@ impl BoardText<'_> {
 
         lines.extend(self.section("YOUR PRS", self.board.yours(), "nothing open", true));
         lines.push(String::new());
+        // Directly under your open work, because it is the same question asked
+        // one step earlier: what have you got going, and what have you not
+        // asked for yet.
+        lines.extend(self.section("YOUR DRAFTS", self.board.your_drafts(), "none", true));
+        lines.push(String::new());
         lines.extend(self.section(
             "NEED YOUR REVIEW",
             self.board.needs_your_review(),
@@ -227,7 +232,7 @@ impl BoardText<'_> {
             // `self.palette`, not the dimmed one: see the note above. The
             // reason is status too — it is the answer to the question the
             // column asks — so it keeps its colour with the other two.
-            pad_to(&checks_cell(row, is_draft, self.palette), CI_COLUMN),
+            pad_to(&checks_cell(row, self.palette), CI_COLUMN),
             pad_to(&threads_cell(row, self.rules, self.palette), THREADS_COLUMN),
             pad_to(&merge_cell(row, is_draft, palette), MERGE_COLUMN),
             pad_to(&reason_cell(row.reason(), self.palette), REASON_COLUMN),
@@ -305,15 +310,13 @@ impl BoardText<'_> {
 /// nothing blocks. An empty rollup is called out rather than drawn as a pass,
 /// because "CI never ran" and "CI is green" are the two readings a board must
 /// never confuse.
-fn checks_cell(row: &BoardRow, is_draft: bool, palette: Palette) -> String {
+fn checks_cell(row: &BoardRow, palette: Palette) -> String {
     let checks = row.checks();
     let (blocking, advisory) = (checks.blocking().len(), checks.advisory().len());
     let (running, total) = (checks.running().len(), checks.total());
     let passing = checks.passing().len();
 
-    if is_draft {
-        palette.paint(Style::Dim, "draft")
-    } else if blocking > 0 {
+    if blocking > 0 {
         let mut cell = palette.paint(Style::Red, &format!("x {blocking}"));
         if advisory > 0 {
             // Coloured, not grey: the `+1` is a real failure. Lighter than the
