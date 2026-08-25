@@ -78,6 +78,10 @@ pub fn focus() -> Focus {
 /// Split from [`focus`] so the shape can be tested without a real file, which
 /// is the only part of this worth testing: reading a path is not where the
 /// mistakes are.
+///
+/// macOS-only, like the file it reads. Without the gate this is dead code
+/// everywhere else, which `-D warnings` correctly refuses.
+#[cfg(target_os = "macos")]
 fn read_focus(parsed: &serde_json::Value) -> Focus {
     let Some(entries) = parsed.get("data").and_then(serde_json::Value::as_array) else {
         return Focus::Unknown;
@@ -237,7 +241,9 @@ pub fn adopt_bundle_identity() -> Result<String> {
     Ok(bundle_id)
 }
 
-#[cfg(test)]
+// The Focus parser is macOS-only, so its tests are too. Nothing else in this
+// module can be tested without a desktop session to post into.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::{read_focus, Focus};
     use serde_json::json;
