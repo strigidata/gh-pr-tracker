@@ -876,6 +876,17 @@ pub struct PrFacts {
     /// [`review_decision`]: PrFacts::review_decision
     pub changes_requested_by: Vec<Login>,
 
+    /// Everyone whose latest review is on the record, whatever it said.
+    ///
+    /// Superset of [`changes_requested_by`]: an approval counts too. Read to
+    /// answer one question the request list cannot — *have I already looked at
+    /// this?* GitHub removes a reviewer from `requested_reviewers` the moment
+    /// they submit, so an approved pull request and one nobody was ever asked
+    /// about are indistinguishable without this.
+    ///
+    /// [`changes_requested_by`]: PrFacts::changes_requested_by
+    pub reviewed_by: Vec<Login>,
+
     /// How many review threads are still open.
     ///
     /// Blocking only where [`PolicyRules::conversation_resolution`] says the
@@ -1011,6 +1022,7 @@ mod tests {
             merge_state: MergeState::Dirty,
             requested_reviewers: vec![Reviewer::Team(TeamSlug::new("ledger-owners"))],
             changes_requested_by: Vec::new(),
+            reviewed_by: Vec::new(),
             unresolved_threads: 0,
             comments: 4,
             checks: vec![

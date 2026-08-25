@@ -103,11 +103,17 @@ impl BoardText<'_> {
         // for review, nobody assigned" is the state that stalls longest and it
         // shows up nowhere else. No sub-heading, because each row's reason
         // already says `NOBODY ASSIGNED` or names whoever *was* asked.
+        //
+        // Anything you have already reviewed is *not* here. GitHub drops you
+        // from the request list the moment you submit, so an approved pull
+        // request looks exactly like an unclaimed one unless who-has-reviewed
+        // is checked — and asking you to review your own approval is the
+        // clearest way to teach somebody to stop reading the section.
         let review: Vec<BoardRow> = self
             .board
             .needs_your_review()
             .iter()
-            .chain(self.board.not_waiting_on_you())
+            .chain(self.board.unclaimed())
             .cloned()
             .collect();
         lines.extend(self.section("NEED YOUR REVIEW", &review, "nothing waiting on you", true));
@@ -323,7 +329,9 @@ impl BoardText<'_> {
                 .yours()
                 .iter()
                 .chain(self.board.needs_your_review())
+                .chain(self.board.your_drafts())
                 .chain(self.board.other_drafts())
+                .chain(self.board.unclaimed())
                 .chain(self.board.not_waiting_on_you())
         };
         let ready = every_row()
@@ -335,17 +343,24 @@ impl BoardText<'_> {
                     && row.facts().mergeable == MergeableState::Conflicting
             })
             .count();
+        // Everything the review section shows that is worth opening now, which
+        // includes the unclaimed rows appended to it.
         let reviewable = self
             .board
             .needs_your_review()
             .iter()
+            .chain(self.board.unclaimed())
             .filter(|row| row.reviewability() < Reviewability::CiRunning)
             .count();
 
         self.palette.paint(
             Style::Dim,
             &format!(
-                "{} open | {} not your review | {ready} ready to merge | \
+                // "not your review" was accurate when the unclaimed rows were
+                // also hidden. They are on screen now, so the only rows left
+                // out are ones this viewer has already reviewed -- which is a
+                // different and more useful thing to be told.
+                "{} open | {} you have reviewed | {ready} ready to merge | \
                  {conflicting} conflicting | {reviewable} reviewable now",
                 self.board.total(),
                 self.board.not_waiting_on_you().len(),
@@ -617,6 +632,7 @@ mod tests {
             merge_state: MergeState::Clean,
             requested_reviewers: Vec::new(),
             changes_requested_by: Vec::new(),
+            reviewed_by: Vec::new(),
             unresolved_threads: 0,
             comments: 0,
             checks: Vec::new(),
@@ -1385,6 +1401,8 @@ mod tests {
 
     #[test]
     fn the_summary_counts_the_rows_the_sections_do_not_show() {
+        // Three reviewable, not two: the unclaimed row is on screen now and
+        // counts toward what somebody could pick up this minute.
         // The three sections between them hide everything that is somebody
         // else's problem. The count is the only place a reader learns those
         // pull requests exist at all, so it has to come from the whole board
@@ -1428,7 +1446,7 @@ mod tests {
         assert_eq!(
             summary,
             Ok(
-                "5 open | 2 not your review | 1 ready to merge | 1 conflicting | 1 reviewable now"
+                "5 open | 0 you have reviewed | 1 ready to merge | 1 conflicting | 3 reviewable now"
                     .to_owned()
             )
         );

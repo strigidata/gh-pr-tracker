@@ -115,6 +115,9 @@ impl BoardJson<'_> {
             // neither of the other two.
             "mine_drafts": listed(self.board.your_drafts(), "mine_drafts"),
             "review": listed(self.board.needs_your_review(), "review"),
+            // Rendered under `review`, but a separate key: a consumer counting
+            // what was asked of somebody must not be handed what was not.
+            "unclaimed": listed(self.board.unclaimed(), "unclaimed"),
             "drafts": listed(self.board.other_drafts(), "drafts"),
             "neither": listed(self.board.not_waiting_on_you(), "neither"),
         })
@@ -285,6 +288,7 @@ mod tests {
             merge_state: MergeState::Clean,
             requested_reviewers: Vec::new(),
             changes_requested_by: Vec::new(),
+            reviewed_by: Vec::new(),
             unresolved_threads: 0,
             comments: 0,
             checks: Vec::new(),
@@ -401,7 +405,8 @@ mod tests {
                 "mine_drafts": [{"n": 1, "section": "mine_drafts"}],
                 "review":  [{"n": 3, "section": "review"}],
                 "drafts":  [{"n": 4, "section": "drafts"}],
-                "neither": [{"n": 5, "section": "neither"}],
+                "neither": [],
+                "unclaimed": [{"n": 5, "section": "unclaimed"}],
             })),
             "the draft sorts last among the viewer's own, as the board ordered it"
         );
@@ -635,7 +640,14 @@ mod tests {
             "required_approvals",
             "required_checks",
         ];
-        const SECTION_KEYS: [&str; 5] = ["drafts", "mine", "mine_drafts", "neither", "review"];
+        const SECTION_KEYS: [&str; 6] = [
+            "drafts",
+            "mine",
+            "mine_drafts",
+            "neither",
+            "review",
+            "unclaimed",
+        ];
 
         fn keys(value: &Value) -> Vec<String> {
             value

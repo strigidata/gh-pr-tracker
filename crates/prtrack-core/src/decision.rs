@@ -683,6 +683,7 @@ mod tests {
             merge_state: MergeState::Blocked,
             requested_reviewers: Vec::new(),
             changes_requested_by: Vec::new(),
+            reviewed_by: Vec::new(),
             unresolved_threads: 0,
             comments: 0,
             checks: Vec::new(),

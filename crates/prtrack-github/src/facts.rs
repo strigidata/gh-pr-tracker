@@ -205,6 +205,7 @@ fn facts_of(
         merge_state: merge_state_of(&pull_request.merge_state_status),
         requested_reviewers: reviewers_of(pull_request).map_err(refuse)?,
         changes_requested_by: changes_requested_by(pull_request).map_err(refuse)?,
+        reviewed_by: reviewed_by(pull_request).map_err(refuse)?,
         unresolved_threads: unresolved_threads(pull_request),
         comments: u32::try_from(pull_request.comments.total_count).map_err(|_source| {
             ConversionError::NegativeCount {
@@ -241,6 +242,23 @@ fn reviewers_of(
             // request would render the pull request as waiting on nobody.
             None => Ok(Reviewer::unknown("")),
         })
+        .collect()
+}
+
+/// Everyone who has submitted a review, whatever it said.
+///
+/// The same list `changes_requested_by` filters, unfiltered. Together they
+/// answer "who is blocking" and "who has already looked", which are different
+/// questions and were previously the same one.
+fn reviewed_by(pull_request: &wire::PullRequest) -> Result<Vec<Login>, prtrack_core::InvalidValue> {
+    pull_request
+        .latest_reviews
+        .nodes
+        .iter()
+        .flatten()
+        .flatten()
+        .filter_map(|review| review.author.as_ref())
+        .map(|actor| Login::parse(&actor.login))
         .collect()
 }
 

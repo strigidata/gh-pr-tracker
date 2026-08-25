@@ -96,8 +96,15 @@ impl ActionUrgency {
 /// Ordering is the declaration order of the variants: most reviewable first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Reviewability {
-    /// Nothing is in the way of reading it.
+    /// Nothing is in the way and nothing is failing. Open this one.
     Ready,
+    /// Nothing is in the way, but something failed that cannot block the merge.
+    ///
+    /// Below [`Reviewability::Ready`] because an advisory failure is still a
+    /// failure somebody may want to look at, so a pull request with none is the
+    /// better use of the next five minutes. Above everything else, because
+    /// nothing here stops the review being written.
+    ReadyWithAdvisory,
     /// Threads are open that the repository requires resolved. Still readable;
     /// the conversation is part of the review.
     UnresolvedThreads,
@@ -142,6 +149,12 @@ impl Reviewability {
         // even when nothing has tested it.
         if checks.total() == 0 && rung < Self::NoChecksReported {
             return Self::NoChecksReported;
+        }
+        // A pull request with nothing in its way but something red beside it is
+        // still readable, and still second to one with nothing red at all.
+        // Asked only of `Ready`, so it cannot promote a rung below it.
+        if rung == Self::Ready && !checks.advisory().is_empty() {
+            return Self::ReadyWithAdvisory;
         }
         rung
     }
@@ -191,6 +204,15 @@ enum Section {
     OtherDrafts,
     /// Somebody else's work, open for review, with the viewer asked for one.
     NeedsYourReview,
+    /// Somebody else's work, open for review, that the viewer has neither been
+    /// asked about nor already reviewed.
+    ///
+    /// Separate from [`Section::NotWaitingOnYou`] because it is the one group
+    /// there that somebody could usefully pick up. A pull request the viewer
+    /// has already approved is *not* here: GitHub removes a reviewer from the
+    /// request list the moment they submit, so without checking who has already
+    /// reviewed, approved work is indistinguishable from unclaimed work.
+    Unclaimed,
     /// Somebody else's work that is not waiting on the viewer at all.
     NotWaitingOnYou,
 }
@@ -223,7 +245,13 @@ impl Section {
         {
             return Self::NeedsYourReview;
         }
-        Self::NotWaitingOnYou
+        // Already had your say — approved it, or asked for changes. The next
+        // move is somebody else's, and showing it as reviewable would be asking
+        // you to do a thing you have done.
+        if facts.reviewed_by.contains(viewer) {
+            return Self::NotWaitingOnYou;
+        }
+        Self::Unclaimed
     }
 }
 
@@ -333,6 +361,7 @@ impl BoardRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Board {
     yours: Vec<BoardRow>,
+    unclaimed: Vec<BoardRow>,
     your_drafts: Vec<BoardRow>,
     needs_your_review: Vec<BoardRow>,
     other_drafts: Vec<BoardRow>,
@@ -350,6 +379,7 @@ impl Board {
     pub fn assemble(rows: Vec<BoardRow>, viewer: &Login) -> Self {
         let mut board = Self {
             yours: Vec::new(),
+            unclaimed: Vec::new(),
             your_drafts: Vec::new(),
             needs_your_review: Vec::new(),
             other_drafts: Vec::new(),
@@ -361,6 +391,7 @@ impl Board {
                 Section::Yours => &mut board.yours,
                 Section::YourDrafts => &mut board.your_drafts,
                 Section::NeedsYourReview => &mut board.needs_your_review,
+                Section::Unclaimed => &mut board.unclaimed,
                 Section::OtherDrafts => &mut board.other_drafts,
                 Section::NotWaitingOnYou => &mut board.not_waiting_on_you,
             };
@@ -392,14 +423,19 @@ impl Board {
         // been asked to review is the one that stalls indefinitely, so it leads;
         // one already assigned to other people is somebody else's job and
         // follows.
-        board.not_waiting_on_you.sort_by_key(|row| {
+        // Rendered under the review section, so ordered by the same question
+        // it asks. Nobody asked for these, so the tie-break that matters is how
+        // long they have sat.
+        board.unclaimed.sort_by_key(|row| {
             (
-                !row.facts.requested_reviewers.is_empty(),
                 row.reviewability(),
                 row.facts.last_push,
                 row.facts.number.get(),
             )
         });
+        board
+            .not_waiting_on_you
+            .sort_by_key(|row| row.facts.number.get());
 
         board
     }
@@ -446,20 +482,30 @@ impl Board {
         &self.other_drafts
     }
 
-    /// Somebody else's open work that nobody has asked the viewer about.
+    /// Somebody else's open work that nobody has asked the viewer about, and
+    /// that the viewer has not already reviewed.
     ///
     /// Rendered under [`Board::needs_your_review`] rather than hidden, because
     /// "ready for review and nobody assigned" is the state that stalls longest
-    /// and it is invisible everywhere else. Unclaimed first, then work already
-    /// assigned to other people.
+    /// and it is invisible everywhere else.
     ///
-    /// No row here is claiming the viewer was asked for anything; the reason
-    /// column says `NOBODY ASSIGNED` or names whoever *was* asked, so the two
-    /// groups stay distinguishable without a sub-heading.
+    /// No row here claims the viewer was asked for anything; each one's reason
+    /// says `NOBODY ASSIGNED` or names whoever *was*, so the two groups stay
+    /// distinguishable without a sub-heading.
+    #[must_use]
+    pub fn unclaimed(&self) -> &[BoardRow] {
+        &self.unclaimed
+    }
+
+    /// Everything left — including anything the viewer has already reviewed.
     ///
-    /// Ordered by pull request number, since no urgency applies. Usually
-    /// counted rather than rendered; see the type's documentation for why it is
-    /// kept at all.
+    /// An approval is the common case here, and it is why this exists as a
+    /// separate group: GitHub removes a reviewer from the request list the
+    /// moment they submit, so without checking who has already reviewed, work
+    /// the viewer approved is indistinguishable from work nobody has touched.
+    ///
+    /// Ordered by pull request number, since no urgency applies. Counted rather
+    /// than rendered; see the type's documentation for why it is kept.
     #[must_use]
     pub fn not_waiting_on_you(&self) -> &[BoardRow] {
         &self.not_waiting_on_you
@@ -473,6 +519,7 @@ impl Board {
     pub const fn total(&self) -> usize {
         self.yours.len()
             + self.your_drafts.len()
+            + self.unclaimed.len()
             + self.needs_your_review.len()
             + self.other_drafts.len()
             + self.not_waiting_on_you.len()
@@ -487,7 +534,7 @@ mod tests {
         BranchName, DraftState, MergeState, MergeableState, PrFacts, PrTitle, PrUrl,
         ReviewDecision, Reviewer, TeamSlug,
     };
-    use crate::policy::{PolicyRules, Requirement};
+    use crate::policy::{BlockingChecks, PolicyRules, Requirement};
     use crate::types::{CheckName, HeadSha, InvalidValue, Login, PrNumber, RepoRef};
     use chrono::{DateTime, TimeDelta, Utc};
 
@@ -522,6 +569,7 @@ mod tests {
             merge_state: MergeState::Clean,
             requested_reviewers: Vec::new(),
             changes_requested_by: Vec::new(),
+            reviewed_by: Vec::new(),
             unresolved_threads: 0,
             comments: 0,
             checks: Vec::new(),
@@ -536,12 +584,20 @@ mod tests {
 
     /// Reduces every pull request against the same rule and arranges the board.
     fn board_for(prs: Vec<PrFacts>, viewer: &Login) -> Board {
-        let policy = PolicyRules::unprotected();
-        let rows = prs
-            .into_iter()
-            .map(|facts| BoardRow::reduce(facts, &policy))
-            .collect();
-        Board::assemble(rows, viewer)
+        board_under(&PolicyRules::unprotected(), prs, viewer)
+    }
+
+    /// A rule naming one required check, so anything else that fails is
+    /// advisory. Needed wherever the blocking-versus-advisory split is what is
+    /// under test.
+    fn rule_requiring_the_gate() -> Result<PolicyRules, InvalidValue> {
+        Ok(PolicyRules {
+            blocking_checks: BlockingChecks::from_rule(
+                Requirement::Required,
+                vec![CheckName::parse("Preview CI Gate")?],
+            ),
+            ..PolicyRules::unprotected()
+        })
     }
 
     /// A check attempt, so a fixture can be given a rollup worth classifying.
@@ -976,7 +1032,10 @@ mod tests {
                 numbers(board.your_drafts()),
                 numbers(board.needs_your_review()),
                 numbers(board.other_drafts()),
-                numbers(board.not_waiting_on_you()),
+                // Unclaimed, not `not_waiting_on_you`: nobody asked the viewer
+                // about these and the viewer has not reviewed them, so they are
+                // the group that gets rendered.
+                numbers(board.unclaimed()),
                 board.total(),
             ))
         });
@@ -1014,6 +1073,55 @@ mod tests {
     }
 
     #[test]
+    fn fully_green_outranks_green_enough_to_merge() {
+        // Both are readable and neither is blocked, so both used to be `Ready`
+        // and the tie fell to push time. But one has something red beside it
+        // that somebody may want to look at, and the other has nothing --
+        // which makes the second the better use of the next five minutes.
+        let order = Login::parse("octocat").and_then(|me| {
+            let rule = rule_requiring_the_gate()?;
+
+            let mut spotless = open_pr(1, "hubot")?;
+            spotless.requested_reviewers = vec![Reviewer::User(Login::parse("octocat")?)];
+            spotless.checks = vec![Check::new(
+                CheckName::parse("Preview CI Gate")?,
+                CheckState::parse("SUCCESS"),
+                Some(at(0)),
+            )];
+            // *Newer*, so the push tie-break would put it second. Only the
+            // rung can put it first, which is the whole point -- with both on
+            // the same rung this fixture answers the same either way, and the
+            // test proves nothing. It did, until a mutation said so.
+            spotless.last_push = at(100);
+
+            let mut advisory = open_pr(2, "hubot")?;
+            advisory.requested_reviewers = vec![Reviewer::User(Login::parse("octocat")?)];
+            advisory.checks = vec![
+                Check::new(
+                    CheckName::parse("Preview CI Gate")?,
+                    CheckState::parse("SUCCESS"),
+                    Some(at(0)),
+                ),
+                Check::new(
+                    CheckName::parse("Not required at all")?,
+                    CheckState::parse("FAILURE"),
+                    Some(at(0)),
+                ),
+            ];
+            advisory.last_push = at(0);
+
+            let board = board_under(&rule, vec![advisory, spotless], &me);
+            Ok::<_, InvalidValue>(numbers(board.needs_your_review()))
+        });
+
+        assert_eq!(
+            order,
+            Ok(vec![1, 2]),
+            "nothing failing beats nothing blocking, whatever the push times say"
+        );
+    }
+
+    #[test]
     fn a_review_asked_only_of_a_team_does_not_put_the_pull_request_in_front_of_you() {
         // `Reviewer::Team` names no account, so the viewer cannot be recognised
         // in it even when they are a member. That is a known hole needing
@@ -1036,7 +1144,7 @@ mod tests {
 
             let board = board_for(vec![team_only], &me);
             let still_named = board
-                .not_waiting_on_you()
+                .unclaimed()
                 .iter()
                 .flat_map(|row| row.facts().requested_reviewers.iter())
                 .filter_map(Reviewer::name)
@@ -1045,7 +1153,7 @@ mod tests {
 
             Ok::<_, InvalidValue>((
                 numbers(board.needs_your_review()),
-                numbers(board.not_waiting_on_you()),
+                numbers(board.unclaimed()),
                 board.total(),
                 still_named,
             ))
