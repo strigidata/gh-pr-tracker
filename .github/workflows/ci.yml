@@ -1,51 +1,62 @@
 name: CI
 
-# The gate `AGENTS.md` calls the Definition of Done. Until this existed the rule
-# could not be satisfied at all, because there was nowhere for CI to be green.
+# The gate `AGENTS.md` calls the Definition of Done.
 #
 # Every step passes `--locked`. A build that silently updates `Cargo.lock` is not
 # the build anybody reviewed.
+#
+# # Compile once per (target, profile), not once per step
+#
+# `cargo clippy --all-targets` and `cargo test` share a debug build; a separate
+# `cargo build --all-targets` re-checks what both already did. And a `--release`
+# smoke run shares nothing with either — a second full compilation of the
+# dependency tree to test exit codes that are identical in either profile. Both
+# were here and both are gone.
+#
+# The Linux job stays on one target for the same reason: clippy against musl and
+# tests against the host gnu triple is two dependency trees where one will do.
 
 on:
   push:
     branches: [main]
   pull_request:
-  # So a release can be cut from a commit known to be green rather than assumed.
+  # So a release is cut from a commit known to be green, and can reuse the Linux
+  # artefact this builds rather than compiling musl a second time.
   workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
   # A CI failure that only says "error" costs a re-run to diagnose.
   RUST_BACKTRACE: 1
+  # Nothing is rebuilt incrementally across runs, and the files cost cache space.
+  CARGO_INCREMENTAL: 0
 
 concurrency:
   # A second push to the same branch makes the first run's answer irrelevant.
+  # Tags are excluded: cancelling a release half way leaves it half published.
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
-  gate:
+  macos:
     # macOS carries the full gate because the notification path links AppKit and
     # its failure modes are the hardest here to reason about.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install the toolchain
         run: rustup component add rustfmt clippy
 
       - uses: Swatinem/rust-cache@v2
 
-      # Ordered cheapest-first: a formatting failure is instant to detect and
-      # makes clippy's output diff-noisy if left in.
+      # Cheapest first: a formatting failure is instant to find and makes
+      # clippy's output diff-noisy if left in.
       - name: Format
         run: cargo fmt --all --check
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
-      - name: Build
-        run: cargo build --workspace --all-targets --locked
 
       - name: Test
         run: cargo test --workspace --all-features --locked
@@ -60,16 +71,18 @@ jobs:
       # A green suite does not prove the binary works. These are the properties
       # a test cannot reach: that the process starts, that its exit codes are
       # the contract, and that piped output is data rather than escapes.
+      #
+      # Run against the *debug* binary, which clippy and the tests have already
+      # built. No assertion here can tell the two profiles apart.
       - name: Smoke — the binary answers without a token
         run: |
-          # No `set -e`. This step asserts on exit codes, and the runner's shell
-          # already treats a non-zero one as fatal -- so the very check that
-          # matters most, "a missing token exits 3", killed the step before it
-          # could be inspected. Every command's status is captured explicitly
-          # instead.
+          # No `set -e`. This step asserts on exit codes and the runner's shell
+          # treats a non-zero one as fatal, so the check that matters most --
+          # "a missing token exits 3" -- killed the step before it could be
+          # inspected. Every status is captured explicitly instead.
           set -u
-          cargo build --release --locked -p prtrack-cli || exit 1
-          BIN=./target/release/prtrack
+          cargo build --locked -p prtrack-cli || exit 1
+          BIN=./target/debug/prtrack
 
           "$BIN" --version || exit 1
 
@@ -77,9 +90,6 @@ jobs:
           # exiting 2 while claiming the command line could not be read.
           code=0; "$BIN" --help >/dev/null 2>&1 || code=$?
           test "$code" -eq 0 || { echo "--help must exit 0, got $code"; exit 1; }
-
-          code=0; "$BIN" --version >/dev/null 2>&1 || code=$?
-          test "$code" -eq 0 || { echo "--version must exit 0, got $code"; exit 1; }
 
           # A missing token is an auth failure, distinct from a usage error and
           # from a network one. The exit code is the only part a script reads.
@@ -89,8 +99,8 @@ jobs:
           test "$code" -eq 3 || { echo "no token must exit 3, got $code"; cat /tmp/err.txt; exit 1; }
           grep -q "GH_TOKEN" /tmp/err.txt || { echo "the message must name the variable"; exit 1; }
 
-          # A bad command line is a usage error, and must not be confused with
-          # the above.
+          # A bad command line is a usage error and must not be confused with
+          # the above. The value of either is that they are different numbers.
           code=0; "$BIN" board >/dev/null 2>&1 || code=$?
           test "$code" -eq 2 || { echo "a missing --repo must exit 2, got $code"; exit 1; }
 
@@ -103,55 +113,66 @@ jobs:
 
   # Debian is a target, so a Linux break must fail here rather than at release
   # time. This job exists because one did: `adopt_bundle_identity` is macOS-only
-  # and was being called unconditionally, so the Linux build did not compile and
-  # a macOS-only gate could never have said so.
+  # and was called unconditionally, so the Linux build did not compile and a
+  # macOS-only gate could never have said so.
   #
   # musl, statically linked, because a binary built against the runner's glibc
-  # refuses to start on an older Debian — and "works on the machine that built
-  # it" is not a distribution.
+  # refuses to start on an older Debian — "works on the machine that built it"
+  # is not a distribution.
   linux:
     runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install the toolchain
         run: |
           rustup component add clippy
-          rustup target add x86_64-unknown-linux-musl
-          # `ring` compiles C, so cross-compiling to musl needs a musl C
-          # compiler even though everything else here is pure Rust.
+          rustup target add "$TARGET"
+          # `ring` compiles C, so building for musl needs a musl C compiler even
+          # though everything else here is pure Rust.
           sudo apt-get update && sudo apt-get install -y musl-tools
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked --target x86_64-unknown-linux-musl -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked --target "$TARGET" -- -D warnings
 
       - name: Test
-        # Native, not the musl target: tests run the host's binaries and musl
-        # adds nothing to what they exercise.
-        run: cargo test --workspace --all-features --locked
+        # The same target as clippy, so the debug artefacts are shared rather
+        # than a second dependency tree. musl binaries run fine on the runner.
+        run: cargo test --workspace --all-features --locked --target "$TARGET"
 
-      - name: Build the artefact the release will ship
+      - name: Build the artefact the release ships
         run: |
           set -euo pipefail
-          cargo build --release --locked -p prtrack-cli --target x86_64-unknown-linux-musl
-          BIN=target/x86_64-unknown-linux-musl/release/prtrack
+          cargo build --release --locked -p prtrack-cli --target "$TARGET"
+          BIN="target/$TARGET/release/prtrack"
           "$BIN" --version
+
           # Static, or it is not portable and the musl target bought nothing.
           #
-          # Tested as a property rather than a phrase. Two earlier versions of
-          # this check asserted on the exact wording of `ldd` and then of
-          # `file`, and both failed a binary that was already correct: glibc's
-          # ldd says "statically linked" where the obvious guess is "not a
-          # dynamic executable", and file says "static-pie linked" where the
-          # obvious guess is "statically linked". The property that actually
-          # matters is that nothing is resolved at load time, which is visible
-          # as the absence of any `=>` in ldd's output.
+          # Tested as a property, not a phrase. Two earlier versions asserted on
+          # the exact wording of `ldd` and then of `file`, and both failed a
+          # binary that was already correct: ldd says "statically linked" where
+          # the guess is "not a dynamic executable", and file says "static-pie
+          # linked" where the guess is "statically linked". What matters is that
+          # nothing resolves at load time, which is the absence of any `=>`.
           file "$BIN"
           if ldd "$BIN" 2>&1 | grep -q "=>"; then
-            echo "expected no shared library dependencies, got:"
-            ldd "$BIN"
-            exit 1
+            echo "expected no shared library dependencies, got:"; ldd "$BIN"; exit 1
           fi
-          echo "linux: no dynamic dependencies, and it runs"
+          mkdir -p dist && cp "$BIN" dist/prtrack
+
+      # Only for a release. Every other run would be paying to upload a binary
+      # that nothing downloads.
+      - name: Hand the binary to the release job
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-musl
+          path: dist/prtrack
+          retention-days: 1
