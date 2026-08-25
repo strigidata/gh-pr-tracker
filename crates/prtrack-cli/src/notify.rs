@@ -183,7 +183,8 @@ pub fn prepare() -> Option<String> {
 /// # Errors
 ///
 /// Returns whatever the notification backend rejected the request with. A
-/// failure to *open* is not reported: see [`open_in_browser`].
+/// failure to *open* the browser afterwards is not reported at all -- it''s
+/// best-effort, on a thread with no screen to report to.
 pub fn post(summary: &str, body: &str, url: &str) -> Result<()> {
     // The bundle identity is *not* adopted here. `set_application` is guarded
     // by a `Once`, so a second call reports `AlreadySet` — which this function
