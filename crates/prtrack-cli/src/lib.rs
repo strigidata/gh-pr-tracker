@@ -20,6 +20,7 @@ pub mod exit;
 pub mod json;
 pub mod notify;
 pub mod render;
+pub mod screen;
 pub mod state;
 pub mod update;
 pub mod watch;

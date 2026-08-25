@@ -110,7 +110,14 @@ impl BoardJson<'_> {
         }
         json!({
             "mine": listed(self.board.yours(), "mine"),
+            // Separate from `mine`, and from `drafts` which is everybody
+            // else's: a consumer counting what somebody is waiting on wants
+            // neither of the other two.
+            "mine_drafts": listed(self.board.your_drafts(), "mine_drafts"),
             "review": listed(self.board.needs_your_review(), "review"),
+            // Rendered under `review`, but a separate key: a consumer counting
+            // what was asked of somebody must not be handed what was not.
+            "unclaimed": listed(self.board.unclaimed(), "unclaimed"),
             "drafts": listed(self.board.other_drafts(), "drafts"),
             "neither": listed(self.board.not_waiting_on_you(), "neither"),
         })
@@ -274,12 +281,14 @@ mod tests {
             author: Some(Login::parse(author)?),
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse(SOME_SHA)?,
+            head_ref: BranchName::new("topic/branch-01"),
             base_ref: BranchName::new("main"),
             review_decision: None,
             mergeable: MergeableState::Mergeable,
             merge_state: MergeState::Clean,
             requested_reviewers: Vec::new(),
             changes_requested_by: Vec::new(),
+            reviewed_by: Vec::new(),
             unresolved_threads: 0,
             comments: 0,
             checks: Vec::new(),
@@ -392,10 +401,12 @@ mod tests {
         assert_eq!(
             sections,
             Ok(json!({
-                "mine":    [{"n": 2, "section": "mine"}, {"n": 1, "section": "mine"}],
+                "mine":    [{"n": 2, "section": "mine"}],
+                "mine_drafts": [{"n": 1, "section": "mine_drafts"}],
                 "review":  [{"n": 3, "section": "review"}],
                 "drafts":  [{"n": 4, "section": "drafts"}],
-                "neither": [{"n": 5, "section": "neither"}],
+                "neither": [],
+                "unclaimed": [{"n": 5, "section": "unclaimed"}],
             })),
             "the draft sorts last among the viewer's own, as the board ordered it"
         );
@@ -629,7 +640,14 @@ mod tests {
             "required_approvals",
             "required_checks",
         ];
-        const ORACLE_SECTIONS: [&str; 4] = ["drafts", "mine", "neither", "review"];
+        const SECTION_KEYS: [&str; 6] = [
+            "drafts",
+            "mine",
+            "mine_drafts",
+            "neither",
+            "review",
+            "unclaimed",
+        ];
 
         fn keys(value: &Value) -> Vec<String> {
             value
@@ -655,7 +673,7 @@ mod tests {
         );
         assert_eq!(
             at("/sections"),
-            Ok(ORACLE_SECTIONS.map(str::to_owned).to_vec())
+            Ok(SECTION_KEYS.map(str::to_owned).to_vec())
         );
         assert_eq!(at("/prs/0"), Ok(PR_KEYS.map(str::to_owned).to_vec()));
     }

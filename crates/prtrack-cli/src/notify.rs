@@ -174,10 +174,18 @@ pub fn prepare() -> Option<String> {
 /// whole thesis is the interruption must not claim otherwise, which is why
 /// nothing above this reports a nudge as "delivered".
 ///
+/// # Clicking it opens the pull request
+///
+/// A banner you cannot act on is a banner that made you go and find the thing
+/// yourself, which is most of the way back to not being told. The click is
+/// waited for on a detached thread and handed to the desktop's URL opener.
+///
 /// # Errors
 ///
-/// Returns whatever the notification backend rejected the request with.
-pub fn post(summary: &str, body: &str) -> Result<()> {
+/// Returns whatever the notification backend rejected the request with. A
+/// failure to *open* the browser afterwards is not reported at all -- it''s
+/// best-effort, on a thread with no screen to report to.
+pub fn post(summary: &str, body: &str, url: &str) -> Result<()> {
     // The bundle identity is *not* adopted here. `set_application` is guarded
     // by a `Once`, so a second call reports `AlreadySet` — which this function
     // would report as a failure, turning every notification after the first
@@ -185,13 +193,53 @@ pub fn post(summary: &str, body: &str) -> Result<()> {
     //
     // The Result is propagated rather than dropped on purpose. A discarded
     // error here is exactly how a broken notification path stays invisible.
-    Notification::new()
+    let handle = Notification::new()
         .summary(summary)
         .body(body)
+        // Registered so a body click is reported at all. On XDG a notification
+        // with no actions delivers nothing when clicked, so without this the
+        // banner is a dead end on Linux. macOS reports the click either way.
+        .action("default", "Open pull request")
         .show()
         .context("the notification backend rejected the request")?;
 
+    // Waiting blocks until the notification is acted on or goes away, and the
+    // watcher has a board to keep drawing — so it waits on its own thread and
+    // nobody joins it. A click that never comes ends when the notification
+    // does; a thread that outlives the process is ended by the process.
+    let target = url.to_owned();
+    std::thread::spawn(move || {
+        handle.wait_for_action(|action| {
+            // `__closed` is this backend's way of saying it went away by
+            // itself, which is not somebody asking for anything.
+            if action != "__closed" {
+                open_in_browser(&target);
+            }
+        });
+    });
+
     Ok(())
+}
+
+/// Opens `url` with whatever the desktop uses for links.
+///
+/// Best-effort and silent. This runs on a detached thread with no screen to
+/// report to — the watcher is repainting a board over anything it might print —
+/// and a browser that did not open is a disappointment rather than a failure of
+/// the thing the notification was telling you.
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(not(target_os = "macos"))]
+    let opener = "xdg-open";
+
+    drop(
+        std::process::Command::new(opener)
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn(),
+    );
 }
 
 /// Borrows a bundle identifier so macOS will accept our notification, and

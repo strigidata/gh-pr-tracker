@@ -50,6 +50,15 @@ pub struct BoardArgs {
     #[arg(long, default_value = "auto", value_parser = colour)]
     pub color: ColorChoice,
 
+    /// Hide the branch column.
+    ///
+    /// The branch is shown by default because it is what you type to go and
+    /// look at the work, and it is the one field the row otherwise makes you
+    /// open GitHub for. Teams whose branch names are long can turn it off
+    /// rather than let the row wrap.
+    #[arg(long)]
+    pub no_branch: bool,
+
     /// Keep watching, and notify when something changes.
     ///
     /// Refused when stdout is not a terminal: a watcher writing a board every

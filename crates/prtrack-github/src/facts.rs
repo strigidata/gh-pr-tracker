@@ -195,6 +195,7 @@ fn facts_of(
             DraftState::ReadyForReview
         },
         head: HeadSha::parse(&pull_request.head_ref_oid).map_err(refuse)?,
+        head_ref: BranchName::new(&pull_request.head_ref_name),
         base_ref: BranchName::new(&pull_request.base_ref_name),
         review_decision: pull_request
             .review_decision
@@ -204,6 +205,7 @@ fn facts_of(
         merge_state: merge_state_of(&pull_request.merge_state_status),
         requested_reviewers: reviewers_of(pull_request).map_err(refuse)?,
         changes_requested_by: changes_requested_by(pull_request).map_err(refuse)?,
+        reviewed_by: reviewed_by(pull_request).map_err(refuse)?,
         unresolved_threads: unresolved_threads(pull_request),
         comments: u32::try_from(pull_request.comments.total_count).map_err(|_source| {
             ConversionError::NegativeCount {
@@ -240,6 +242,43 @@ fn reviewers_of(
             // request would render the pull request as waiting on nobody.
             None => Ok(Reviewer::unknown("")),
         })
+        .collect()
+}
+
+/// Everyone whose review still stands.
+///
+/// Answers "have I already had my say", which the request list cannot: GitHub
+/// removes a reviewer from `reviewRequests` the moment they submit.
+///
+/// # Only verdicts that still count
+///
+/// **`Dismissed` is excluded, and that is the whole subtlety.** Where the rule
+/// dismisses stale reviews, a push after an approval throws that approval out —
+/// the pull request needs looking at again, and it is exactly the case somebody
+/// would otherwise never be told about, because it silently left their queue
+/// when they approved it and nothing puts it back.
+///
+/// `Commented` is excluded too: a comment is not a verdict, and somebody who
+/// asked a question has not reviewed. `Pending` is a draft review nobody has
+/// submitted.
+fn reviewed_by(pull_request: &wire::PullRequest) -> Result<Vec<Login>, prtrack_core::InvalidValue> {
+    pull_request
+        .latest_reviews
+        .nodes
+        .iter()
+        .flatten()
+        .flatten()
+        .filter(|review| match review.state {
+            wire::ReviewState::Approved | wire::ReviewState::ChangesRequested => true,
+            // Named rather than wildcarded, so a state GitHub adds later is a
+            // compile error here instead of a silent "yes, they reviewed it".
+            wire::ReviewState::Dismissed
+            | wire::ReviewState::Commented
+            | wire::ReviewState::Pending
+            | wire::ReviewState::Unknown(_) => false,
+        })
+        .filter_map(|review| review.author.as_ref())
+        .map(|actor| Login::parse(&actor.login))
         .collect()
 }
 
@@ -525,7 +564,7 @@ mod tests {
             "the recording converts into at least one pull request"
         );
 
-        assert_eq!(first.map(|f| f.number.get()), Some(4440));
+        assert_eq!(first.map(|f| f.number.get()), Some(4449));
         assert_eq!(first.map(|f| f.repo.to_string()), Some(REPO.to_owned()));
         assert_eq!(first.map(|f| f.head.as_str().len()), Some(40));
         assert_eq!(first.map(|f| f.base_ref.as_str()), Some("main"));
@@ -540,7 +579,9 @@ mod tests {
         );
         assert_eq!(
             first.map(|f| f.draft_state),
-            Some(DraftState::ReadyForReview)
+            // The newest pull request in this recording happens to be a draft.
+            // Pinned to what was recorded rather than to what is tidy.
+            Some(DraftState::Draft)
         );
     }
 
@@ -703,7 +744,7 @@ mod tests {
             .map(|(facts, _)| facts.checks.len())
             .sum();
         assert_eq!(
-            attempts, 1677,
+            attempts, 1669,
             "every reported attempt of either kind must survive"
         );
     }
@@ -822,11 +863,11 @@ mod tests {
             .map(|(facts, _)| facts.requested_reviewers.len())
             .collect();
 
-        assert_eq!(requested.iter().sum::<usize>(), 85);
+        assert_eq!(requested.iter().sum::<usize>(), 63);
         assert_eq!(
             requested.iter().filter(|count| **count > 0).count(),
-            29,
-            "twenty-nine of the recorded pull requests are waiting on somebody"
+            22,
+            "twenty-two of the recorded pull requests are waiting on somebody"
         );
     }
 
@@ -845,8 +886,8 @@ mod tests {
         assert_eq!(counted.len(), TOTAL_OPEN);
         assert_eq!(
             counted.iter().map(|(threads, _)| threads).sum::<u32>(),
-            7,
-            "the recording holds seven unresolved threads"
+            3,
+            "the recording holds three unresolved threads"
         );
         assert_eq!(
             counted.iter().map(|(_, comments)| *comments).max(),
@@ -906,8 +947,8 @@ mod tests {
             .filter(|(facts, _)| facts.draft_state == DraftState::Draft)
             .count();
         assert_eq!(
-            drafts, 15,
-            "fifteen of the recorded pull requests are drafts"
+            drafts, 17,
+            "seventeen of the recorded pull requests are drafts"
         );
     }
 
@@ -951,6 +992,51 @@ mod tests {
     }
 
     #[test]
+    fn a_review_a_push_dismissed_puts_the_pull_request_back_on_your_plate() {
+        // Approve, somebody pushes, the rule dismisses stale reviews: the
+        // approval is thrown out and the pull request needs looking at again.
+        //
+        // This is the case that hides. It left the reviewer's queue when they
+        // approved it -- GitHub drops them from the request list on submit --
+        // and nothing puts it back, so counting a dismissed review as "already
+        // reviewed" makes it invisible to the one person who has to act.
+        let states = |state: &str| {
+            converted_with(|pull_request| {
+                for review in pull_request
+                    .latest_reviews
+                    .nodes
+                    .iter_mut()
+                    .flatten()
+                    .flatten()
+                {
+                    review.state = serde_json::from_value(serde_json::json!(state))
+                        .unwrap_or(wire::ReviewState::Pending);
+                }
+            })
+            .map(|facts| {
+                facts
+                    .pull_requests()
+                    .iter()
+                    .map(|(pr, _)| pr.reviewed_by.len())
+                    .sum::<usize>()
+            })
+        };
+
+        let approved = states("APPROVED");
+        let dismissed = states("DISMISSED");
+
+        assert!(
+            approved.is_some_and(|count| count > 0),
+            "the recording has reviews to dismiss, or this proves nothing"
+        );
+        assert_eq!(
+            dismissed,
+            Some(0),
+            "a dismissed review is not a review that still stands"
+        );
+    }
+
+    #[test]
     fn the_facts_reduce_into_the_board_they_were_built_for() {
         // The contract this whole task feeds. If the shapes did not line up the
         // failure would be a compile error, but the counts are worth pinning:
@@ -968,6 +1054,7 @@ mod tests {
             assert_eq!(board.total(), TOTAL_OPEN);
             assert_eq!(
                 board.yours().len()
+                    + board.your_drafts().len()
                     + board.needs_your_review().len()
                     + board.other_drafts().len()
                     + board.not_waiting_on_you().len(),

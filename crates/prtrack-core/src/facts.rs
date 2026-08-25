@@ -814,6 +814,10 @@ pub struct PrFacts {
     /// head are the fresh-looking stale cell this crate is built to avoid.
     pub head: HeadSha,
 
+    /// The pull request's own branch — what you would check out to work on it,
+    /// and the thing a reader copies rather than retypes.
+    pub head_ref: BranchName,
+
     /// The branch it wants to merge into.
     ///
     /// Read to decide *which* [`PolicyRules`] apply. A rule protects a pattern
@@ -871,6 +875,17 @@ pub struct PrFacts {
     ///
     /// [`review_decision`]: PrFacts::review_decision
     pub changes_requested_by: Vec<Login>,
+
+    /// Everyone whose latest review is on the record, whatever it said.
+    ///
+    /// Superset of [`changes_requested_by`]: an approval counts too. Read to
+    /// answer one question the request list cannot — *have I already looked at
+    /// this?* GitHub removes a reviewer from `requested_reviewers` the moment
+    /// they submit, so an approved pull request and one nobody was ever asked
+    /// about are indistinguishable without this.
+    ///
+    /// [`changes_requested_by`]: PrFacts::changes_requested_by
+    pub reviewed_by: Vec<Login>,
 
     /// How many review threads are still open.
     ///
@@ -1000,12 +1015,14 @@ mod tests {
             author: Some(Login::parse("octocat")?),
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse("9f2c4e1b7a3d5068c9e4b2a17f36d8095c1e4a7b")?,
+            head_ref: BranchName::new("topic/branch-01"),
             base_ref: BranchName::new("main"),
             review_decision: Some(ReviewDecision::Approved),
             mergeable: MergeableState::Conflicting,
             merge_state: MergeState::Dirty,
             requested_reviewers: vec![Reviewer::Team(TeamSlug::new("ledger-owners"))],
             changes_requested_by: Vec::new(),
+            reviewed_by: Vec::new(),
             unresolved_threads: 0,
             comments: 4,
             checks: vec![

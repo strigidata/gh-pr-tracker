@@ -156,10 +156,17 @@ tests, docs and a smoke run, plus a Linux job building the static musl artefact
 the release ships. **Both must be green.** A macOS-only gate once let a Linux
 build that never compiled sit on `main` for an hour.
 
-A release is `.github/workflows/release.yml`, triggered by a `vN.N.N` tag whose
-version must match `prtrack-cli`'s. Cut a release only from a commit whose CI is
-already green, and remember the version bump — a tag ten minutes ahead of a fix
-ships the bug.
+**A release is a merged version bump.** `.github/workflows/release.yml` watches
+`main`, compares `prtrack-cli`'s version against the tags, and publishes when it
+finds one with no tag. There is no tag to push: raise the version in the pull
+request that finishes the work, and merging it cuts the release from the exact
+commit that was built and tested.
+
+That removes a failure this repository already had — a tag pushed ten minutes
+before a fix landed, shipping the bug — because the version and the code can no
+longer disagree about which commit is the release. Publishing runs in the
+`release` environment, so a required reviewer can be added without touching the
+workflow.
 
 `origin/main` is the stable baseline. If a gate surfaces a problem outside the
 branch's authorized scope, do not silently fix it from the feature branch.

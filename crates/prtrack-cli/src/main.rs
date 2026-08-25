@@ -24,6 +24,7 @@ use prtrack_cli::exit::Exit;
 use prtrack_cli::json::BoardJson;
 use prtrack_cli::notify;
 use prtrack_cli::render::BoardText;
+use prtrack_cli::screen::{self, Screen};
 use prtrack_cli::state::WatchState;
 use prtrack_cli::update;
 use prtrack_cli::watch::{already_waiting, tick, Nudged};
@@ -122,6 +123,7 @@ fn watch(args: &BoardArgs) -> Result<Exit, Trouble> {
     if let Some(warning) = notify::prepare() {
         eprintln!("prtrack: {warning}");
     }
+
     if let notify::Focus::Active { mode } = notify::focus() {
         eprintln!(
             "prtrack: {mode} is on, so macOS will drop every notification without \
@@ -163,6 +165,28 @@ async fn watch_forever(
     let mut state = remembered(path);
     let mut first_poll = true;
 
+    // The board is repainted in place rather than printed again underneath, so
+    // the terminal shows one board rather than a transcript of every poll. The
+    // screen restores the cursor when this function returns by any route.
+    let interactive = args.format == Format::Text && std::io::stdout().is_terminal();
+    let mut screen = Screen::new(std::io::stdout(), interactive);
+
+    // Anything worth saying goes here rather than to stderr while the screen is
+    // being repainted, because a repaint erases from the cursor down and stderr
+    // lines sit exactly there. Without this the nudges — the whole product —
+    // survived until the next poll and no longer.
+    let mut footer = screen::Footer::default();
+    if interactive {
+        // A Focus mode is a standing condition, not an event: it was announced
+        // once at startup and erased by the first repaint, which is the worst
+        // possible place to lose "your notifications are being swallowed".
+        if let notify::Focus::Active { mode } = notify::focus() {
+            footer.warnings.push(format!(
+                "{mode} is on, so macOS will drop every notification without showing it."
+            ));
+        }
+    }
+
     // Resolved for *stderr*, which is where a nudge goes. It is a different
     // stream from the board's and can be redirected on its own, so borrowing
     // stdout's answer would write escapes into a log the moment somebody ran
@@ -179,13 +203,24 @@ async fn watch_forever(
                     .collect();
                 let board =
                     Board::assemble(judged.iter().map(|(row, _)| row.clone()).collect(), &viewer);
-                write_board(
-                    args,
-                    &board,
-                    &judged,
-                    default_branch.as_ref(),
-                    &default_rule,
-                );
+
+                match default_branch
+                    .as_ref()
+                    .map(|branch| board_text(args, &board, branch, &default_rule))
+                {
+                    Some(rendered) => {
+                        screen.redraw(&format!("{rendered}{}", footer.render(palette(args))));
+                    }
+                    // JSON, or a repository with no default branch. Neither is
+                    // a board to repaint, so fall back to writing it out.
+                    None => write_board(
+                        args,
+                        &board,
+                        &judged,
+                        default_branch.as_ref(),
+                        &default_rule,
+                    ),
+                }
 
                 if first_poll {
                     announce_first_poll(&judged, &viewer);
@@ -193,7 +228,10 @@ async fn watch_forever(
                 }
 
                 for nudged in tick(&mut state, &judged, &viewer) {
-                    deliver(&nudged, stderr_palette);
+                    let line = deliver(&nudged, stderr_palette, !interactive);
+                    if interactive {
+                        footer.saw(line);
+                    }
                 }
 
                 // Once per poll, which the one-hour cache turns into once an
@@ -203,7 +241,15 @@ async fn watch_forever(
                     .await
                     .notice()
                 {
-                    eprintln!("{notice}");
+                    if interactive {
+                        // A condition rather than an event: it stays true until
+                        // somebody upgrades, so it is replaced rather than
+                        // accumulated.
+                        footer.warnings.retain(|line| !line.starts_with('❗'));
+                        footer.warnings.push(notice);
+                    } else {
+                        eprintln!("{notice}");
+                    }
                 }
                 if let Err(reason) = state.save(path) {
                     eprintln!(
@@ -225,7 +271,29 @@ async fn watch_forever(
             }
         }
 
-        tokio::time::sleep(interval).await;
+        // The countdown, ticking under the board. Broken into one-second steps
+        // rather than one long sleep so the line can be rewritten as it counts,
+        // and so `Updating...` appears the moment the wait ends rather than
+        // after the fetch that follows it.
+        //
+        // Ctrl-C is raced against every step. Without it the process dies on
+        // the signal, `Screen`'s destructor never runs, and the shell the user
+        // returns to has an invisible cursor with no way to know why — the
+        // failure `AGENTS.md` means by "a crash must restore the terminal".
+        let seconds = i64::try_from(interval.as_secs()).unwrap_or(i64::MAX);
+        for remaining in (1..=seconds).rev() {
+            screen.status_line(&screen::countdown(remaining));
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                result = tokio::signal::ctrl_c() => {
+                    // An unavailable handler is not a reason to keep running:
+                    // the user asked to stop either way.
+                    drop(result);
+                    return Ok(Exit::Informational);
+                }
+            }
+        }
+        screen.status_line(&screen::updating());
     }
 }
 
@@ -287,7 +355,7 @@ fn announce_first_poll(judged: &[(BoardRow, PolicyRules)], viewer: &Login) {
 /// there is no way for this process to tell. The stderr line is the only
 /// record a user has that something was meant to reach them, which is why it
 /// is printed whether or not the banner appears.
-fn deliver(nudged: &Nudged, stderr_palette: Palette) {
+fn deliver(nudged: &Nudged, stderr_palette: Palette, to_stderr: bool) -> String {
     let summary = nudged.summary();
 
     // Where stderr is a terminal the number carries the link and the URL is not
@@ -302,18 +370,27 @@ fn deliver(nudged: &Nudged, stderr_palette: Palette) {
             format!("{linked} {}", nudged.happened())
         }
     };
-    eprintln!("prtrack: {line}");
+    // Printed here only when nothing is repainting the screen. A watcher draws
+    // it into the frame instead, because a redraw erases from the cursor down
+    // and would take this with it.
+    if to_stderr {
+        eprintln!("prtrack: {line}");
+    }
 
     // The notification gets the plain form. Its body is not a terminal and
     // would show an escape sequence literally.
-    if let Err(reason) = notify::post(&summary, nudged.title.as_str()) {
+    if let Err(reason) = notify::post(&summary, nudged.title.as_str(), nudged.url.as_str()) {
         eprintln!("prtrack: that notification could not be posted: {reason:#}");
     } else if let notify::Focus::Active { mode } = notify::focus() {
         // Checked per nudge rather than once, because a Focus can begin
         // mid-session -- and the run where that happens is exactly the run
         // where somebody is about to conclude the tool is broken.
-        eprintln!("prtrack: ...but {mode} is on, so that banner was suppressed.");
+        if to_stderr {
+            eprintln!("prtrack: ...but {mode} is on, so that banner was suppressed.");
+        }
     }
+
+    line
 }
 
 /// Reads what a previous run remembered, saying so if it cannot.
@@ -482,6 +559,29 @@ fn fetch(args: &BoardArgs) -> Result<(RepositoryFacts, Option<String>), Trouble>
 }
 
 /// Writes the board to stdout in the shape that was asked for.
+/// Renders the board as the text `--watch` repaints, or `None` where there is
+/// no default branch to name.
+///
+/// Split from [`write_board`] because a watcher hands the text to
+/// [`Screen::redraw`] rather than printing it: printing appends, and appending
+/// is the thing `--watch` is not supposed to do.
+fn board_text(
+    args: &BoardArgs,
+    board: &Board,
+    default_branch: &BranchName,
+    default_rule: &PolicyRules,
+) -> String {
+    BoardText {
+        board,
+        rules: default_rule,
+        default_branch: default_branch.as_str(),
+        now: Utc::now(),
+        palette: palette(args),
+        show_branch: !args.no_branch,
+    }
+    .render()
+}
+
 fn write_board(
     args: &BoardArgs,
     board: &Board,
@@ -496,17 +596,7 @@ fn write_board(
             // policy line would be a sentence about nothing. It is omitted
             // rather than given a placeholder, because a line naming a branch
             // is a line a reader will believe.
-            let text = default_branch.map(|branch| {
-                BoardText {
-                    board,
-                    rules: default_rule,
-                    default_branch: branch.as_str(),
-                    now: Utc::now(),
-                    palette: palette(args),
-                }
-                .render()
-            });
-            match text {
+            match default_branch.map(|branch| board_text(args, board, branch, default_rule)) {
                 Some(rendered) => print!("{rendered}"),
                 None => eprintln!(
                     "prtrack: this repository has no default branch, so there is no policy \
