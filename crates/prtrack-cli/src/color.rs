@@ -189,6 +189,34 @@ impl Palette {
             .code()
             .map_or_else(|| text.to_owned(), |code| format!("{code}{text}{RESET}"))
     }
+
+    /// Makes `text` a hyperlink to `url`, or hands it back untouched.
+    ///
+    /// This is OSC 8, which lets a terminal attach a URL to text without
+    /// spending a single column on it — so `#4225` stays seven cells wide and
+    /// is still clickable. A terminal that does not understand it discards the
+    /// sequence and shows the text, which is why this needs no capability
+    /// detection.
+    ///
+    /// # Tied to painting, deliberately
+    ///
+    /// Emitted only when [`paint`] would emit. A hyperlink is not colour and
+    /// `NO_COLOR` does not speak to it, but every reason not to paint applies
+    /// here unchanged: output that is not a terminal must carry no escapes at
+    /// all, and somebody who asked for plain text is asking for plain text.
+    /// Splitting the two would mean `--color=never` still writing escapes.
+    ///
+    /// [`paint`]: Palette::paint
+    #[must_use]
+    pub fn link(self, url: &str, text: &str) -> String {
+        if !self.painting {
+            return text.to_owned();
+        }
+        // `ESC ] 8 ; <params> ; <url> ST`, then the text, then the same with an
+        // empty URL to close it. `ESC \` is the String Terminator; `BEL` also
+        // works and is likelier to be mangled by something in between.
+        format!("\u{1b}]8;;{url}\u{1b}\\{text}\u{1b}]8;;\u{1b}\\")
+    }
 }
 
 #[cfg(test)]
@@ -312,6 +340,32 @@ mod tests {
         // interrupt a row-level dim.
         let palette = Palette::resolve(ColorChoice::Always, &interactive());
         assert_eq!(palette.paint(Style::Plain, "#4225"), "#4225");
+    }
+
+    #[test]
+    fn a_link_is_written_only_where_paint_would_be() {
+        // A hyperlink is not colour, so `NO_COLOR` does not speak to it -- but
+        // every reason not to paint applies unchanged. The one that matters is
+        // the pipe: stdout carrying escapes is corrupt data, and a URL is a
+        // much larger corruption than a colour code.
+        let painting = Palette::resolve(ColorChoice::Always, &interactive());
+        let plain = Palette::resolve(ColorChoice::Never, &interactive());
+
+        let linked = painting.link("https://example.com/pull/1", "#1");
+        assert!(
+            linked.contains("https://example.com/pull/1"),
+            "the URL is carried"
+        );
+        assert!(
+            linked.ends_with("\u{1b}]8;;\u{1b}\\"),
+            "and the link is closed again"
+        );
+
+        assert_eq!(
+            plain.link("https://example.com/pull/1", "#1"),
+            "#1",
+            "not painting means not one escape byte, URL included"
+        );
     }
 
     #[test]

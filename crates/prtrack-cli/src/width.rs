@@ -14,11 +14,25 @@ const ESC: char = '\u{1b}';
 /// every colour code belongs to.
 const CSI: char = '[';
 
+/// The byte that follows [`ESC`] in an Operating System Command — the family
+/// hyperlinks belong to.
+const OSC: char = ']';
+
+/// The byte that can end an OSC instead of `ESC \`. Both are legal and
+/// terminals emit either, so both are accepted.
+const BEL: char = '\u{7}';
+
 /// Steps over an escape sequence, returning what is left after it.
 ///
-/// A CSI sequence runs from `ESC [` to the first byte in the range `@` to `~`,
-/// which is the terminator. Anything else beginning with `ESC` is a two-byte
-/// escape this renderer never emits; one character is consumed so that a
+/// Two families reach here, and they end differently. A CSI runs from `ESC [`
+/// to the first byte in `@`..=`~`. An OSC runs from `ESC ]` to a String
+/// Terminator — either `ESC \` or a bare `BEL` — and its payload is arbitrary
+/// text, so it cannot be ended by scanning for a character class.
+///
+/// **An OSC that is not skipped is not a small error.** Its payload is a URL,
+/// so counting it would add roughly forty phantom cells to a seven-cell column
+/// and shear every row below it. Anything else beginning with `ESC` is a
+/// two-byte escape this renderer never emits; one character is consumed so a
 /// stray one cannot spin the caller.
 fn skip_escape(rest: &str) -> &str {
     let mut chars = rest.chars();
@@ -34,8 +48,33 @@ fn skip_escape(rest: &str) -> &str {
                         .unwrap_or_default()
                 })
         }
+        Some(OSC) => skip_to_string_terminator(chars.as_str()),
         Some(_) | None => chars.as_str(),
     }
+}
+
+/// Steps over an OSC payload and its terminator.
+///
+/// Unterminated input returns empty rather than the remainder: a sequence the
+/// terminal would swallow to end-of-output must not be counted as cells here,
+/// or the two disagree about what is on the screen.
+fn skip_to_string_terminator(payload: &str) -> &str {
+    let mut rest = payload;
+    while let Some(ch) = rest.chars().next() {
+        rest = rest.get(ch.len_utf8()..).unwrap_or_default();
+        if ch == BEL {
+            return rest;
+        }
+        if ch == ESC {
+            // `ESC \` is the two-character form. The backslash is consumed
+            // with it; anything else after `ESC` inside a payload is not a
+            // terminator and the scan continues.
+            if rest.starts_with('\\') {
+                return rest.get('\\'.len_utf8()..).unwrap_or_default();
+            }
+        }
+    }
+    ""
 }
 
 /// How many terminal cells `text` occupies once escape sequences are
@@ -110,6 +149,48 @@ mod tests {
     /// test does not depend on the palette agreeing with it.
     const RED: &str = "\u{1b}[31m";
     const RESET: &str = "\u{1b}[0m";
+
+    #[test]
+    fn a_hyperlink_occupies_only_the_cells_of_its_text() {
+        // OSC 8 carries a URL, so a payload counted as text does not add one
+        // cell -- it adds the whole URL. Roughly forty phantom cells in a
+        // seven-cell column, which shears every row under it.
+        let linked = "\u{1b}]8;;https://github.com/octo-org/example/pull/4225\u{1b}\\#4225\u{1b}]8;;\u{1b}\\";
+        assert_eq!(visible_width(linked), 5, "only `#4225` is drawn");
+
+        // BEL is the other legal terminator and terminals emit both.
+        let bel = "\u{1b}]8;;https://example.com\u{7}#1\u{1b}]8;;\u{7}";
+        assert_eq!(visible_width(bel), 2, "BEL ends an OSC as well as `ESC \\`");
+
+        // A link inside a painted cell: both families have to be skipped, and
+        // the row only aligns if neither leaks.
+        let both = "\u{1b}]8;;https://example.com\u{1b}\\\u{1b}[31m#7\u{1b}[0m\u{1b}]8;;\u{1b}\\";
+        assert_eq!(
+            visible_width(both),
+            2,
+            "colour inside a link still measures 2"
+        );
+
+        // Padding is the thing that actually breaks, so assert on it rather
+        // than only on the measurement it uses.
+        assert_eq!(
+            visible_width(&pad_to(linked, 7)),
+            7,
+            "a linked cell pads to its column like any other"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_hyperlink_does_not_leak_its_url_into_the_count() {
+        // A truncated sequence is one the terminal swallows to end of output.
+        // Counting the remainder would put the renderer and the screen into
+        // disagreement about what is drawn.
+        assert_eq!(
+            visible_width("\u{1b}]8;;https://example.com/very/long/path"),
+            0,
+            "an unterminated OSC draws nothing"
+        );
+    }
 
     #[test]
     fn escape_sequences_occupy_no_cells() {

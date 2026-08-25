@@ -192,8 +192,14 @@ impl BoardText<'_> {
 
         format!(
             "{}{}{}{}{}{}{}",
+            // The number is a link to the pull request. OSC 8 costs no columns,
+            // so the URL is reachable without a column wide enough to print it
+            // — and the row stays scannable, which a full URL per row does not.
             pad_to(
-                &palette.paint(Style::Plain, &format!("#{}", facts.number.get())),
+                &palette.link(
+                    facts.url.as_str(),
+                    &palette.paint(Style::Plain, &format!("#{}", facts.number.get())),
+                ),
                 PR_COLUMN
             ),
             pad_to(
