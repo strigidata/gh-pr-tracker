@@ -4,6 +4,13 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+# The crate is `prtrack-cli` because the library half lives beside it, but the
+# thing a person types is `prtrack` — which is what every message it prints
+# already calls itself, down to `prtrack: could not prepare a GitHub client`.
+[[bin]]
+name = "prtrack"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 chrono = { workspace = true }

@@ -25,8 +25,8 @@ concurrency:
 
 jobs:
   gate:
-    # macOS because the notification path is macOS-only and links AppKit, so a
-    # Linux-only gate would not compile the crate that matters most.
+    # macOS carries the full gate because the notification path links AppKit and
+    # its failure modes are the hardest here to reason about.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -65,17 +65,17 @@ jobs:
           set -u
           cargo build --release --locked -p prtrack-cli
 
-          ./target/release/prtrack-cli --version
-          ./target/release/prtrack-cli --help >/dev/null
+          ./target/release/prtrack --version
+          ./target/release/prtrack --help >/dev/null
 
           # `--help` and `--version` are successes. This regressed once already,
           # exiting 2 and claiming the command line could not be read.
-          ./target/release/prtrack-cli --help >/dev/null 2>&1
+          ./target/release/prtrack --help >/dev/null 2>&1
           test $? -eq 0 || { echo "--help must exit 0"; exit 1; }
 
           # No token is an auth failure, distinct from a usage error and from a
           # network one. The exit code is the only part a script can read.
-          env -u GH_TOKEN -u GITHUB_TOKEN ./target/release/prtrack-cli \
+          env -u GH_TOKEN -u GITHUB_TOKEN ./target/release/prtrack \
             board --repo octo-org/example >/dev/null 2>/tmp/err.txt
           code=$?
           test $code -eq 3 || { echo "no token must exit 3, got $code"; cat /tmp/err.txt; exit 1; }
@@ -84,4 +84,47 @@ jobs:
           # A token must never reach stderr, however the run fails.
           if grep -qE "ghp_|github_pat_" /tmp/err.txt; then
             echo "a credential reached stderr"; exit 1
+          fi
+
+  # Debian is a target, so a Linux break must fail here rather than at release
+  # time. This job exists because one did: `adopt_bundle_identity` is macOS-only
+  # and was being called unconditionally, so the Linux build did not compile and
+  # a macOS-only gate could never have said so.
+  #
+  # musl, statically linked, because a binary built against the runner's glibc
+  # refuses to start on an older Debian — and "works on the machine that built
+  # it" is not a distribution.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: |
+          rustup component add clippy
+          rustup target add x86_64-unknown-linux-musl
+          # `ring` compiles C, so cross-compiling to musl needs a musl C
+          # compiler even though everything else here is pure Rust.
+          sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked --target x86_64-unknown-linux-musl -- -D warnings
+
+      - name: Test
+        # Native, not the musl target: tests run the host's binaries and musl
+        # adds nothing to what they exercise.
+        run: cargo test --workspace --all-features --locked
+
+      - name: Build the artefact the release will ship
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p prtrack-cli --target x86_64-unknown-linux-musl
+          BIN=target/x86_64-unknown-linux-musl/release/prtrack
+          "$BIN" --version
+          # Static, or it is not portable and the musl target bought nothing.
+          file "$BIN"
+          if ldd "$BIN" 2>&1 | grep -qv "not a dynamic executable"; then
+            echo "expected a static binary"; ldd "$BIN"; exit 1
           fi

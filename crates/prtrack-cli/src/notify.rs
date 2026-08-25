@@ -114,6 +114,42 @@ fn read_focus(parsed: &serde_json::Value) -> Focus {
     }
 }
 
+/// Readies the platform's notification path, and reports anything that will
+/// stop a notification arriving.
+///
+/// Called once before the first post. The two platforms fail differently and
+/// both fail *quietly*, which is the only reason this exists: on macOS a
+/// notification with no owning bundle is dropped without an error, and on Linux
+/// there is nothing to deliver to unless a session bus is running.
+///
+/// Returns `None` when nothing is known to be wrong. That is not a promise the
+/// notification will arrive — see [`post`].
+#[must_use]
+pub fn prepare() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        adopt_bundle_identity()
+            .err()
+            .map(|reason| format!("notifications may not appear: {reason:#}"))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // A desktop notification on Linux is a D-Bus message to a notification
+        // daemon. Over SSH, in a container, or on a server there is no session
+        // bus and no daemon, so the post fails or goes nowhere. Worth saying
+        // once at startup rather than once per nudge.
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            return Some(
+                "no D-Bus session bus, so desktop notifications will not be delivered. \
+                 Nudges will still be printed here."
+                    .to_owned(),
+            );
+        }
+        None
+    }
+}
+
 /// Posts one notification.
 ///
 /// **Whether it is displayed is not knowable from here.** The backend accepts

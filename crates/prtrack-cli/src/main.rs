@@ -118,8 +118,8 @@ fn watch(args: &BoardArgs) -> Result<Exit, Trouble> {
     // Once, before the first notification. macOS attributes a notification to
     // an application bundle and silently drops one it cannot attribute; see
     // `prtrack_cli::notify`.
-    if let Err(reason) = notify::adopt_bundle_identity() {
-        eprintln!("prtrack: notifications may not appear: {reason:#}");
+    if let Some(warning) = notify::prepare() {
+        eprintln!("prtrack: {warning}");
     }
     if let notify::Focus::Active { mode } = notify::focus() {
         eprintln!(
