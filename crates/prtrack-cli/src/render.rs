@@ -176,12 +176,15 @@ impl BoardText<'_> {
     /// One pull request as a row of columns.
     ///
     /// A row the viewer cannot act on is drawn dim — see [`Palette::dimmed`] —
-    /// **except its status cells**. CI and open threads keep their colour in
-    /// every row, because the two say different things: the dim means "you
-    /// cannot act on this", and the colour means "this is what is wrong". A
-    /// dimmed row is still the fastest place to see that six required checks
+    /// **except its status cells**. CI, open threads and the reason keep their
+    /// colour in every row, because the two say different things: the dim means
+    /// "you cannot act on this", and the colour means "this is what is wrong".
+    /// A dimmed row is still the fastest place to see that six required checks
     /// are red, and flattening that to grey hid the one fact the column exists
     /// to carry.
+    ///
+    /// What stays dim is identity and timing — the number, the author, the age
+    /// — which is enough to read the row as muted without hiding its state.
     ///
     /// Each cell is padded after it is painted, using the width it *shows*
     /// rather than the bytes it holds.
@@ -213,11 +216,13 @@ impl BoardText<'_> {
                 &palette.paint(Style::Plain, truncate_to(author, AUTHOR_CELLS)),
                 AUTHOR_COLUMN
             ),
-            // `self.palette`, not the dimmed one: see the note above.
+            // `self.palette`, not the dimmed one: see the note above. The
+            // reason is status too — it is the answer to the question the
+            // column asks — so it keeps its colour with the other two.
             pad_to(&checks_cell(row, is_draft, self.palette), CI_COLUMN),
             pad_to(&threads_cell(row, self.rules, self.palette), THREADS_COLUMN),
             pad_to(&merge_cell(row, is_draft, palette), MERGE_COLUMN),
-            pad_to(&reason_cell(row.reason(), palette), REASON_COLUMN),
+            pad_to(&reason_cell(row.reason(), self.palette), REASON_COLUMN),
             palette.paint(Style::Plain, &self.age_of(row)),
         )
     }
@@ -983,12 +988,12 @@ mod tests {
             "a failing required check stays red even where the row is dim"
         );
 
-        // And the reason column -- prose, not status -- does not fight it.
+        // Identity still reads as muted, which is what makes the row scan as
+        // one the viewer can skip.
         assert_eq!(
-            row.as_ref()
-                .map(|line| line.contains("\u{1b}[34m") || line.contains("\u{1b}[35m")),
-            Ok(false),
-            "prose cells stay dim; only status cells keep colour"
+            row.as_ref().map(|line| line.contains("\u{1b}[2mocto")),
+            Ok(true),
+            "the author stays dim, so the row still reads as one to skip"
         );
     }
 
