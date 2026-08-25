@@ -37,18 +37,22 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
+# Least privilege, stated rather than inherited. Nothing in the gate writes.
+permissions:
+  contents: read
+
 jobs:
   macos:
     # macOS carries the full gate because the notification path links AppKit and
     # its failure modes are the hardest here to reason about.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install the toolchain
         run: rustup component add rustfmt clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Cheapest first: a formatting failure is instant to find and makes
       # clippy's output diff-noisy if left in.
@@ -124,7 +128,7 @@ jobs:
     env:
       TARGET: x86_64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install the toolchain
         run: |
@@ -134,7 +138,7 @@ jobs:
           # though everything else here is pure Rust.
           sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ env.TARGET }}
 
@@ -171,7 +175,7 @@ jobs:
       # that nothing downloads.
       - name: Hand the binary to the release job
         if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-musl
           path: dist/prtrack
