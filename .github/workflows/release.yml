@@ -78,13 +78,17 @@ jobs:
             echo "release=true" >>"$GITHUB_OUTPUT"
           fi
 
-  # The same gate every push runs. A release built from a commit whose tests
-  # were never run is a release nobody can vouch for — and its Linux job
-  # publishes the musl binary this workflow ships.
+  # The gate for every commit on `main`, release or not. It runs unconditionally
+  # because `ci.yml` no longer has a push trigger of its own: this is the only
+  # thing verifying the default branch, and skipping it on non-release commits
+  # would leave most of `main` unchecked.
+  #
+  # It publishes the Linux binary only when a release is going to collect it.
   gate:
     needs: decide
-    if: needs.decide.outputs.release == 'true'
     uses: ./.github/workflows/ci.yml
+    with:
+      upload_artifact: ${{ needs.decide.outputs.release == 'true' }}
 
   release:
     needs: [decide, gate]
