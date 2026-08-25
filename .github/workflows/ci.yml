@@ -139,7 +139,13 @@ jobs:
           BIN=target/x86_64-unknown-linux-musl/release/prtrack
           "$BIN" --version
           # Static, or it is not portable and the musl target bought nothing.
+          #
+          # Asserted with `file`, not `ldd`. glibc's ldd prints "statically
+          # linked" for a musl-static binary rather than "not a dynamic
+          # executable", so the obvious ldd check reports a correct build as
+          # broken -- which it did, on the first run of this job.
           file "$BIN"
-          if ldd "$BIN" 2>&1 | grep -qv "not a dynamic executable"; then
-            echo "expected a static binary"; ldd "$BIN"; exit 1
+          if ! file "$BIN" | grep -q "statically linked"; then
+            echo "expected a static binary, got:"; file "$BIN"; exit 1
           fi
+          echo "linux: static, and it runs"
