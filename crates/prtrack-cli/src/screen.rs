@@ -64,14 +64,38 @@ impl<W: Write> Screen<W> {
 
     /// Replaces everything on screen with `body`.
     ///
-    /// Home, then the new content, then erase whatever the old content left
-    /// below it. Erasing *after* writing rather than clearing first is what
-    /// stops the board flickering: the cells are overwritten in place and only
-    /// the surplus is blanked.
+    /// Home, then each line followed by an erase-to-end-of-line, then an
+    /// erase-to-end-of-screen. Erasing *after* writing rather than clearing
+    /// first is what stops the board flickering: cells are overwritten in place
+    /// and only the surplus is blanked.
+    ///
+    /// # Both erases are needed, and the line one is the subtle half
+    ///
+    /// Erase-to-end-of-**screen** removes surplus *lines* — a board that got
+    /// shorter. It does nothing about a line that got shorter, because the
+    /// cursor has already moved past it. Overwrite a 149-column row with a
+    /// 21-column heading and the row's last 128 columns are still there:
+    ///
+    /// ```text
+    /// old   #4360  tokenbooks-re  ! 2 adv  …  renovate/cargo-lock-file-maint
+    /// new   NEED YOUR REVIEW  (7)
+    /// seen  NEED YOUR REVIEW  (7)! 2 adv  …  renovate/cargo-lock-file-maint
+    /// ```
+    ///
+    /// Which is what a board looked like after one poll changed a section's
+    /// length. Every line is erased to its end as it is written.
     pub fn redraw(&mut self, body: &str) {
         if self.interactive {
             self.emit(HOME);
-            self.emit(body);
+            // Erase each line's tail as the cursor passes it, then the surplus
+            // lines below the whole frame.
+            for (index, line) in body.split('\n').enumerate() {
+                if index > 0 {
+                    self.emit("\n");
+                }
+                self.emit(line);
+                self.emit(CLEAR_LINE);
+            }
             self.emit(CLEAR_BELOW);
         } else {
             // Not a terminal: no cursor to move and nothing to erase, so print
@@ -222,6 +246,34 @@ mod tests {
             ),
             (true, true),
             "erase-to-end must follow the body, or a shorter board leaves stale rows"
+        );
+    }
+
+    #[test]
+    fn a_line_that_got_shorter_leaves_no_tail_of_the_one_it_replaced() {
+        // The failure this exists to stop, and the one the frame-level erase
+        // does not catch: erase-to-end-of-screen runs after the whole body, by
+        // which point the cursor is past every line, so a row overwritten by a
+        // shorter row keeps the difference. On a real board that turned
+        // "NEED YOUR REVIEW  (7)" into "NEED YOUR REVIEW  (7)! 2 adv  …".
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut screen = Screen::new(&mut sink, true);
+            screen.redraw("a-very-long-row-indeed\nsecond");
+        }
+        let out = String::from_utf8_lossy(&sink).into_owned();
+
+        // Every line, including the last, is erased to its end.
+        let erases = out.matches(CLEAR_LINE).count();
+        assert_eq!(erases, 2, "one erase per line, not one per frame");
+
+        // And each erase comes *after* its own line rather than before, or it
+        // would blank the line just written.
+        let first_line = out.find("a-very-long-row-indeed");
+        let first_erase = out.find(CLEAR_LINE);
+        assert!(
+            first_line < first_erase,
+            "the line is written, then its tail is erased"
         );
     }
 
