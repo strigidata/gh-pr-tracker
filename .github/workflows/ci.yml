@@ -89,6 +89,34 @@ jobs:
       #
       # Run against the *debug* binary, which clippy and the tests have already
       # built. No assertion here can tell the two profiles apart.
+      # Only when a release is going to collect it, and here rather than in the
+      # release job because the gate is already warm: the release job compiled
+      # both architectures from a cold cache in a separate runner, which is a
+      # whole build nobody needed.
+      - name: Build the universal binary the release ships
+        if: inputs.upload_artifact
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked -p prtrack-cli --target aarch64-apple-darwin
+          cargo build --release --locked -p prtrack-cli --target x86_64-apple-darwin
+          mkdir -p dist
+          # One file for Apple Silicon and Intel. Nobody should have to know
+          # which Mac they are on to pick a download.
+          lipo -create -output dist/prtrack \
+            target/aarch64-apple-darwin/release/prtrack \
+            target/x86_64-apple-darwin/release/prtrack
+          lipo -info dist/prtrack
+          ./dist/prtrack --version
+
+      - name: Hand the universal binary to the release job
+        if: inputs.upload_artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-universal
+          path: dist/prtrack
+          retention-days: 1
+
       - name: Smoke — the binary answers without a token
         run: |
           # No `set -e`. This step asserts on exit codes and the runner's shell

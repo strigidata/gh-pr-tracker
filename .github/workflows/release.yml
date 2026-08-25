@@ -9,11 +9,12 @@ name: Release
 # installers, signing, self-update — `dist` is the right tool and this is the
 # thing it replaces.
 #
-# # One build per artefact
+# # No compiler runs here
 #
-# The gate already compiles, checks and runs the musl binary, so this downloads
-# it rather than building it a second time. Only the two macOS architectures are
-# built here, because a universal binary needs both and the gate builds neither.
+# The gate builds every artefact this ships — the musl binary and the macOS
+# universal one — and hands both over. This downloads, packages and publishes.
+# Building the macOS pair here instead meant a cold cache in a separate runner
+# doing work the warm one had a head start on.
 #
 # **The binaries are not signed or notarized.** A browser download is
 # quarantined by macOS and needs the attribute cleared by hand; a `gh` download
@@ -106,32 +107,31 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Named one at a time rather than matched by a pattern: a glob that
+      # silently matches nothing would leave the packaging step tarring an
+      # empty directory, and a release of nothing is worse than a failed one.
+      - name: Collect the macOS binary the gate built
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: macos-universal
+          path: dist
 
-      - name: Build both macOS architectures
-        run: |
-          set -euo pipefail
-          rustup target add aarch64-apple-darwin x86_64-apple-darwin
-          cargo build --release --locked -p prtrack-cli --target aarch64-apple-darwin
-          cargo build --release --locked -p prtrack-cli --target x86_64-apple-darwin
-
-      - name: Fuse them into one universal binary
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          # One file that runs on Apple Silicon and Intel. A team should not have
-          # to know which Mac they are on to pick a download.
-          lipo -create -output dist/prtrack \
-            target/aarch64-apple-darwin/release/prtrack \
-            target/x86_64-apple-darwin/release/prtrack
-          lipo -info dist/prtrack
-          ./dist/prtrack --version
-
-      - name: Collect the Linux binary the gate already built
+      - name: Collect the Linux binary the gate built
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: linux-musl
           path: linux
+
+      - name: Check they are what they claim to be
+        run: |
+          set -euo pipefail
+          # An artefact loses its permission bits in transit.
+          chmod 755 dist/prtrack linux/prtrack
+          # Both halves present, or the universal binary is not universal.
+          lipo -info dist/prtrack | grep -q "x86_64 arm64" \
+            || { echo "expected a fat binary, got:"; lipo -info dist/prtrack; exit 1; }
+          ./dist/prtrack --version
+          file linux/prtrack
 
       - name: Package
         id: package
@@ -143,8 +143,6 @@ jobs:
           tar -czf "$MAC.tar.gz" -C dist prtrack
           shasum -a 256 "$MAC.tar.gz" >"$MAC.tar.gz.sha256"
 
-          # An artefact loses its permission bits in transit.
-          chmod 755 linux/prtrack
           tar -czf "$LNX.tar.gz" -C linux prtrack
           shasum -a 256 "$LNX.tar.gz" >"$LNX.tar.gz.sha256"
 
