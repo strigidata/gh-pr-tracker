@@ -27,6 +27,7 @@ use prtrack_cli::render::BoardText;
 use prtrack_cli::screen::{self, Screen};
 use prtrack_cli::state::WatchState;
 use prtrack_cli::update;
+use prtrack_cli::upgrade;
 use prtrack_cli::watch::{already_waiting, tick, Nudged};
 use prtrack_core::{Board, BoardRow, BranchName, Login, PolicyRules, RepoRef};
 use prtrack_github::{GitHubClient, RepositoryFacts};
@@ -90,6 +91,7 @@ fn run() -> Result<Exit, Trouble> {
     match cli.command {
         Command::Board(args) if args.watch => watch(&args),
         Command::Board(args) => board(&args),
+        Command::Update(args) => update_binary(&args),
     }
 }
 
@@ -514,6 +516,49 @@ fn board(args: &BoardArgs) -> Result<Exit, Trouble> {
     }
 
     Ok(outcome(&board, &viewer))
+}
+
+/// Replaces this binary with the newest published release.
+///
+/// Prints to stderr, not stdout: this is the tool talking about itself, and
+/// stdout is the board's.
+fn update_binary(args: &cli::UpdateArgs) -> Result<Exit, Trouble> {
+    let repo = match args.from.clone() {
+        Some(chosen) => chosen,
+        None => RepoRef::parse(&update::release_repo()).map_err(|source| {
+            Trouble::usage(anyhow::Error::new(source).context("the release repository is unusable"))
+        })?,
+    };
+
+    let client = GitHubClient::from_env().map_err(|source| Trouble {
+        exit: Exit::of(&source),
+        cause: anyhow::Error::new(source).context("could not prepare a GitHub client"),
+    })?;
+
+    let runtime = tokio::runtime::Runtime::new()
+        .context("could not start the async runtime")
+        .map_err(|cause| Trouble {
+            exit: Exit::Api,
+            cause,
+        })?;
+
+    let outcome = runtime
+        .block_on(upgrade::run(&client, &repo))
+        .map_err(|failure| Trouble {
+            // Whatever went wrong, nothing was replaced: `upgrade::run` moves
+            // the binary only after every check has passed. What differs is
+            // whether trying again could help — an unwritable directory stays
+            // unwritable, and telling a wrapper to retry it is a lie.
+            exit: if failure.retryable {
+                Exit::Api
+            } else {
+                Exit::Usage
+            },
+            cause: failure.cause,
+        })?;
+
+    eprintln!("prtrack: {}", outcome.describe());
+    Ok(Exit::Informational)
 }
 
 /// Asks GitHub, and says which kind of failure it was if it will not answer.
