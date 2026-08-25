@@ -9,15 +9,15 @@ prtrack 0.1.1 | policy on main: 4 required checks | 1 approval(s) | threads must
 
 YOUR PRS  (15)
 PR     AUTHOR      CI          OPEN.CMT MERGE      WHY IT CANNOT MERGE          SINCE PUSH
-#3449  octocat    ! 2 adv     0.19     CONFLICT   approved - REBASE NEEDED     22d
-#4429  octocat    ! 1 adv     0.11     CONFLICT   conflicting - rebase first   3h
-#4349  octocat    ~ 1/42 run  0.11     -          CI running                   1h
-#4445  octocat    ok 53/53    0.5      clean      review: hubot +2        3h
+#3449  octocat     ! 2 adv     0.19     CONFLICT   approved - REBASE NEEDED     22d
+#4429  octocat     ! 1 adv     0.11     CONFLICT   conflicting - rebase first   3h
+#4349  octocat     ~ 1/42 run  0.11     -          CI running                   1h
+#4445  octocat     ok 53/53    0.5      clean      review: hubot +2             3h
 
 NEED YOUR REVIEW  (9)
-#4225  octofix    ! 1 adv     0.2      clean      review: octocat +2          6d
-#4323  monalisa   ok 34/34    0.11     clean      review: octocat +2          1h
-#4324  monalisa   x 3         0.10     -          required check failing       1h
+#4225  octofix     ! 1 adv     0.2      clean      review: octocat +2           6d
+#4323  monalisa    ok 34/34    0.11     clean      review: octocat +2           1h
+#4324  monalisa    x 3         0.10     -          required check failing       1h
 
 35 open | 0 ready to merge | 7 conflicting | 5 reviewable now
 ```
