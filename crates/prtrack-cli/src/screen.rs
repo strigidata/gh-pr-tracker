@@ -21,6 +21,8 @@
 
 use std::io::Write;
 
+use crate::color::{Palette, Style};
+
 /// Move the cursor to the top left, without clearing anything.
 const HOME: &str = "\u{1b}[H";
 
@@ -114,6 +116,59 @@ impl<W: Write> Drop for Screen<W> {
     }
 }
 
+/// How many recent nudges the footer keeps.
+///
+/// Enough to see what happened while you were away from the desk, few enough
+/// that the board stays the thing on screen.
+pub const RECENT_NUDGES: usize = 5;
+
+/// The lines under the board that survive a repaint.
+///
+/// Everything a watcher has to say used to go to stderr, and a redraw erases
+/// from the cursor down — so the update notice, the Focus warning and **every
+/// nudge** were wiped by the next poll. In a watcher the nudges are the entire
+/// product, and their only on-screen record was lasting five minutes.
+///
+/// So they are part of the frame instead. Ordered newest first, because the one
+/// you have not seen is the one at the top.
+#[derive(Debug, Clone, Default)]
+pub struct Footer {
+    /// Nudges, newest first.
+    pub recent: Vec<String>,
+    /// Conditions that persist until something changes — a Focus mode
+    /// swallowing notifications, a newer release being out.
+    pub warnings: Vec<String>,
+}
+
+impl Footer {
+    /// Records a nudge, dropping the oldest once [`RECENT_NUDGES`] are held.
+    pub fn saw(&mut self, line: String) {
+        self.recent.insert(0, line);
+        self.recent.truncate(RECENT_NUDGES);
+    }
+
+    /// The block to draw under the board, or empty when there is nothing.
+    ///
+    /// Blank when silent rather than a heading with nothing under it: a
+    /// watcher that reserves screen for news it does not have is a watcher
+    /// whose board is smaller for no reason.
+    #[must_use]
+    pub fn render(&self, palette: Palette) -> String {
+        if self.recent.is_empty() && self.warnings.is_empty() {
+            return String::new();
+        }
+        let mut lines = vec![String::new()];
+        for line in &self.recent {
+            lines.push(palette.paint(Style::Plain, line));
+        }
+        for warning in &self.warnings {
+            lines.push(palette.paint(Style::Dim, warning));
+        }
+        lines.push(String::new());
+        lines.join("\n")
+    }
+}
+
 /// The line under the board, counting down to the next poll.
 ///
 /// Seconds rather than a bar, because the useful question is "have I got time
@@ -136,7 +191,11 @@ pub fn updating() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{countdown, updating, Screen, CLEAR_BELOW, CLEAR_LINE, HIDE_CURSOR, SHOW_CURSOR};
+    use super::{
+        countdown, updating, Footer, Screen, CLEAR_BELOW, CLEAR_LINE, HIDE_CURSOR, RECENT_NUDGES,
+        SHOW_CURSOR,
+    };
+    use crate::color::Palette;
 
     /// What a `Screen` wrote, once it has been dropped.
     fn written(interactive: bool, body: &str, status: &str) -> String {
@@ -199,6 +258,49 @@ mod tests {
         let out = written(false, "board", "Next update in 5 seconds");
         assert_eq!(out, "board", "the board, and nothing around it");
         assert!(!out.contains('\u{1b}'), "no escape byte reaches a pipe");
+    }
+
+    #[test]
+    fn a_silent_footer_takes_no_room_at_all() {
+        // A watcher that reserves screen for news it does not have is a watcher
+        // whose board is smaller for no reason.
+        assert_eq!(Footer::default().render(Palette::plain()), "");
+    }
+
+    #[test]
+    fn the_newest_nudge_is_the_one_at_the_top_and_the_oldest_fall_off() {
+        // Newest first because the one you have not seen is the one you want,
+        // and bounded because a watcher left running for a day would otherwise
+        // push the board off the screen with its own history.
+        let mut footer = Footer::default();
+        for n in 1..=(RECENT_NUDGES + 2) {
+            footer.saw(format!("#{n} is ready to merge"));
+        }
+
+        let rendered = footer.render(Palette::plain());
+        let lines: Vec<&str> = rendered.lines().filter(|l| !l.is_empty()).collect();
+
+        assert_eq!(lines.len(), RECENT_NUDGES, "bounded");
+        assert_eq!(
+            lines.first().copied(),
+            Some(format!("#{} is ready to merge", RECENT_NUDGES + 2).as_str()),
+            "newest first"
+        );
+        assert!(
+            !rendered.contains("#1 is ready"),
+            "the oldest fell off rather than the newest never arriving"
+        );
+    }
+
+    #[test]
+    fn a_footer_that_says_something_is_separated_from_the_board() {
+        // Butted straight against the last row it reads as another row.
+        let mut footer = Footer::default();
+        footer.saw("#7 is ready to merge".to_owned());
+        let rendered = footer.render(Palette::plain());
+
+        assert!(rendered.starts_with('\n'), "a blank line above it");
+        assert!(rendered.contains("#7 is ready to merge"));
     }
 
     #[test]
