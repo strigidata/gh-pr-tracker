@@ -1,0 +1,16 @@
+[package]
+name = "prtrack-core"
+version = "0.1.0"
+description = "Pure domain model for prtrack: the facts about a pull request, the policy that governs it, and the decision about why it cannot merge. Performs no IO."
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Only for `DateTime<Utc>` as a value type. Classification merges a check's
+# repeated attempts by taking the newest, so an instant is part of the domain.
+# Nothing here reads the clock; `now` is always a parameter.
+chrono = { workspace = true }
+thiserror = { workspace = true }

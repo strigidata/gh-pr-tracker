@@ -1,0 +1,144 @@
+# Every open pull request in one repository, and the context needed to say why
+# each cannot merge yet.
+#
+# Three properties of this query are load-bearing and easy to undo:
+#
+#   1. `$first` and `$after` make the pull request connection pageable. Asking
+#      for one page and stopping would silently show a subset of a repository
+#      with more open pull requests than the page size, and a subset that looks
+#      complete is the failure mode this project exists to avoid.
+#   2. `pageInfo` comes back with every page so the caller can tell "that was
+#      the last one" from "the response was truncated".
+#   3. The ordering is `CREATED_AT` rather than `UPDATED_AT`. A cursor walks a
+#      sorted list, so ordering on a key that
+#      changes while the walk is in progress lets a pull request move from
+#      ahead of the cursor to behind it and never be seen. `UPDATED_AT` changes
+#      on every comment, push and label; `CREATED_AT` never changes at all.
+#      Nothing downstream depends on the order the API returns -- the board
+#      sorts every section itself -- so this costs nothing and removes the
+#      failure rather than detecting it.
+#
+# `mergeStateStatus` is only available under the
+# `application/vnd.github.merge-info-preview+json` Accept header. Without it the
+# field does not resolve and the whole query errors.
+#
+# `startedAt` on a CheckRun and `createdAt` on a StatusContext are not
+# decoration. GitHub reports every *attempt* of a check, so one name arrives
+# several times with different verdicts, and only the newest is current. Without
+# an instant there is no way to tell a superseded failure from a live one.
+query OpenPullRequests($owner: String!, $name: String!, $first: Int!, $after: String) {
+  rateLimit {
+    cost
+    remaining
+  }
+  viewer {
+    login
+  }
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef {
+      name
+    }
+    branchProtectionRules(first: 25) {
+      totalCount
+      nodes {
+        pattern
+        requiresApprovingReviews
+        requiredApprovingReviewCount
+        requiresConversationResolution
+        requiresStatusChecks
+        requiresStrictStatusChecks
+        requiredStatusCheckContexts
+        requiresCodeOwnerReviews
+        dismissesStaleReviews
+      }
+    }
+    pullRequests(
+      first: $first
+      after: $after
+      states: OPEN
+      orderBy: { field: CREATED_AT, direction: DESC }
+    ) {
+      totalCount
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        number
+        title
+        url
+        isDraft
+        createdAt
+        headRefOid
+        baseRefName
+        author {
+          login
+        }
+        reviewDecision
+        mergeable
+        mergeStateStatus
+        reviewRequests(first: 10) {
+          totalCount
+          nodes {
+            requestedReviewer {
+              __typename
+              ... on User {
+                login
+              }
+              ... on Team {
+                slug
+              }
+            }
+          }
+        }
+        latestReviews(first: 10) {
+          totalCount
+          nodes {
+            state
+            author {
+              login
+            }
+            submittedAt
+          }
+        }
+        reviewThreads(first: 100) {
+          totalCount
+          nodes {
+            isResolved
+            isOutdated
+          }
+        }
+        comments(first: 1) {
+          totalCount
+        }
+        commits(last: 1) {
+          nodes {
+            commit {
+              committedDate
+              statusCheckRollup {
+                state
+                contexts(first: 100) {
+                  totalCount
+                  nodes {
+                    __typename
+                    ... on CheckRun {
+                      name
+                      conclusion
+                      status
+                      startedAt
+                    }
+                    ... on StatusContext {
+                      context
+                      state
+                      createdAt
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

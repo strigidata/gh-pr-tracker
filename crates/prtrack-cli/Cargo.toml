@@ -1,0 +1,24 @@
+[package]
+name = "prtrack-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+notify-rust = { workspace = true }
+prtrack-core = { path = "../prtrack-core" }
+prtrack-github = { path = "../prtrack-github" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The library half of this crate reports typed failures -- the watcher has to
+# tell an unreadable state file from an unwritable one -- so it wants an error
+# enum, while `main` still wraps everything in anyhow at the top.
+thiserror = { workspace = true }
+tokio = { workspace = true }
+unicode-width = { workspace = true }
+
+[lints]
+workspace = true

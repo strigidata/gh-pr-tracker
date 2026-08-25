@@ -1,0 +1,107 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+# `rust-version` was removed deliberately: nothing builds this on the version it
+# claimed, so the promise was unenforceable. Restore it together with a CI job
+# that actually compiles against it.
+license = "MIT"
+
+[workspace.dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
+clap = { version = "4", features = ["derive", "env"] }
+notify-rust = "4"
+# Column alignment is measured in terminal cells, not characters: a CJK glyph
+# occupies two. Only the shell needs it; nothing in the core knows about columns.
+unicode-width = "0.2"
+wiremock = "0.6"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+unused_lifetimes = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+variant_size_differences = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+future_incompatible = { level = "warn", priority = -1 }
+nonstandard_style = { level = "warn", priority = -1 }
+
+# Levels are `warn`, not `deny`, on purpose: the verification gate runs clippy
+# with `-D warnings`, so nothing escapes CI, while local `cargo check` stays
+# readable instead of stopping at the first finding.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# Two lints from the `cargo` group are switched off in configuration rather
+# than in code, which is where AGENTS.md says exceptions belong.
+#   - crates.io metadata: nothing here is published, so repository/readme/
+#     keywords/categories would be decoration. Revisit if that changes.
+#   - duplicate transitive versions: driven by proc-macro crates we do not
+#     control, and not actionable from this workspace.
+cargo_common_metadata = "allow"
+
+# This lint and `unreachable_pub` (enabled deliberately in the rust table above)
+# give opposite instructions for a crate-internal type in a private module:
+# `unreachable_pub` says use `pub(crate)`, `redundant_pub_crate` says use `pub`.
+# There is no third spelling -- measured at 34 and 35 findings respectively on
+# prtrack-github's wire types. `unreachable_pub` is the curated choice and
+# catches visibility genuinely leaking into a crate's public API, so this one
+# from the nursery group loses.
+redundant_pub_crate = "allow"
+multiple_crate_versions = "allow"
+
+# `restriction` is deliberately NOT enabled as a group. It is a menu of
+# mutually contradictory lints, not a standard, and turning it on wholesale is
+# a documented anti-pattern. These are the individual ones worth having.
+
+# Panics. A panic is a crash, and this tool runs unattended in a poll loop.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+indexing_slicing = "warn"
+unwrap_in_result = "warn"
+exit = "warn"
+
+# Exhaustiveness. GitHub adds enum values; a wildcard arm swallows them.
+wildcard_enum_match_arm = "warn"
+
+# AGENTS.md forbids silencing a lint. This makes an unreasoned `#[allow]` itself
+# a lint finding, so the rule is enforced by the toolchain rather than by review.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+
+# `print_stdout` / `print_stderr` are deliberately NOT here. Cargo forbids
+# mixing `lints.workspace = true` with a per-crate override, so denying them
+# workspace-wide would force `prtrack-cli` either to duplicate this whole table
+# (drift, needing a policing script) or to carry inline `#[allow]`s, which
+# AGENTS.md forbids. The output-discipline rule stays in AGENTS.md and in the
+# code-review playbook. Revisit if a library ever actually prints.
+dbg_macro = "warn"
+
+# Assorted footguns.
+clone_on_ref_ptr = "warn"
+float_cmp_const = "warn"
+mem_forget = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+str_to_string = "warn"
+try_err = "warn"
+verbose_file_reads = "warn"
+empty_drop = "warn"

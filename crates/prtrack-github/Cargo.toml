@@ -1,0 +1,21 @@
+[package]
+name = "prtrack-github"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prtrack-core = { path = "../prtrack-core" }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
