@@ -39,6 +39,31 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// known, not overlooked.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a release download may take.
+///
+/// Longer than a query, because this is megabytes over whatever connection the
+/// user has rather than a few kilobytes of JSON.
+const ASSET_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// A published release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release {
+    /// The tag, as published — `v0.1.2`, leading `v` included.
+    pub tag: String,
+    /// The files attached to it.
+    pub assets: Vec<Asset>,
+}
+
+/// One file attached to a release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Asset {
+    /// Its filename, which is how a caller tells the platforms apart.
+    pub name: String,
+    /// The **API** url. Not the browser one: only this accepts the token, and
+    /// a private repository refuses the other.
+    pub url: String,
+}
+
 /// Pull requests per page. Fifty with full check context costs 3 GraphQL
 /// points, which leaves the budget a non-issue at any repository size this
 /// tool is pointed at.
@@ -144,6 +169,118 @@ impl GitHubClient {
     #[must_use]
     pub fn with_timeout(self, timeout: Duration) -> Self {
         Self { timeout, ..self }
+    }
+
+    /// A published release: its tag, and the files attached to it.
+    ///
+    /// Same authentication as everything else here, which is the point — a
+    /// private repository's assets are reachable by exactly the people who can
+    /// install from them, with no second credential and nothing hosted.
+    ///
+    /// # Errors
+    ///
+    /// `404` — no release published — is [`Ok(None)`](Option::None) rather than
+    /// a failure. Anything else is reported.
+    pub async fn latest_release_detail(
+        &self,
+        repo: &RepoRef,
+    ) -> Result<Option<Release>, GitHubError> {
+        let Some(body) = self.release_json(repo).await? else {
+            return Ok(None);
+        };
+        let Some(tag) = body
+            .get("tag_name")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            return Ok(None);
+        };
+        let assets = body
+            .get("assets")
+            .and_then(serde_json::Value::as_array)
+            .map(|assets| {
+                assets
+                    .iter()
+                    .filter_map(|asset| {
+                        Some(Asset {
+                            name: asset.get("name")?.as_str()?.to_owned(),
+                            url: asset.get("url")?.as_str()?.to_owned(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(Release { tag, assets }))
+    }
+
+    /// Downloads one release asset.
+    ///
+    /// The URL must be the API url from [`Asset::url`], not the browser one:
+    /// only the API url accepts the token, and a private repository refuses the
+    /// other.
+    ///
+    /// # Errors
+    ///
+    /// [`GitHubError::UnexpectedStatus`] for anything GitHub refuses, and
+    /// [`GitHubError::Transport`] if the body cannot be read.
+    pub async fn download_asset(&self, url: &str) -> Result<Vec<u8>, GitHubError> {
+        let response = self
+            .http
+            .get(url)
+            // Without this GitHub answers with the asset's *metadata* as JSON,
+            // which downloads successfully and is not the file.
+            .header(ACCEPT, "application/octet-stream")
+            .timeout(ASSET_TIMEOUT)
+            .send()
+            .await
+            .map_err(GitHubError::Transport)?;
+
+        if !response.status().is_success() {
+            return Err(GitHubError::UnexpectedStatus {
+                status: response.status().as_u16(),
+            });
+        }
+        Ok(response
+            .bytes()
+            .await
+            .map_err(GitHubError::Transport)?
+            .to_vec())
+    }
+
+    /// The `releases/latest` document, or `None` where nothing is published.
+    async fn release_json(&self, repo: &RepoRef) -> Result<Option<serde_json::Value>, GitHubError> {
+        let base = self
+            .endpoint
+            .as_str()
+            .strip_suffix("/graphql")
+            .unwrap_or(self.endpoint.as_str());
+        let url = format!(
+            "{base}/repos/{}/{}/releases/latest",
+            repo.owner(),
+            repo.name()
+        );
+
+        let response = self
+            .http
+            .get(&url)
+            .header(ACCEPT, "application/vnd.github+json")
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(GitHubError::Transport)?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(GitHubError::UnexpectedStatus {
+                status: response.status().as_u16(),
+            });
+        }
+        let raw = response.bytes().await.map_err(GitHubError::Transport)?;
+        serde_json::from_slice(&raw)
+            .map(Some)
+            .map_err(GitHubError::Decode)
     }
 
     /// The tag of the newest published release, or `None` where there is none.

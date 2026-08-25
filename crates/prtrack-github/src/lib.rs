@@ -78,7 +78,7 @@ mod retry;
 mod token;
 mod wire;
 
-pub use client::{GitHubClient, OpenPullRequests};
+pub use client::{Asset, GitHubClient, OpenPullRequests, Release};
 pub use error::{ConversionError, GitHubError, Malformed, NestedList};
 pub use facts::RepositoryFacts;
 pub use retry::RetryBudget;

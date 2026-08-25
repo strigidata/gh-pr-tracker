@@ -72,10 +72,12 @@ impl Update {
     pub fn notice(&self) -> Option<String> {
         match self {
             Self::Newer { version } => Some(format!(
-                "❗ prtrack {version} is out — you are on {}. \
-                 gh release download v{version} --repo {}",
+                // The command, not the four steps it replaces. Printing an
+                // install recipe at somebody assumes they will read it, keep
+                // it, and get the paths right -- which is how a version notice
+                // becomes something people scroll past.
+                "❗ prtrack {version} is out — you are on {}. Run `prtrack update`",
                 running(),
-                release_repo()
             )),
             Self::Current | Self::Unknown => None,
         }

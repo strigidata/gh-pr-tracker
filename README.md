@@ -66,6 +66,21 @@ xattr -d com.apple.quarantine prtrack
 Signing removes the caveat entirely and is the gate to distributing outside the
 team, not a nicety. Linux has no equivalent obstacle.
 
+## Keeping it current
+
+```bash
+prtrack update
+```
+
+Downloads the newest release, checks it against its published checksum, and
+replaces the running binary in place. It uses the same token the board does, so
+a private distribution needs nothing hosted.
+
+It refuses rather than half-succeeds: an unwritable install directory is
+reported before anything is downloaded, and a download that does not match its
+checksum is discarded. Exit `2` means change something — usually permissions —
+and exit `4` means try again.
+
 ## Use
 
 ```bash

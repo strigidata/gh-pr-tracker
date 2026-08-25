@@ -23,5 +23,6 @@ pub mod render;
 pub mod screen;
 pub mod state;
 pub mod update;
+pub mod upgrade;
 pub mod watch;
 pub mod width;

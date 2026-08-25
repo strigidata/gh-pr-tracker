@@ -30,6 +30,23 @@ pub struct Cli {
 pub enum Command {
     /// Show every open pull request and why it cannot merge yet.
     Board(BoardArgs),
+
+    /// Replace this binary with the newest published release.
+    ///
+    /// Uses the same GitHub token the board does, so a private distribution
+    /// needs nothing hosted — see `prtrack_cli::upgrade`.
+    Update(UpdateArgs),
+}
+
+/// How an update was asked for.
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// Where releases are published, as `owner/name`.
+    ///
+    /// Defaults to where this binary came from. Overridable for a fork, or to
+    /// test the path against somewhere else.
+    #[arg(long, value_name = "OWNER/NAME", value_parser = repository)]
+    pub from: Option<RepoRef>,
 }
 
 /// How the board was asked for.
@@ -207,8 +224,31 @@ mod tests {
         Cli::try_parse_from(args)
             .map(|cli| match cli.command {
                 Command::Board(board) => (board.repo.to_string(), board.format, board.color),
+                // Named rather than wildcarded, so a subcommand added later is
+                // a compile error here rather than silently untested.
+                Command::Update(_) => ("update".to_owned(), Format::Text, ColorChoice::Auto),
             })
             .map_err(|error| error.kind().to_string())
+    }
+
+    #[test]
+    fn update_needs_no_arguments_and_takes_a_repository_if_offered() {
+        // The whole point is that nobody has to remember anything, so the bare
+        // word has to work.
+        let parsed = |args: &[&str]| {
+            Cli::try_parse_from(args).ok().map(|cli| match cli.command {
+                Command::Update(update) => update
+                    .from
+                    .map_or_else(|| "default".to_owned(), |r| r.to_string()),
+                Command::Board(_) => "board".to_owned(),
+            })
+        };
+
+        assert_eq!(parsed(&["prtrack", "update"]), Some("default".to_owned()));
+        assert_eq!(
+            parsed(&["prtrack", "update", "--from", "octo-org/example"]),
+            Some("octo-org/example".to_owned())
+        );
     }
 
     #[test]
