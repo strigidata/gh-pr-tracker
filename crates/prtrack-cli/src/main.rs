@@ -121,6 +121,12 @@ fn watch(args: &BoardArgs) -> Result<Exit, Trouble> {
     if let Err(reason) = notify::adopt_bundle_identity() {
         eprintln!("prtrack: notifications may not appear: {reason:#}");
     }
+    if let notify::Focus::Active { mode } = notify::focus() {
+        eprintln!(
+            "prtrack: {mode} is on, so macOS will drop every notification without \
+             showing it. Nudges will still be printed here."
+        );
+    }
 
     let path = state_path(args)?;
     let runtime = tokio::runtime::Runtime::new()
@@ -156,6 +162,12 @@ async fn watch_forever(
     let mut state = remembered(path);
     let mut first_poll = true;
 
+    // Resolved for *stderr*, which is where a nudge goes. It is a different
+    // stream from the board's and can be redirected on its own, so borrowing
+    // stdout's answer would write escapes into a log the moment somebody ran
+    // `--watch 2>nudges.log`.
+    let stderr_palette = stream_palette(args, std::io::stderr().is_terminal());
+
     loop {
         match read_repository(&client, args).await {
             Ok(facts) => {
@@ -180,7 +192,7 @@ async fn watch_forever(
                 }
 
                 for nudged in tick(&mut state, &judged, &viewer) {
-                    deliver(&nudged);
+                    deliver(&nudged, stderr_palette);
                 }
                 if let Err(reason) = state.save(path) {
                     eprintln!(
@@ -264,11 +276,32 @@ fn announce_first_poll(judged: &[(BoardRow, PolicyRules)], viewer: &Login) {
 /// there is no way for this process to tell. The stderr line is the only
 /// record a user has that something was meant to reach them, which is why it
 /// is printed whether or not the banner appears.
-fn deliver(nudged: &Nudged) {
+fn deliver(nudged: &Nudged, stderr_palette: Palette) {
     let summary = nudged.summary();
-    eprintln!("prtrack: {summary} — {}", nudged.url.as_str());
+
+    // Where stderr is a terminal the number carries the link and the URL is not
+    // printed: the line reads as a sentence and the pull request is one click
+    // away. Where it is not — a redirected log, a pipe — the URL is spelled out,
+    // because a link nothing can click is a URL that has been deleted.
+    let line = {
+        let linked = stderr_palette.link(nudged.url.as_str(), &nudged.label());
+        if linked == nudged.label() {
+            format!("{summary} — {}", nudged.url.as_str())
+        } else {
+            format!("{linked} {}", nudged.happened())
+        }
+    };
+    eprintln!("prtrack: {line}");
+
+    // The notification gets the plain form. Its body is not a terminal and
+    // would show an escape sequence literally.
     if let Err(reason) = notify::post(&summary, nudged.title.as_str()) {
         eprintln!("prtrack: that notification could not be posted: {reason:#}");
+    } else if let notify::Focus::Active { mode } = notify::focus() {
+        // Checked per nudge rather than once, because a Focus can begin
+        // mid-session -- and the run where that happens is exactly the run
+        // where somebody is about to conclude the tool is broken.
+        eprintln!("prtrack: ...but {mode} is on, so that banner was suppressed.");
     }
 }
 
@@ -423,6 +456,15 @@ fn write_board(
 /// here it is a decision already made, so nothing can paint against a
 /// `NO_COLOR` it did not know about.
 fn palette(args: &BoardArgs) -> Palette {
+    stream_palette(args, std::io::stdout().is_terminal())
+}
+
+/// The same decision, for whichever stream the caller is about to write to.
+///
+/// `--color` and the environment apply to both; only the terminal test differs.
+/// The board goes to stdout and a nudge goes to stderr, and either can be
+/// redirected without the other, so each has to be asked about separately.
+fn stream_palette(args: &BoardArgs, is_terminal: bool) -> Palette {
     let no_color = std::env::var("NO_COLOR").ok();
     let clicolor = std::env::var("CLICOLOR").ok();
     Palette::resolve(
@@ -430,7 +472,7 @@ fn palette(args: &BoardArgs) -> Palette {
         &Environment {
             no_color: no_color.as_deref(),
             clicolor: clicolor.as_deref(),
-            stdout_is_terminal: std::io::stdout().is_terminal(),
+            stdout_is_terminal: is_terminal,
         },
     )
 }

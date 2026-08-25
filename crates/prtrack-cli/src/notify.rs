@@ -7,16 +7,112 @@
 //! because [`adopt_bundle_identity`] encodes a finding that cost a day to get
 //! and is invisible from the API it works around.
 //!
-//! **Nothing calls this yet.** It is not dead code in the sense the lint
-//! means — it is the shell half of a feature whose other half is not written —
-//! but it is also not exercised, so treat its behaviour as last verified by
-//! the spike rather than by the suite.
-//!
 //! Every line it prints is diagnostics, which is why none of it goes to
 //! stdout.
 
 use anyhow::{Context as _, Result};
 use notify_rust::Notification;
+
+/// Whether a Focus mode is swallowing notifications.
+///
+/// The whole point of this tool is that an interruption arrives, so "it was
+/// posted and you will never see it" is the one outcome that must not pass
+/// unremarked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Focus {
+    /// A mode is on. Anything posted now is dropped without a sound, and
+    /// nothing in the notification API says so.
+    Active {
+        /// The mode's identifier, such as `com.apple.focus.work`.
+        mode: String,
+    },
+    /// No mode is on.
+    Clear,
+    /// Cannot be told from here: not macOS, or the file is missing, or it is a
+    /// shape this does not recognise.
+    ///
+    /// Deliberately not folded into [`Focus::Clear`]. "No Focus is on" and "I
+    /// could not find out" lead to different things being said to the user, and
+    /// collapsing them would make the quieter, wronger one the default.
+    Unknown,
+}
+
+/// Where macOS records the Focus modes currently asserted.
+///
+/// Private, undocumented, and not a stable interface — which is why every
+/// failure to read or parse it becomes [`Focus::Unknown`] rather than an error.
+/// Being unable to check must never stop a nudge being posted.
+#[cfg(target_os = "macos")]
+const FOCUS_ASSERTIONS: &str = "Library/DoNotDisturb/DB/Assertions.json";
+
+/// Reads whether a Focus mode is currently on.
+///
+/// Never fails: an unreadable or unfamiliar file is [`Focus::Unknown`]. This is
+/// a courtesy check on a private file, and a tool that refused to run because
+/// Apple moved a JSON file would be worse than one that shrugs.
+#[must_use]
+pub fn focus() -> Focus {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Focus::Unknown
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let Some(home) = std::env::var_os("HOME") else {
+            return Focus::Unknown;
+        };
+        let path = std::path::Path::new(&home).join(FOCUS_ASSERTIONS);
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return Focus::Unknown;
+        };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return Focus::Unknown;
+        };
+        read_focus(&parsed)
+    }
+}
+
+/// Picks the active mode out of the assertions document.
+///
+/// Split from [`focus`] so the shape can be tested without a real file, which
+/// is the only part of this worth testing: reading a path is not where the
+/// mistakes are.
+fn read_focus(parsed: &serde_json::Value) -> Focus {
+    let Some(entries) = parsed.get("data").and_then(serde_json::Value::as_array) else {
+        return Focus::Unknown;
+    };
+
+    // `storeAssertionRecords` holds what is asserted *now*;
+    // `storeInvalidationRecords` beside it holds modes that have ended, and
+    // reading that one instead would report a Focus that finished hours ago.
+    let mut saw_the_field = false;
+    for entry in entries {
+        let Some(active) = entry
+            .get("storeAssertionRecords")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        saw_the_field = true;
+        if let Some(mode) = active.iter().find_map(|assertion| {
+            assertion
+                .get("assertionDetails")
+                .and_then(|details| details.get("assertionDetailsModeIdentifier"))
+                .and_then(serde_json::Value::as_str)
+        }) {
+            return Focus::Active {
+                mode: mode.to_owned(),
+            };
+        }
+    }
+
+    if saw_the_field {
+        Focus::Clear
+    } else {
+        Focus::Unknown
+    }
+}
 
 /// Posts one notification.
 ///
@@ -103,4 +199,62 @@ pub fn adopt_bundle_identity() -> Result<String> {
     notify_rust::set_application(&bundle_id)
         .with_context(|| format!("could not adopt the bundle identifier {bundle_id}"))?;
     Ok(bundle_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_focus, Focus};
+    use serde_json::json;
+
+    #[test]
+    fn an_active_mode_is_read_and_an_ended_one_is_not() {
+        // The two arrays sit side by side and hold the same shape. Reading the
+        // wrong one reports a Focus that ended hours ago, which is worse than
+        // reporting none: it tells somebody their notifications are suppressed
+        // when they are not, and the advice that follows is wrong.
+        let active = json!({"data": [{
+            "storeAssertionRecords": [{
+                "assertionDetails": {"assertionDetailsModeIdentifier": "com.apple.focus.work"}
+            }],
+            "storeInvalidationRecords": [{
+                "invalidationAssertion": {
+                    "assertionDetails": {"assertionDetailsModeIdentifier": "com.apple.focus.sleep"}
+                }
+            }]
+        }]});
+        assert_eq!(
+            read_focus(&active),
+            Focus::Active {
+                mode: "com.apple.focus.work".to_owned()
+            },
+            "the asserted mode, not the invalidated one"
+        );
+
+        // A finished Focus with nothing currently asserted is Clear. This is
+        // the state the machine is in most of the time, and calling it Active
+        // would make the warning permanent and therefore ignored.
+        let ended = json!({"data": [{
+            "storeAssertionRecords": [],
+            "storeInvalidationRecords": [{
+                "invalidationAssertion": {
+                    "assertionDetails": {"assertionDetailsModeIdentifier": "com.apple.focus.work"}
+                }
+            }]
+        }]});
+        assert_eq!(read_focus(&ended), Focus::Clear, "nothing asserted now");
+    }
+
+    #[test]
+    fn a_shape_this_does_not_know_is_unknown_rather_than_clear() {
+        // Apple owns this file and may change it. Saying "no Focus is on" when
+        // the truth is "I could not tell" is the failure that matters: it is
+        // the quiet answer, so it is the one that would go unnoticed.
+        for unfamiliar in [
+            json!({}),
+            json!({"data": "not an array"}),
+            json!({"data": [{"somethingElse": []}]}),
+        ] {
+            assert_eq!(read_focus(&unfamiliar), Focus::Unknown, "{unfamiliar}");
+        }
+    }
 }

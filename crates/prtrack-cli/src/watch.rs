@@ -29,17 +29,38 @@ pub struct Nudged {
 }
 
 impl Nudged {
-    /// The one-line form, for a notification title or a log.
+    /// What changed, as the phrase that follows the pull request number.
+    ///
+    /// Separate from [`summary`] so a caller can put the number and the phrase
+    /// in different places — a terminal makes the number a link, a notification
+    /// cannot.
+    ///
+    /// [`summary`]: Nudged::summary
     #[must_use]
-    pub fn summary(&self) -> String {
-        let happened = match self.nudge {
+    pub const fn happened(&self) -> &'static str {
+        match self.nudge {
             Nudge::ReadyToMerge => "is ready to merge",
             Nudge::ApprovedThenConflicted => "was approved and now conflicts",
             Nudge::RequiredCheckFailed => "has a required check failing",
             Nudge::ReviewRequestedOfYou => "is waiting for your review",
             Nudge::ApprovalDismissedByPush => "lost its approval to a push",
-        };
-        format!("#{} {happened}", self.number.get())
+        }
+    }
+
+    /// The number as it is written, with its `#`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!("#{}", self.number.get())
+    }
+
+    /// The one-line form, in plain text.
+    ///
+    /// This is what a desktop notification gets, so it must stay free of escape
+    /// sequences — a notification body is not a terminal and would render them
+    /// literally.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!("{} {}", self.label(), self.happened())
     }
 }
 
