@@ -245,11 +245,22 @@ fn reviewers_of(
         .collect()
 }
 
-/// Everyone who has submitted a review, whatever it said.
+/// Everyone whose review still stands.
 ///
-/// The same list `changes_requested_by` filters, unfiltered. Together they
-/// answer "who is blocking" and "who has already looked", which are different
-/// questions and were previously the same one.
+/// Answers "have I already had my say", which the request list cannot: GitHub
+/// removes a reviewer from `reviewRequests` the moment they submit.
+///
+/// # Only verdicts that still count
+///
+/// **`Dismissed` is excluded, and that is the whole subtlety.** Where the rule
+/// dismisses stale reviews, a push after an approval throws that approval out —
+/// the pull request needs looking at again, and it is exactly the case somebody
+/// would otherwise never be told about, because it silently left their queue
+/// when they approved it and nothing puts it back.
+///
+/// `Commented` is excluded too: a comment is not a verdict, and somebody who
+/// asked a question has not reviewed. `Pending` is a draft review nobody has
+/// submitted.
 fn reviewed_by(pull_request: &wire::PullRequest) -> Result<Vec<Login>, prtrack_core::InvalidValue> {
     pull_request
         .latest_reviews
@@ -257,6 +268,15 @@ fn reviewed_by(pull_request: &wire::PullRequest) -> Result<Vec<Login>, prtrack_c
         .iter()
         .flatten()
         .flatten()
+        .filter(|review| match review.state {
+            wire::ReviewState::Approved | wire::ReviewState::ChangesRequested => true,
+            // Named rather than wildcarded, so a state GitHub adds later is a
+            // compile error here instead of a silent "yes, they reviewed it".
+            wire::ReviewState::Dismissed
+            | wire::ReviewState::Commented
+            | wire::ReviewState::Pending
+            | wire::ReviewState::Unknown(_) => false,
+        })
         .filter_map(|review| review.author.as_ref())
         .map(|actor| Login::parse(&actor.login))
         .collect()
@@ -968,6 +988,51 @@ mod tests {
         assert_eq!(
             disagreeing, 0,
             "every row on the default branch is judged by the rule the policy line names"
+        );
+    }
+
+    #[test]
+    fn a_review_a_push_dismissed_puts_the_pull_request_back_on_your_plate() {
+        // Approve, somebody pushes, the rule dismisses stale reviews: the
+        // approval is thrown out and the pull request needs looking at again.
+        //
+        // This is the case that hides. It left the reviewer's queue when they
+        // approved it -- GitHub drops them from the request list on submit --
+        // and nothing puts it back, so counting a dismissed review as "already
+        // reviewed" makes it invisible to the one person who has to act.
+        let states = |state: &str| {
+            converted_with(|pull_request| {
+                for review in pull_request
+                    .latest_reviews
+                    .nodes
+                    .iter_mut()
+                    .flatten()
+                    .flatten()
+                {
+                    review.state = serde_json::from_value(serde_json::json!(state))
+                        .unwrap_or(wire::ReviewState::Pending);
+                }
+            })
+            .map(|facts| {
+                facts
+                    .pull_requests()
+                    .iter()
+                    .map(|(pr, _)| pr.reviewed_by.len())
+                    .sum::<usize>()
+            })
+        };
+
+        let approved = states("APPROVED");
+        let dismissed = states("DISMISSED");
+
+        assert!(
+            approved.is_some_and(|count| count > 0),
+            "the recording has reviews to dismiss, or this proves nothing"
+        );
+        assert_eq!(
+            dismissed,
+            Some(0),
+            "a dismissed review is not a review that still stands"
         );
     }
 
