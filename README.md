@@ -5,7 +5,7 @@ never does: **why each one cannot merge yet** — and interrupts you when that
 answer changes.
 
 ```
-prtrack 0.1.1 | policy on main: 4 required checks | 1 approval(s) | threads must be resolved
+prtrack 0.1.2 | policy on main: 4 required checks | 1 approval(s) | threads must be resolved
 
 YOUR PRS  (15)
 PR     AUTHOR      CI          OPEN.CMT MERGE      WHY IT CANNOT MERGE          SINCE PUSH
