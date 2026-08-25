@@ -1224,7 +1224,7 @@ mod tests {
                 &outcome,
                 Outcome::Fetched { collected, reported_total, viewer, rate_limit_remaining }
                     if *collected == TOTAL_OPEN
-                        && *reported_total == Some(39)
+                        && *reported_total == Some(34)
                         && viewer == "user-09"
                         && rate_limit_remaining.is_some()
             ),
@@ -1634,7 +1634,9 @@ mod tests {
     #[tokio::test]
     async fn a_reviewer_this_crate_names_that_did_not_parse_is_refused() {
         let renamed = page_1_patched(
-            "/data/repository/pullRequests/nodes/0/reviewRequests/nodes/0/requestedReviewer",
+            // Node 3 rather than 0: the first pull request in the recording has
+            // no review requests, so patching it would assert nothing.
+            "/data/repository/pullRequests/nodes/3/reviewRequests/nodes/0/requestedReviewer",
             serde_json::json!({"__typename": "User", "handle": "octocat"}),
         );
         let (outcome, _sent) = fetch(vec![ok(&renamed)]).await;

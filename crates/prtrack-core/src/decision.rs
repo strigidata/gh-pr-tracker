@@ -676,6 +676,7 @@ mod tests {
             author: Some(Login::parse("octocat")?),
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse("9f2c4e1b7a3d5068c9e4b2a17f36d8095c1e4a7b")?,
+            head_ref: BranchName::new("topic/branch-01"),
             base_ref: BranchName::new("main"),
             review_decision: Some(ReviewDecision::ReviewRequired),
             mergeable: MergeableState::Mergeable,

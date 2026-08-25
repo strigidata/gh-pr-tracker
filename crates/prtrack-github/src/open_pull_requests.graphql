@@ -70,6 +70,7 @@ query OpenPullRequests($owner: String!, $name: String!, $first: Int!, $after: St
         isDraft
         createdAt
         headRefOid
+        headRefName
         baseRefName
         author {
           login

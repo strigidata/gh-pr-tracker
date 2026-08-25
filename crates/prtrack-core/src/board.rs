@@ -496,6 +496,7 @@ mod tests {
             author: Some(Login::parse(author)?),
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse(SOME_SHA)?,
+            head_ref: BranchName::new("topic/branch-01"),
             base_ref: BranchName::new("main"),
             review_decision: None,
             mergeable: MergeableState::Mergeable,

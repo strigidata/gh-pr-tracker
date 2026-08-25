@@ -68,6 +68,10 @@ def all_titles: collect(.data.repository.pullRequests.nodes[]?.title);
 def all_branches:
   collect(
     (.data.repository.pullRequests.nodes[]?.baseRefName),
+    # A head branch is the one that gives something away: the convention
+    # nearly everywhere is `firstname/TICKET-123-what-it-does`, so it
+    # carries a person and an internal ticket in one string.
+    (.data.repository.pullRequests.nodes[]?.headRefName),
     (.data.repository.defaultBranchRef?.name),
     (.data.repository.branchProtectionRules.nodes[]?.pattern)
   )
@@ -131,6 +135,7 @@ $owner as $owner
     .title |= title
     | .url |= url
     | .baseRefName |= branch
+    | .headRefName |= branch
     | .author |= redact_actor
     | (.reviewRequests.nodes[]?.requestedReviewer) |=
         (if type == "object" then

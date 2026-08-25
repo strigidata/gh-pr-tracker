@@ -533,6 +533,8 @@ pub(crate) struct PullRequest {
     pub(crate) head_ref_oid: String,
     /// The branch it wants to merge into, which decides whether a rule governs
     /// it.
+    /// The pull request's own branch. `String!`, so never null.
+    pub(crate) head_ref_name: String,
     pub(crate) base_ref_name: String,
     /// Whoever opened it. Null when that account is gone.
     pub(crate) author: Option<Actor>,
@@ -793,15 +795,15 @@ pub(crate) const PAGE_2: &str = include_str!("../tests/fixtures/open-pull-reques
 /// with. The client must send exactly this to replay the recording.
 #[cfg(test)]
 pub(crate) const PAGE_1_END_CURSOR: &str =
-    "Y3Vyc29yOnYyOpK0MjAyNi0wOC0yMVQwNTo0Nzo1NVrPAAAAAQIIy0Q=";
+    "Y3Vyc29yOnYyOpK0MjAyNi0wOC0yMVQxOTowNzoyMFrPAAAAAQJb17g=";
 
 /// How many open pull requests the repository had when these were recorded.
 #[cfg(test)]
-pub(crate) const TOTAL_OPEN: usize = 39;
+pub(crate) const TOTAL_OPEN: usize = 34;
 
 /// How many of them are on each page.
 #[cfg(test)]
-pub(crate) const PER_PAGE: usize = 20;
+pub(crate) const PER_PAGE: usize = 19;
 
 #[cfg(test)]
 mod tests {
@@ -927,7 +929,7 @@ mod tests {
         );
 
         let newest = requests.first();
-        assert_eq!(newest.map(|request| request.number), Some(4440));
+        assert_eq!(newest.map(|request| request.number), Some(4449));
         assert_eq!(
             newest.map(|request| request.head_ref_oid.len()),
             Some(40),

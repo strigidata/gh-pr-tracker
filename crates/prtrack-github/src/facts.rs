@@ -195,6 +195,7 @@ fn facts_of(
             DraftState::ReadyForReview
         },
         head: HeadSha::parse(&pull_request.head_ref_oid).map_err(refuse)?,
+        head_ref: BranchName::new(&pull_request.head_ref_name),
         base_ref: BranchName::new(&pull_request.base_ref_name),
         review_decision: pull_request
             .review_decision
@@ -525,7 +526,7 @@ mod tests {
             "the recording converts into at least one pull request"
         );
 
-        assert_eq!(first.map(|f| f.number.get()), Some(4440));
+        assert_eq!(first.map(|f| f.number.get()), Some(4449));
         assert_eq!(first.map(|f| f.repo.to_string()), Some(REPO.to_owned()));
         assert_eq!(first.map(|f| f.head.as_str().len()), Some(40));
         assert_eq!(first.map(|f| f.base_ref.as_str()), Some("main"));
@@ -540,7 +541,9 @@ mod tests {
         );
         assert_eq!(
             first.map(|f| f.draft_state),
-            Some(DraftState::ReadyForReview)
+            // The newest pull request in this recording happens to be a draft.
+            // Pinned to what was recorded rather than to what is tidy.
+            Some(DraftState::Draft)
         );
     }
 
@@ -703,7 +706,7 @@ mod tests {
             .map(|(facts, _)| facts.checks.len())
             .sum();
         assert_eq!(
-            attempts, 1677,
+            attempts, 1669,
             "every reported attempt of either kind must survive"
         );
     }
@@ -822,11 +825,11 @@ mod tests {
             .map(|(facts, _)| facts.requested_reviewers.len())
             .collect();
 
-        assert_eq!(requested.iter().sum::<usize>(), 85);
+        assert_eq!(requested.iter().sum::<usize>(), 63);
         assert_eq!(
             requested.iter().filter(|count| **count > 0).count(),
-            29,
-            "twenty-nine of the recorded pull requests are waiting on somebody"
+            22,
+            "twenty-two of the recorded pull requests are waiting on somebody"
         );
     }
 
@@ -845,8 +848,8 @@ mod tests {
         assert_eq!(counted.len(), TOTAL_OPEN);
         assert_eq!(
             counted.iter().map(|(threads, _)| threads).sum::<u32>(),
-            7,
-            "the recording holds seven unresolved threads"
+            3,
+            "the recording holds three unresolved threads"
         );
         assert_eq!(
             counted.iter().map(|(_, comments)| *comments).max(),
@@ -906,8 +909,8 @@ mod tests {
             .filter(|(facts, _)| facts.draft_state == DraftState::Draft)
             .count();
         assert_eq!(
-            drafts, 15,
-            "fifteen of the recorded pull requests are drafts"
+            drafts, 17,
+            "seventeen of the recorded pull requests are drafts"
         );
     }
 

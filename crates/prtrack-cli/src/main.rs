@@ -538,6 +538,7 @@ fn board_text(
         default_branch: default_branch.as_str(),
         now: Utc::now(),
         palette: palette(args),
+        show_branch: !args.no_branch,
     }
     .render()
 }

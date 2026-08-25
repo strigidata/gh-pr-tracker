@@ -19,9 +19,16 @@ use crate::width::{pad_to, truncate_to};
 const PR_COLUMN: usize = 7;
 const AUTHOR_COLUMN: usize = 14;
 const CI_COLUMN: usize = 15;
-const THREADS_COLUMN: usize = 8;
+// Nine, not eight, because `pad_to` guarantees at least one trailing space so
+// two values can never run together. `OPEN.CMT` is exactly eight characters, so
+// at width eight the *heading* rendered nine cells while the data rendered
+// eight, and every heading to its right sat one cell off its column. Invisible
+// until something followed `SINCE PUSH`.
+const THREADS_COLUMN: usize = 9;
 const MERGE_COLUMN: usize = 11;
 const REASON_COLUMN: usize = 40;
+/// Only padded when something follows it. As the last column it needs no width.
+const SINCE_PUSH_COLUMN: usize = 11;
 
 /// How much of a login is shown. One cell short of its column, so the longest
 /// login still leaves a space before the next value.
@@ -44,6 +51,13 @@ const SECONDS_PER_MINUTE: i64 = 60;
 const SECONDS_PER_HOUR: i64 = 60 * SECONDS_PER_MINUTE;
 const SECONDS_PER_DAY: i64 = 24 * SECONDS_PER_HOUR;
 
+/// How much of a branch name is shown before it is cut.
+///
+/// Last column, so it could run to the edge — but a branch is scanned for
+/// recognition rather than read, and an unbounded last column turns a wide
+/// terminal into a wall of slugs.
+const BRANCH_CELLS: usize = 34;
+
 /// A board, and everything needed to draw it.
 ///
 /// Fields are public because this is a plain bundle of arguments: a
@@ -62,6 +76,13 @@ pub struct BoardText<'a> {
     pub now: DateTime<Utc>,
     /// Whether, and how, to paint.
     pub palette: Palette,
+    /// Whether to show the branch each pull request lives on.
+    ///
+    /// On by default: the branch is what you type to go and look at the thing,
+    /// and it is the one field the row otherwise makes you open GitHub for. Off
+    /// for anybody whose branch names are long enough to push the row past the
+    /// width of their terminal.
+    pub show_branch: bool,
 }
 
 impl BoardText<'_> {
@@ -181,8 +202,17 @@ impl BoardText<'_> {
             pad_to("OPEN.CMT", THREADS_COLUMN),
             pad_to("MERGE", MERGE_COLUMN),
             pad_to("WHY IT CANNOT MERGE", REASON_COLUMN),
-            "SINCE PUSH"
+            if self.show_branch {
+                pad_to("SINCE PUSH", SINCE_PUSH_COLUMN)
+            } else {
+                "SINCE PUSH".to_owned()
+            }
         );
+        let header = if self.show_branch {
+            format!("{header}BRANCH")
+        } else {
+            header
+        };
         self.palette.paint(Style::Dim, &header)
     }
 
@@ -213,7 +243,7 @@ impl BoardText<'_> {
 
         let author = facts.author.as_ref().map_or(DELETED_AUTHOR, Login::as_str);
 
-        format!(
+        let line = format!(
             "{}{}{}{}{}{}{}",
             // The number is a link to the pull request. OSC 8 costs no columns,
             // so the URL is reachable without a column wide enough to print it
@@ -236,8 +266,28 @@ impl BoardText<'_> {
             pad_to(&threads_cell(row, self.rules, self.palette), THREADS_COLUMN),
             pad_to(&merge_cell(row, is_draft, palette), MERGE_COLUMN),
             pad_to(&reason_cell(row.reason(), self.palette), REASON_COLUMN),
-            palette.paint(Style::Plain, &self.age_of(row)),
-        )
+            if self.show_branch {
+                pad_to(
+                    &palette.paint(Style::Plain, &self.age_of(row)),
+                    SINCE_PUSH_COLUMN,
+                )
+            } else {
+                palette.paint(Style::Plain, &self.age_of(row))
+            },
+        );
+        if self.show_branch {
+            // Dim in every row, including one that is otherwise bright: the
+            // branch is how you reach the work, not a judgement about it, and
+            // painting it the same weight as the reason would have the row
+            // shouting twice.
+            let branch = self.palette.paint(
+                Style::Dim,
+                truncate_to(facts.head_ref.as_str(), BRANCH_CELLS),
+            );
+            format!("{line}{branch}")
+        } else {
+            line
+        }
     }
 
     /// How long ago the head commit landed, to one unit.
@@ -496,7 +546,8 @@ fn name_reviewers(reviewers: &[Reviewer]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoardText, AUTHOR_COLUMN, CI_COLUMN, MERGE_COLUMN, PR_COLUMN, REASON_COLUMN, THREADS_COLUMN,
+        BoardText, AUTHOR_COLUMN, CI_COLUMN, MERGE_COLUMN, PR_COLUMN, REASON_COLUMN,
+        SINCE_PUSH_COLUMN, THREADS_COLUMN,
     };
     use crate::color::{ColorChoice, Environment, Palette};
     use crate::width::visible_width;
@@ -549,6 +600,7 @@ mod tests {
             author: Some(Login::parse(author)?),
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse(SOME_SHA)?,
+            head_ref: BranchName::new("topic/branch-01"),
             base_ref: BranchName::new("main"),
             review_decision: None,
             mergeable: MergeableState::Mergeable,
@@ -582,7 +634,30 @@ mod tests {
     }
 
     /// Renders a board built from `prs` under `rules`, seen by `viewer`.
+    ///
+    /// Without the branch column, which most of these tests predate and none of
+    /// them are about. [`render_with_branch`] is the one that exercises it.
     fn render(prs: Vec<PrFacts>, rules: &PolicyRules, viewer: &Login, palette: Palette) -> String {
+        render_columns(prs, rules, viewer, palette, false)
+    }
+
+    /// The same, with the branch column on.
+    fn render_with_branch(
+        prs: Vec<PrFacts>,
+        rules: &PolicyRules,
+        viewer: &Login,
+        palette: Palette,
+    ) -> String {
+        render_columns(prs, rules, viewer, palette, true)
+    }
+
+    fn render_columns(
+        prs: Vec<PrFacts>,
+        rules: &PolicyRules,
+        viewer: &Login,
+        palette: Palette,
+        show_branch: bool,
+    ) -> String {
         let rows = prs
             .into_iter()
             .map(|facts| BoardRow::reduce(facts, rules))
@@ -593,8 +668,99 @@ mod tests {
             default_branch: "main",
             now: at(0),
             palette,
+            show_branch,
         }
         .render()
+    }
+
+    #[test]
+    fn the_branch_is_shown_last_and_can_be_turned_off() {
+        // The branch is the one field the row otherwise makes you open GitHub
+        // for, which is why it is on by default -- and why it is last, since it
+        // is what you copy rather than what you scan.
+        let rendered = Login::parse("octocat").and_then(|me| {
+            let mut pr = open_pr(1, "octocat")?;
+            pr.head_ref = BranchName::new("topic/branch-01");
+            Ok::<_, InvalidValue>((
+                render_with_branch(vec![pr.clone()], &enforced_rule()?, &me, plain()),
+                render(vec![pr], &enforced_rule()?, &me, plain()),
+            ))
+        });
+
+        assert_eq!(
+            rendered
+                .as_ref()
+                .map(|(shown, _)| shown.contains("topic/branch-01")),
+            Ok(true),
+            "shown by default"
+        );
+        assert_eq!(
+            rendered.as_ref().map(|(shown, _)| shown.contains("BRANCH")),
+            Ok(true),
+            "and the column is named"
+        );
+        assert_eq!(
+            rendered
+                .as_ref()
+                .map(|(_, hidden)| hidden.contains("topic/branch-01") || hidden.contains("BRANCH")),
+            Ok(false),
+            "--no-branch removes the heading as well as the values"
+        );
+    }
+
+    #[test]
+    fn the_branch_column_sits_under_its_heading() {
+        // The age column is unpadded when it is last and padded when it is not.
+        // Getting that wrong puts every branch one place left of its heading,
+        // which is the kind of thing that looks like a rendering bug and is
+        // never reported because it is only slightly wrong.
+        let rendered = Login::parse("octocat").and_then(|me| {
+            let mut pr = open_pr(1, "octocat")?;
+            pr.head_ref = BranchName::new("topic/branch-01");
+            Ok::<_, InvalidValue>(render_with_branch(
+                vec![pr],
+                &enforced_rule()?,
+                &me,
+                plain(),
+            ))
+        });
+
+        let column_of = |needle: &str| {
+            rendered.as_ref().ok().and_then(|text| {
+                text.lines()
+                    .find(|line| line.contains(needle))
+                    .and_then(|line| line.find(needle))
+            })
+        };
+        assert_eq!(
+            column_of("BRANCH"),
+            column_of("topic/branch-01"),
+            "heading and value start in the same column"
+        );
+    }
+
+    #[test]
+    fn every_heading_fits_the_column_it_names() {
+        // `pad_to` always leaves at least one trailing space, so a heading as
+        // long as its column renders one cell wider than the data beneath it --
+        // and every column to its right is then off by one. `OPEN.CMT` at width
+        // eight did exactly that, and it went unnoticed because the drift only
+        // shows once something follows the last column.
+        for (heading, column) in [
+            ("PR", PR_COLUMN),
+            ("AUTHOR", AUTHOR_COLUMN),
+            ("CI", CI_COLUMN),
+            ("OPEN.CMT", THREADS_COLUMN),
+            ("MERGE", MERGE_COLUMN),
+            ("WHY IT CANNOT MERGE", REASON_COLUMN),
+            ("SINCE PUSH", SINCE_PUSH_COLUMN),
+        ] {
+            assert!(
+                heading.len() < column,
+                "{heading:?} needs a column wider than {} to leave a space",
+                heading.len()
+            );
+        }
     }
 
     /// The first line, which is the policy banner.
@@ -637,7 +803,7 @@ mod tests {
 
         assert_eq!(
             rendered.as_ref().map(|text| row_for(text, 1)),
-            Ok("#1     octocat       no checks      0.0     clean      \
+            Ok("#1     octocat       no checks      0.0      clean      \
                 NOBODY ASSIGNED                         0m"
                 .to_owned())
         );
@@ -670,7 +836,7 @@ mod tests {
         // Six cells of login and eight of padding, against seven and seven.
         assert_eq!(
             one_row("日本語", 2),
-            Ok("#2     日本語        no checks      0.0     clean      \
+            Ok("#2     日本語        no checks      0.0      clean      \
                 NOBODY ASSIGNED                         0m"
                 .to_owned())
         );
@@ -679,7 +845,7 @@ mod tests {
         assert_eq!(
             one_row("octocat", 1).and_then(|ascii| one_row("日本語", 2)
                 .map(|wide| (visible_width(&ascii), visible_width(&wide)))),
-            Ok((97, 97))
+            Ok((98, 98))
         );
     }
 
@@ -699,7 +865,7 @@ mod tests {
 
         assert_eq!(
             rendered.as_ref().map(|text| row_for(text, 1)),
-            Ok("#1     a-very-long-l no checks      0.0     clean      \
+            Ok("#1     a-very-long-l no checks      0.0      clean      \
                 NOBODY ASSIGNED                         0m"
                 .to_owned()),
             "thirteen cells of login and the one space that keeps the columns apart"

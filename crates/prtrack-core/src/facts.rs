@@ -814,6 +814,10 @@ pub struct PrFacts {
     /// head are the fresh-looking stale cell this crate is built to avoid.
     pub head: HeadSha,
 
+    /// The pull request's own branch — what you would check out to work on it,
+    /// and the thing a reader copies rather than retypes.
+    pub head_ref: BranchName,
+
     /// The branch it wants to merge into.
     ///
     /// Read to decide *which* [`PolicyRules`] apply. A rule protects a pattern
@@ -1000,6 +1004,7 @@ mod tests {
             author: Some(Login::parse("octocat")?),
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse("9f2c4e1b7a3d5068c9e4b2a17f36d8095c1e4a7b")?,
+            head_ref: BranchName::new("topic/branch-01"),
             base_ref: BranchName::new("main"),
             review_decision: Some(ReviewDecision::Approved),
             mergeable: MergeableState::Conflicting,
