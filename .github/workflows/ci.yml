@@ -16,13 +16,19 @@ name: CI
 # The Linux job stays on one target for the same reason: clippy against musl and
 # tests against the host gnu triple is two dependency trees where one will do.
 
+# **No `push` trigger.** A merge to `main` runs `release.yml`, whose first job
+# calls this one — so a push trigger here meant two full gates per merge, racing
+# for the same concurrency group, one cancelling the other. A cancelled run on
+# `main` reads as a broken build, and the second gate was duplicated work
+# regardless.
 on:
-  push:
-    branches: [main]
   pull_request:
-  # So a release is cut from a commit known to be green, and can reuse the Linux
-  # artefact this builds rather than compiling musl a second time.
   workflow_call:
+    inputs:
+      upload_artifact:
+        description: "Publish the Linux binary for a release job to collect"
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,9 +39,14 @@ env:
 
 concurrency:
   # A second push to the same branch makes the first run's answer irrelevant.
-  # Tags are excluded: cancelling a release half way leaves it half published.
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  #
+  # Keyed by workflow as well as ref. When this is called from another workflow
+  # `github.workflow` is the *caller's* name, so a reusable invocation and a
+  # direct one can never collide — which they did, and one cancelled the other.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Never on `main`: a cancelled gate there is indistinguishable from a broken
+  # one, and it is the branch releases are cut from.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Least privilege, stated rather than inherited. Nothing in the gate writes.
 permissions:
@@ -171,10 +182,11 @@ jobs:
           fi
           mkdir -p dist && cp "$BIN" dist/prtrack
 
-      # Only for a release. Every other run would be paying to upload a binary
-      # that nothing downloads.
+      # Only when a release is going to collect it. Asked as an input rather
+      # than guessed from the ref, because there is no tag at this point — the
+      # release creates one *after* this passes.
       - name: Hand the binary to the release job
-        if: startsWith(github.ref, 'refs/tags/')
+        if: inputs.upload_artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-musl
