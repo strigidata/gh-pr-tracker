@@ -62,29 +62,44 @@ jobs:
       # the contract, and that piped output is data rather than escapes.
       - name: Smoke — the binary answers without a token
         run: |
+          # No `set -e`. This step asserts on exit codes, and the runner's shell
+          # already treats a non-zero one as fatal -- so the very check that
+          # matters most, "a missing token exits 3", killed the step before it
+          # could be inspected. Every command's status is captured explicitly
+          # instead.
           set -u
-          cargo build --release --locked -p prtrack-cli
+          cargo build --release --locked -p prtrack-cli || exit 1
+          BIN=./target/release/prtrack
 
-          ./target/release/prtrack --version
-          ./target/release/prtrack --help >/dev/null
+          "$BIN" --version || exit 1
 
           # `--help` and `--version` are successes. This regressed once already,
-          # exiting 2 and claiming the command line could not be read.
-          ./target/release/prtrack --help >/dev/null 2>&1
-          test $? -eq 0 || { echo "--help must exit 0"; exit 1; }
+          # exiting 2 while claiming the command line could not be read.
+          code=0; "$BIN" --help >/dev/null 2>&1 || code=$?
+          test "$code" -eq 0 || { echo "--help must exit 0, got $code"; exit 1; }
 
-          # No token is an auth failure, distinct from a usage error and from a
-          # network one. The exit code is the only part a script can read.
-          env -u GH_TOKEN -u GITHUB_TOKEN ./target/release/prtrack \
-            board --repo octo-org/example >/dev/null 2>/tmp/err.txt
-          code=$?
-          test $code -eq 3 || { echo "no token must exit 3, got $code"; cat /tmp/err.txt; exit 1; }
+          code=0; "$BIN" --version >/dev/null 2>&1 || code=$?
+          test "$code" -eq 0 || { echo "--version must exit 0, got $code"; exit 1; }
+
+          # A missing token is an auth failure, distinct from a usage error and
+          # from a network one. The exit code is the only part a script reads.
+          code=0
+          env -u GH_TOKEN -u GITHUB_TOKEN "$BIN" board --repo octo-org/example \
+            >/dev/null 2>/tmp/err.txt || code=$?
+          test "$code" -eq 3 || { echo "no token must exit 3, got $code"; cat /tmp/err.txt; exit 1; }
           grep -q "GH_TOKEN" /tmp/err.txt || { echo "the message must name the variable"; exit 1; }
+
+          # A bad command line is a usage error, and must not be confused with
+          # the above.
+          code=0; "$BIN" board >/dev/null 2>&1 || code=$?
+          test "$code" -eq 2 || { echo "a missing --repo must exit 2, got $code"; exit 1; }
 
           # A token must never reach stderr, however the run fails.
           if grep -qE "ghp_|github_pat_" /tmp/err.txt; then
             echo "a credential reached stderr"; exit 1
           fi
+
+          echo "smoke: exit codes are the contract, and they hold"
 
   # Debian is a target, so a Linux break must fail here rather than at release
   # time. This job exists because one did: `adopt_bundle_identity` is macOS-only
