@@ -166,6 +166,10 @@ async fn watch_forever(
 
     let mut state = remembered(path);
     let mut first_poll = true;
+    // Whether `Loading...` is still the only thing on screen. It is drawn
+    // before the first fetch and has to be *replaced* rather than printed
+    // over, by the board or by the failure — whichever arrives first.
+    let mut showing_placeholder = false;
 
     // The board is repainted in place rather than printed again underneath, so
     // the terminal shows one board rather than a transcript of every poll. The
@@ -195,6 +199,15 @@ async fn watch_forever(
     // `--watch 2>nudges.log`.
     let stderr_palette = stream_palette(args, std::io::stderr().is_terminal());
 
+    // Before the first request, not after it. The first fetch is the slow one
+    // — a fresh connection and nothing cached to revalidate against — and an
+    // empty terminal in the meantime is indistinguishable from a command that
+    // never started.
+    if interactive {
+        screen.redraw(&screen::loading());
+        showing_placeholder = true;
+    }
+
     loop {
         match read_repository(&client, args).await {
             Ok(facts) => {
@@ -212,6 +225,7 @@ async fn watch_forever(
                 {
                     Some(rendered) => {
                         screen.redraw(&format!("{rendered}{}", footer.render(palette(args))));
+                        showing_placeholder = false;
                     }
                     // JSON, or a repository with no default branch. Neither is
                     // a board to repaint, so fall back to writing it out.
@@ -265,6 +279,14 @@ async fn watch_forever(
                 // the next successful poll compares against the last thing we
                 // actually saw rather than across a gap — diffing across one
                 // hides the transitions that happened inside it.
+                // `Loading...` is still the only thing on screen, and the
+                // cursor is sitting at the end of it. Erasing first puts the
+                // failure where the board would have gone rather than on the
+                // same line as the placeholder it replaces.
+                if showing_placeholder {
+                    screen.redraw("");
+                    showing_placeholder = false;
+                }
                 eprintln!("prtrack: {:#}", trouble.cause);
                 if !worth_retrying(trouble.exit) {
                     return Err(trouble);
@@ -273,30 +295,42 @@ async fn watch_forever(
             }
         }
 
-        // The countdown, ticking under the board. Broken into one-second steps
-        // rather than one long sleep so the line can be rewritten as it counts,
-        // and so `Updating...` appears the moment the wait ends rather than
-        // after the fetch that follows it.
-        //
-        // Ctrl-C is raced against every step. Without it the process dies on
-        // the signal, `Screen`'s destructor never runs, and the shell the user
-        // returns to has an invisible cursor with no way to know why — the
-        // failure `AGENTS.md` means by "a crash must restore the terminal".
-        let seconds = i64::try_from(interval.as_secs()).unwrap_or(i64::MAX);
-        for remaining in (1..=seconds).rev() {
-            screen.status_line(&screen::countdown(remaining));
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                result = tokio::signal::ctrl_c() => {
-                    // An unavailable handler is not a reason to keep running:
-                    // the user asked to stop either way.
-                    drop(result);
-                    return Ok(Exit::Informational);
-                }
+        if !wait_out_interval(&mut screen, interval).await {
+            return Ok(Exit::Informational);
+        }
+    }
+}
+
+/// Sleeps out one interval, ticking the line under the board.
+///
+/// Broken into one-second steps rather than one long sleep so the line can be
+/// rewritten as it counts, and so `Updating...` appears the moment the wait
+/// ends rather than after the fetch that follows it.
+///
+/// Returns `false` when Ctrl-C arrived, which is the caller's cue to stop.
+/// The signal is raced against every step: without that the process dies on it,
+/// [`Screen`]'s destructor never runs, and the shell the user returns to has an
+/// invisible cursor with no way to know why — the failure `AGENTS.md` means by
+/// "a crash must restore the terminal".
+async fn wait_out_interval(
+    screen: &mut Screen<std::io::Stdout>,
+    interval: std::time::Duration,
+) -> bool {
+    let seconds = i64::try_from(interval.as_secs()).unwrap_or(i64::MAX);
+    for remaining in (1..=seconds).rev() {
+        screen.status_line(&screen::countdown(remaining));
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            result = tokio::signal::ctrl_c() => {
+                // An unavailable handler is not a reason to keep running: the
+                // user asked to stop either way.
+                drop(result);
+                return false;
             }
         }
-        screen.status_line(&screen::updating());
     }
+    screen.status_line(&screen::updating());
+    true
 }
 
 /// One read of the repository, on a client the loop already owns.

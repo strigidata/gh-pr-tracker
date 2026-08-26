@@ -213,11 +213,25 @@ pub fn updating() -> String {
     "Updating...".to_owned()
 }
 
+/// What stands in for the board until the first poll answers.
+///
+/// The first fetch is the slow one — no connection yet and nothing cached to
+/// revalidate against — and until it returned the terminal showed nothing at
+/// all. An empty screen after a command is indistinguishable from a command
+/// that did not start.
+///
+/// Drawn through [`Screen::redraw`] rather than printed, so whatever replaces
+/// it — the board, or a failure — erases it instead of landing after it.
+#[must_use]
+pub fn loading() -> String {
+    "Loading...".to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        countdown, updating, Footer, Screen, CLEAR_BELOW, CLEAR_LINE, HIDE_CURSOR, RECENT_NUDGES,
-        SHOW_CURSOR,
+        countdown, loading, updating, Footer, Screen, CLEAR_BELOW, CLEAR_LINE, HIDE_CURSOR, HOME,
+        RECENT_NUDGES, SHOW_CURSOR,
     };
     use crate::color::Palette;
 
@@ -274,6 +288,50 @@ mod tests {
         assert!(
             first_line < first_erase,
             "the line is written, then its tail is erased"
+        );
+    }
+
+    #[test]
+    fn the_loading_placeholder_is_erased_by_whatever_replaces_it() {
+        // `Loading...` stands in for the board until the first poll answers,
+        // and the first poll is the slow one. It has to go through `redraw`
+        // rather than be printed: printed, it stays above the board for the
+        // life of the process, and the failure branch appends to the same line
+        // instead of taking its place.
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut screen = Screen::new(&mut sink, true);
+            screen.redraw(&loading());
+            // What the failure branch does: erase, so the message that follows
+            // lands where the board would have gone.
+            screen.redraw("");
+        }
+        let out = String::from_utf8_lossy(&sink).into_owned();
+
+        // Compared as `Option`s, which orders `None` below every `Some` — so a
+        // placeholder that was never drawn, or a replacement that never went
+        // home, fails the same comparison rather than needing its own unwrap.
+        let placeholder = out.find(&loading());
+        let replacement = out.rfind(HOME);
+        assert!(placeholder.is_some(), "the placeholder is drawn: {out:?}");
+        assert!(
+            replacement > placeholder,
+            "the replacement must start above the placeholder, not after it: {out:?}"
+        );
+
+        // Everything from the replacement onwards. Asserted on the tail rather
+        // than on the whole output, because `Drop` restores the cursor after
+        // it and would make an `ends_with` check about the wrong thing.
+        let tail = out
+            .get(replacement.unwrap_or_default()..)
+            .unwrap_or_default();
+        assert!(
+            tail.contains(CLEAR_BELOW),
+            "the replacement must clear what the placeholder left behind: {tail:?}"
+        );
+        assert!(
+            !tail.contains("Loading"),
+            "and must not draw it again: {tail:?}"
         );
     }
 
