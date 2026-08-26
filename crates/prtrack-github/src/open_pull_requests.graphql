@@ -120,6 +120,10 @@ query OpenPullRequests($owner: String!, $name: String!, $first: Int!, $after: St
                 state
                 contexts(first: 100) {
                   totalCount
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
                   nodes {
                     __typename
                     ... on CheckRun {

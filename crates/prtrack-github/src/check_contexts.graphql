@@ -1,0 +1,71 @@
+# The contexts of one pull request's head commit, from a cursor onwards.
+#
+# `open_pull_requests.graphql` asks for `contexts(first: 100)`, and 100 is
+# GitHub's maximum for a single connection -- not a number this crate chose and
+# not one it can raise. A pull request with more checks than that can never be
+# satisfied by the main query, so the shortfall is not a symptom of a bad page
+# and asking again cannot fix it. Measured on a real repository at 111 of 100,
+# where the watcher retried and gave up every five minutes indefinitely.
+#
+# So the rest are fetched here instead, one pull request at a time, and only
+# for the ones that actually came back short. The completeness check still runs
+# afterwards against `totalCount` -- following a cursor is how the list is
+# made whole, not a reason to stop checking that it is.
+#
+# The selection under `contexts` must stay identical to the main query's. These
+# nodes are appended to the ones that arrived there, so a field asked for in
+# one and not the other would make an entry's readability depend on which page
+# it landed on.
+query CheckContexts(
+  $owner: String!
+  $name: String!
+  $number: Int!
+  $after: String
+) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      commits(last: 1) {
+        nodes {
+          commit {
+            # Nothing here reads `committedDate` or `state` back -- only the
+            # contexts are wanted. They are selected because the types this
+            # deserializes into require them, and a query that omits either
+            # fails outright with `missing field`. Both shipped and both were
+            # caught by running the binary, not by a test: the fixtures
+            # supplied whatever the types demanded while the query never asked
+            # for it, so they were more generous than any real answer.
+            #
+            # `both_queries_select_the_same_commit_fields` now compares this
+            # whole selection against the main query's, which is the check
+            # that would have caught them.
+            committedDate
+            statusCheckRollup {
+              state
+              contexts(first: 100, after: $after) {
+                totalCount
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    name
+                    conclusion
+                    status
+                    startedAt
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                    createdAt
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
