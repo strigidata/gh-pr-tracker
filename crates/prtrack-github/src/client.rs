@@ -25,6 +25,10 @@ const CLIENT_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO
 /// The query, shared with the fixture recording so the two cannot drift.
 const QUERY: &str = include_str!("open_pull_requests.graphql");
 
+/// The follow-up that pages the checks of a pull request with more than the
+/// hundred a single connection can return. See the file's own header.
+const CONTEXTS_QUERY: &str = include_str!("check_contexts.graphql");
+
 /// How long one request may take before it is abandoned.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -443,6 +447,86 @@ impl GitHubClient {
     /// The first attempt is made outside the loop so that "the budget was
     /// spent" is a state the types can express without a placeholder error
     /// standing in for a failure that never happened.
+    /// Every check of every pull request that came back with some missing.
+    ///
+    /// Only the ones that are short cost a request, so the usual repository
+    /// adds none at all.
+    ///
+    /// This runs inside [`Self::attempt`], so a page that is still short after
+    /// topping up is retried exactly as it was before — a missing `totalCount`
+    /// is as likely to be a momentary hiccup as it ever was. What changed is
+    /// that a pull request with more than the hundred checks a single
+    /// connection can return is now *made* whole first, instead of being
+    /// refused, retried three times and reported as `GaveUp` on every poll
+    /// forever.
+    async fn top_up_contexts(
+        &self,
+        repo: &RepoRef,
+        pull_requests: &mut [wire::PullRequest],
+    ) -> Result<(), AttemptFailure> {
+        for pull_request in pull_requests.iter_mut() {
+            let number = pull_request.number;
+            let Some(contexts) = head_contexts(pull_request) else {
+                continue;
+            };
+
+            let mut pages = 1_usize;
+            while let Some(cursor) = next_cursor(contexts) {
+                if pages >= MAX_PAGES {
+                    return Err(AttemptFailure::Permanent(GitHubError::TooManyPages {
+                        pages,
+                    }));
+                }
+                let more = self.attempt_contexts(repo, number, &cursor).await?;
+
+                match (contexts.nodes.as_mut(), more.nodes) {
+                    (Some(seen), Some(rest)) => seen.extend(rest),
+                    (None, rest) => contexts.nodes = rest,
+                    (Some(_), None) => {}
+                }
+                // The follow-up's own total, so a check that appeared while
+                // this was paging is noticed by the check below rather than
+                // measured against a number that has moved on.
+                contexts.total_count = more.total_count.or(contexts.total_count);
+                contexts.page_info = more.page_info;
+                pages += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// One request for one more page of checks, and one reading of the answer.
+    ///
+    /// No retry of its own. It is called from inside [`Self::attempt`], which
+    /// already has one — a second layer here would multiply into nine requests
+    /// for one bad page.
+    async fn attempt_contexts(
+        &self,
+        repo: &RepoRef,
+        number: i64,
+        after: &str,
+    ) -> Result<wire::Connection<wire::CheckContext>, AttemptFailure> {
+        let response = self
+            .http
+            .post(self.endpoint.clone())
+            .timeout(self.timeout)
+            .json(&Request::contexts(repo, number, after))
+            .send()
+            .await
+            .map_err(unreachable_host)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(refusal(status, response.headers()));
+        }
+
+        let body = response.bytes().await.map_err(unreachable_host)?;
+        let envelope: wire::ContextsEnvelope = serde_json::from_slice(&body)
+            .map_err(|source| AttemptFailure::Transient(GitHubError::Decode(source)))?;
+
+        contexts_of(envelope)
+    }
+
     async fn fetch_page(&self, repo: &RepoRef, after: Option<&str>) -> Result<Page, GitHubError> {
         let mut attempts = 1_u32;
         let mut failure = match self.attempt(repo, after).await {
@@ -487,7 +571,18 @@ impl GitHubClient {
         let envelope: wire::Envelope = serde_json::from_slice(&body)
             .map_err(|source| AttemptFailure::Transient(GitHubError::Decode(source)))?;
 
-        Page::read(data_of(envelope)?, repo)
+        let mut page = Page::read(data_of(envelope)?, repo)?;
+
+        // After the page is whole, because a pull request's checks are the one
+        // nested list that legitimately arrives short: a hundred is GitHub's
+        // cap on a single connection, not a number this crate picked. Anything
+        // still missing once the cursors are exhausted is a real hole, and
+        // falls to the same check as every other list.
+        self.top_up_contexts(repo, &mut page.pull_requests).await?;
+        if let Some(short) = page.pull_requests.iter().find_map(contexts_shortfall) {
+            return Err(incomplete(short));
+        }
+        Ok(page)
     }
 }
 
@@ -600,18 +695,12 @@ fn shortfall_in(pull_request: &wire::PullRequest) -> Option<Malformed> {
         shortfall(&pull_request.latest_reviews, NestedList::LatestReviews),
         shortfall(&pull_request.review_threads, NestedList::ReviewThreads),
     ];
-    if let Some(short) = listed.into_iter().flatten().next() {
-        return Some(short);
-    }
-
-    pull_request
-        .commits
-        .nodes
-        .iter()
-        .flatten()
-        .flatten()
-        .filter_map(|node| node.commit.status_check_rollup.as_ref())
-        .find_map(|rollup| shortfall(&rollup.contexts, NestedList::CheckContexts))
+    // Checks are deliberately not here. They are the one nested connection
+    // that can legitimately arrive short — a hundred is GitHub's cap, not this
+    // crate's choice — so they are topped up first and checked by
+    // `contexts_shortfall` afterwards. Refusing them at this point made a
+    // repository with more than a hundred checks unreadable forever.
+    listed.into_iter().flatten().next()
 }
 
 /// The first union member that fell through to its fallback arm despite being
@@ -765,6 +854,92 @@ fn data_of(envelope: wire::Envelope) -> Result<wire::Query, AttemptFailure> {
     }))
 }
 
+/// The check connection of a follow-up response, or why it cannot be used.
+///
+/// The same reading as [`data_of`] against the smaller envelope: an error
+/// carrying a path nulled something and the answer came back around the hole,
+/// and an error-only body is a refusal rather than an empty result.
+///
+/// A missing rollup is refused rather than read as "no CI". This query is only
+/// ever sent for a pull request that already reported more checks than it
+/// returned, so a rollup that is absent the second time is a page with a hole
+/// in it — and taking it for an empty list would drop the very checks it was
+/// sent to collect.
+fn contexts_of(
+    envelope: wire::ContextsEnvelope,
+) -> Result<wire::Connection<wire::CheckContext>, AttemptFailure> {
+    let wire::ContextsEnvelope { data, errors } = envelope;
+
+    let Some(query) = data else {
+        let messages: Vec<String> = errors
+            .unwrap_or_default()
+            .into_iter()
+            .map(|error| error.message)
+            .collect();
+        return Err(AttemptFailure::Transient(if messages.is_empty() {
+            GitHubError::Malformed(Malformed::NoData)
+        } else {
+            GitHubError::GraphQl { messages }
+        }));
+    };
+
+    if let Some(path) = nulled_field(errors.as_deref()) {
+        return Err(incomplete(Malformed::ErrorNulledField { path }));
+    }
+
+    query
+        .repository
+        .and_then(|repository| repository.pull_request)
+        .and_then(|pull_request| pull_request.commits.nodes)
+        .and_then(|nodes| nodes.into_iter().flatten().next())
+        .and_then(|node| node.commit.status_check_rollup)
+        .map(|rollup| rollup.contexts)
+        .ok_or_else(|| incomplete(Malformed::NoNodes))
+}
+
+/// The check connection of a pull request's head commit, to be extended.
+fn head_contexts(
+    pull_request: &mut wire::PullRequest,
+) -> Option<&mut wire::Connection<wire::CheckContext>> {
+    pull_request
+        .commits
+        .nodes
+        .as_mut()?
+        .iter_mut()
+        .flatten()
+        .next()?
+        .commit
+        .status_check_rollup
+        .as_mut()
+        .map(|rollup| &mut rollup.contexts)
+}
+
+/// The cursor another page of checks would start at, if there is one.
+///
+/// `has_next_page` without a cursor yields `None`, which stops the loop and
+/// leaves the list short — the completeness check then refuses it. That is the
+/// same call the outer list makes, and for the same reason: a cursor GitHub
+/// declined to give is not a page this can go and fetch.
+fn next_cursor(contexts: &wire::Connection<wire::CheckContext>) -> Option<String> {
+    contexts
+        .page_info
+        .as_ref()
+        .filter(|page_info| page_info.has_next_page)
+        .and_then(|page_info| page_info.end_cursor.clone())
+}
+
+/// Whether one pull request's checks are still short after any topping up.
+fn contexts_shortfall(pull_request: &wire::PullRequest) -> Option<Malformed> {
+    pull_request
+        .commits
+        .nodes
+        .iter()
+        .flatten()
+        .flatten()
+        .filter_map(|node| node.commit.status_check_rollup.as_ref())
+        .find_map(|rollup| shortfall(&rollup.contexts, NestedList::CheckContexts))
+}
+
 /// The path of the first error that nulled a field this crate reads.
 ///
 /// An error carrying a path nulled the field at that path — that is what a
@@ -826,8 +1001,18 @@ fn checked_endpoint(raw: &str) -> Result<Url, GitHubError> {
 struct Variables<'a> {
     owner: &'a str,
     name: &'a str,
-    first: i64,
+    /// How many pull requests to ask for. Omitted by the follow-up, which
+    /// selects one by number and so never declares the variable — GraphQL
+    /// rejects an undeclared variable and an unused declaration alike.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first: Option<i64>,
     after: Option<&'a str>,
+    /// Which pull request to page the checks of. Only the follow-up query
+    /// declares this variable, and GraphQL refuses a variable the operation
+    /// does not name — so it is left out of a page request entirely rather
+    /// than sent as null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    number: Option<i64>,
 }
 
 /// One GraphQL request body.
@@ -845,8 +1030,23 @@ impl<'a> Request<'a> {
             variables: Variables {
                 owner: repo.owner(),
                 name: repo.name(),
-                first: PAGE_SIZE,
+                first: Some(PAGE_SIZE),
                 after,
+                number: None,
+            },
+        }
+    }
+
+    /// The request for one more page of `number`'s checks.
+    fn contexts(repo: &'a RepoRef, number: i64, after: &'a str) -> Self {
+        Self {
+            query: CONTEXTS_QUERY,
+            variables: Variables {
+                owner: repo.owner(),
+                name: repo.name(),
+                first: None,
+                after: Some(after),
+                number: Some(number),
             },
         }
     }
@@ -1301,6 +1501,56 @@ mod tests {
             unexplained.is_empty(),
             "the query selects fields no recording shows, so nothing here \
              establishes they are real: {unexplained:?}"
+        );
+    }
+
+    #[test]
+    fn both_queries_select_the_same_check_fields() {
+        // The follow-up's nodes are appended to the main query's, so a field
+        // asked for in one and not the other would make a check's readability
+        // depend on which page it happened to land on -- the first hundred
+        // parse, the rest fall through to the unknown arm and read as still
+        // running. That is the quiet kind of wrong: a failing required check
+        // rendered as one waiting for CI.
+        //
+        // Compared as a token set rather than as text, because the two files
+        // nest the block at different depths and neither indentation nor the
+        // trailing braces mean anything here.
+        fn check_fields(query: &str) -> Vec<String> {
+            // Comments first. The follow-up's header explains itself by
+            // quoting `contexts(first: 100)`, and splitting on that match
+            // swallows the prose instead of the selection.
+            let selections: String = query
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .collect::<Vec<&str>>()
+                .join("\n");
+            let from_contexts = selections
+                .split_once("contexts(")
+                .map_or("", |(_, rest)| rest)
+                // The argument list differs on purpose: the follow-up carries
+                // `after`, and that is the whole point of it.
+                .split_once(')')
+                .map_or("", |(_, rest)| rest);
+            let mut fields: Vec<String> = from_contexts
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .filter(|token| !token.is_empty() && *token != "on")
+                .map(str::to_owned)
+                .collect();
+            fields.sort_unstable();
+            fields.dedup();
+            fields
+        }
+
+        let main = check_fields(QUERY);
+        assert!(
+            main.contains(&"conclusion".to_owned()) && main.contains(&"createdAt".to_owned()),
+            "the extraction must actually find the check selection, got {main:?}"
+        );
+        assert_eq!(
+            main,
+            check_fields(super::CONTEXTS_QUERY),
+            "the two queries must read a check the same way"
         );
     }
 
@@ -1891,6 +2141,155 @@ mod tests {
                     )
             ),
             "expected an uncountable list to be refused, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checks_that_are_short_with_no_cursor_to_follow_are_still_refused() {
+        // The counterpart to the test below, and the reason it is safe. Topping
+        // up moved the completeness check later; it did not remove it. A list
+        // that is short with nowhere to go is a hole, and a hole in the checks
+        // renders a pull request with a failing required check as one still
+        // waiting for CI.
+        //
+        // Without this, the guard is only ever exercised on a page that gets
+        // repaired -- which is to say, never exercised as a guard at all.
+        let mut body =
+            serde_json::from_str::<serde_json::Value>(PAGE_1).unwrap_or(serde_json::Value::Null);
+        if let Some(serde_json::Value::Object(contexts)) = body.pointer_mut(
+            "/data/repository/pullRequests/nodes/0/commits/nodes/0/commit/statusCheckRollup/contexts",
+        ) {
+            contexts.insert("totalCount".to_owned(), serde_json::json!(48));
+            contexts.insert(
+                "pageInfo".to_owned(),
+                serde_json::json!({ "hasNextPage": false, "endCursor": null }),
+            );
+        }
+
+        let (outcome, sent) = fetch(vec![ok(&body.to_string())]).await;
+
+        assert!(
+            matches!(
+                &outcome,
+                Outcome::Failed(GitHubError::GaveUp { source, .. })
+                    if matches!(
+                        **source,
+                        GitHubError::Malformed(Malformed::Truncated {
+                            what: NestedList::CheckContexts,
+                            counted: 47,
+                            total: 48,
+                        })
+                    )
+            ),
+            "a short check list with no cursor must still be refused, got {outcome:?}"
+        );
+        assert!(
+            sent.iter()
+                .all(|request| variables(request).get("number").is_none()),
+            "with no cursor offered there is nothing to follow, so no follow-up may be sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_contexts_past_the_first_page_are_followed_rather_than_refused() {
+        // `first: 100` is GitHub's maximum for a single connection, so a pull
+        // request with more contexts than that can never be satisfied by the
+        // main query. Refusing short data is right; refusing it when a cursor
+        // was offered is not, and because the failure counts as retryable
+        // `--watch` looped on it forever -- measured on a real repository at
+        // 111 of 100.
+        //
+        // The fixture carries 47, so this claims a 48th exists and offers the
+        // cursor that reaches it.
+        const CONTEXT_CURSOR: &str = "Y3Vyc29yOnYyOpHOAAAAAQ==";
+
+        let mut body =
+            serde_json::from_str::<serde_json::Value>(PAGE_1).unwrap_or(serde_json::Value::Null);
+        if let Some(serde_json::Value::Object(contexts)) = body.pointer_mut(
+            "/data/repository/pullRequests/nodes/0/commits/nodes/0/commit/statusCheckRollup/contexts",
+        ) {
+            contexts.insert("totalCount".to_owned(), serde_json::json!(48));
+            contexts.insert(
+                "pageInfo".to_owned(),
+                serde_json::json!({ "hasNextPage": true, "endCursor": CONTEXT_CURSOR }),
+            );
+        }
+        // The probe has to actually be short, or this test passes for the
+        // reason none of it is about. A pointer that stops resolving because
+        // the recording was replaced would leave the fixture in normal form
+        // and the assertions below still green.
+        assert_eq!(
+            body.pointer(
+                "/data/repository/pullRequests/nodes/0/commits/nodes/0/commit/statusCheckRollup/contexts/totalCount",
+            ),
+            Some(&serde_json::json!(48)),
+            "the fixture must be made short for this to be a test of anything"
+        );
+
+        // Read from the fixture rather than written down, so this still names
+        // the right pull request if the recording is replaced.
+        let short_one = body
+            .pointer("/data/repository/pullRequests/nodes/0/number")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        let forty_eighth = serde_json::json!({
+            "__typename": "StatusContext",
+            "context": "ci/the-forty-eighth",
+            "state": "SUCCESS",
+            "createdAt": "2024-01-01T00:00:00Z",
+        });
+        let rollup = serde_json::json!({
+            "state": "SUCCESS",
+            "contexts": {
+                "totalCount": 48,
+                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                "nodes": [forty_eighth],
+            },
+        });
+        let follow_up = serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "commits": {
+                            "nodes": [{
+                                "commit": {
+                                    "committedDate": "2024-01-01T00:00:00Z",
+                                    "statusCheckRollup": rollup,
+                                },
+                            }],
+                        },
+                    },
+                },
+            },
+        });
+
+        let (outcome, sent) = fetch(vec![
+            ok(&body.to_string()),
+            ok(&follow_up.to_string()),
+            ok(PAGE_2),
+        ])
+        .await;
+
+        assert!(
+            matches!(outcome, Outcome::Fetched { .. }),
+            "a cursor was offered, so the contexts must be topped up rather \
+             than the page refused: {outcome:?}"
+        );
+        assert_eq!(sent.len(), 3, "the top-up sits between the two list pages");
+        // Both halves matter. A top-up that starts from the beginning loops,
+        // and one that names the wrong pull request still comes back long
+        // enough to satisfy the total -- so neither assertion alone would
+        // notice the other's failure.
+        assert_eq!(
+            variable(&sent, 1, "after"),
+            serde_json::Value::from(CONTEXT_CURSOR),
+            "the top-up must start where the contexts ran out"
+        );
+        assert_eq!(
+            variable(&sent, 1, "number"),
+            short_one,
+            "the top-up must name the pull request whose contexts were short"
         );
     }
 

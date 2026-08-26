@@ -300,6 +300,46 @@ pub(crate) struct Envelope {
     pub(crate) errors: Option<Vec<GraphQlError>>,
 }
 
+/// A response to the follow-up query that pages one pull request's checks.
+///
+/// Its own envelope rather than a reuse of [`Envelope`], because that one hangs
+/// everything off `repository.pullRequests` and this query asks for a single
+/// `pullRequest` by number. Sharing the type would mean making the connection
+/// optional in the shape every other reader relies on it having.
+///
+/// Deserialize only: nothing round-trips this, because no fixture records it —
+/// the recorded repository has no pull request with more than a hundred checks,
+/// which is exactly why the shortfall it exists to repair went unnoticed.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ContextsEnvelope {
+    /// The query result, absent when the query could not be executed at all.
+    pub(crate) data: Option<ContextsQuery>,
+    /// What went wrong. Can arrive alongside partial data.
+    pub(crate) errors: Option<Vec<GraphQlError>>,
+}
+
+/// The `data` of a [`ContextsEnvelope`].
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ContextsQuery {
+    /// Null when the repository is gone or invisible to the token.
+    pub(crate) repository: Option<ContextsRepository>,
+}
+
+/// The `repository` of a [`ContextsQuery`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ContextsRepository {
+    /// Null when the number names no pull request.
+    pub(crate) pull_request: Option<ContextsPullRequest>,
+}
+
+/// The single pull request a [`ContextsRepository`] was asked for.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ContextsPullRequest {
+    /// Its head commit, carrying the page of checks this query went after.
+    pub(crate) commits: Connection<CommitNode>,
+}
+
 /// One entry of a GraphQL `errors` array.
 ///
 /// `locations` and `extensions` are still dropped, so unlike the rest of this
