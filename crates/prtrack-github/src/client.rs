@@ -1505,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn both_queries_select_the_same_check_fields() {
+    fn both_queries_select_the_same_commit_fields() {
         // The follow-up's nodes are appended to the main query's, so a field
         // asked for in one and not the other would make a check's readability
         // depend on which page it happened to land on -- the first hundred
@@ -1525,21 +1525,47 @@ mod tests {
                 .filter(|line| !line.trim_start().starts_with('#'))
                 .collect::<Vec<&str>>()
                 .join("\n");
-            let from_contexts = selections
-                .split_once("contexts(")
-                .map_or("", |(_, rest)| rest)
-                // The argument list differs on purpose: the follow-up carries
-                // `after`, and that is the whole point of it.
-                .split_once(')')
+            // Every argument list goes. They differ on purpose -- the
+            // follow-up carries a cursor -- and none of them is a field.
+            let mut without_arguments = String::new();
+            let mut depth = 0_usize;
+            for character in selections.chars() {
+                match character {
+                    '(' => depth += 1,
+                    ')' => depth = depth.saturating_sub(1),
+                    _ if depth == 0 => without_arguments.push(character),
+                    _ => {}
+                }
+            }
+
+            // From `commit`, not from `contexts` or from the rollup. Both
+            // narrower anchors were tried and each let a real failure through:
+            // the rollup requires `state`, the commit requires
+            // `committedDate`, and a follow-up omitting either cannot
+            // deserialize at all.
+            //
+            // Neither unit test could see it, because their fixtures supplied
+            // the fields the *types* demand while the query never asked for
+            // them -- fixtures more generous than any answer GitHub would
+            // send, so the tests passed on data that could not arrive. Both
+            // were found by running the binary against a real repository.
+            // Anchoring on the whole commit selection is what makes this a
+            // guard rather than a spot check.
+            //
+            // `commit {` rather than `commit`, so it cannot match `commits`.
+            let from_commit = without_arguments
+                .split_once("commit {")
                 .map_or("", |(_, rest)| rest);
-            let mut fields: Vec<String> = from_contexts
+            // In order, and not deduplicated. A sorted set cannot see the
+            // failure this exists to catch: `state` is selected twice in the
+            // main query -- once on the rollup and once on a `StatusContext`
+            // -- so dropping the rollup's leaves the set identical and only
+            // the sequence one token shorter.
+            from_commit
                 .split(|c: char| !c.is_alphanumeric() && c != '_')
                 .filter(|token| !token.is_empty() && *token != "on")
                 .map(str::to_owned)
-                .collect();
-            fields.sort_unstable();
-            fields.dedup();
-            fields
+                .collect()
         }
 
         let main = check_fields(QUERY);

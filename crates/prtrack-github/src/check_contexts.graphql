@@ -27,7 +27,20 @@ query CheckContexts(
       commits(last: 1) {
         nodes {
           commit {
+            # Nothing here reads `committedDate` or `state` back -- only the
+            # contexts are wanted. They are selected because the types this
+            # deserializes into require them, and a query that omits either
+            # fails outright with `missing field`. Both shipped and both were
+            # caught by running the binary, not by a test: the fixtures
+            # supplied whatever the types demanded while the query never asked
+            # for it, so they were more generous than any real answer.
+            #
+            # `both_queries_select_the_same_commit_fields` now compares this
+            # whole selection against the main query's, which is the check
+            # that would have caught them.
+            committedDate
             statusCheckRollup {
+              state
               contexts(first: 100, after: $after) {
                 totalCount
                 pageInfo {
