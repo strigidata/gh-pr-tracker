@@ -3,8 +3,12 @@
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-/// Three attempts: the first try and two retries.
-const DEFAULT_ATTEMPTS: NonZeroU32 = match NonZeroU32::new(3) {
+/// Five attempts: the first try and four retries, waiting 7.5s in all.
+///
+/// Three gave up after a second and a half of waiting, which is shorter than
+/// one of GitHub's own query timeouts. Five is also enough for the client to
+/// halve a page that timed out down to a single pull request.
+const DEFAULT_ATTEMPTS: NonZeroU32 = match NonZeroU32::new(5) {
     Some(attempts) => attempts,
     None => NonZeroU32::MIN,
 };
@@ -125,6 +129,23 @@ mod tests {
                 Duration::from_millis(500),
                 Duration::from_secs(1),
                 Duration::from_secs(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_default_budget_rides_out_several_seconds_of_trouble() {
+        // Three attempts gave up after barely a second and a half of waiting,
+        // which is shorter than one of GitHub's own query timeouts. Five reach
+        // the smallest page the client will shrink to and wait 7.5s in all.
+        assert_eq!(
+            RetryBudget::default().schedule().collect::<Vec<Duration>>(),
+            vec![
+                Duration::ZERO,
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
             ]
         );
     }
