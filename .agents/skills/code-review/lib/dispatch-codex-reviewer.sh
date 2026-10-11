@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dispatch a code-review reviewer brief to OpenAI Codex CLI (GPT-5.5)
+# Dispatch a code-review reviewer brief to OpenAI Codex CLI (GPT-6.1-Sol)
 # for a second-opinion review on a high-risk diff slice.
 #
 # Usage:
@@ -7,7 +7,7 @@
 #
 # Behavior:
 #   - If Codex CLI is not installed or fails, returns an empty findings
-#     payload with model set to `gpt-5.5-unavailable` (or `-error`) so
+#     payload with model set to `<model>-unavailable` (or `-error`) so
 #     the aggregator can record the gap and the run continues cleanly.
 #   - The brief should already include the reviewer playbook, the
 #     shared severity rubric, the nits guide, and the output schema.
@@ -24,6 +24,10 @@ REVIEWER="${1:-}"
 BRIEF="${2:-}"
 DIFF="${3:-}"
 OUT="${4:-/dev/stdout}"
+
+# Pinned rather than inherited from the user's Codex default, so the second
+# opinion is a known model. One place to change on the next upgrade.
+CODEX_MODEL="${CR_CODEX_MODEL:-gpt-6.1-sol}"
 
 if [ -z "${REVIEWER}" ] || [ -z "${BRIEF}" ] || [ -z "${DIFF}" ]; then
   echo "usage: $0 <reviewer-name> <brief-file> <diff-file> [output-file]" >&2
@@ -42,7 +46,7 @@ emit_unavailable() {
   cat > "${OUT}" <<JSON
 {
   "reviewer": "${REVIEWER}",
-  "model": "gpt-5.5-unavailable",
+  "model": "${CODEX_MODEL}-unavailable",
   "findings": [],
   "note": "${reason}"
 }
@@ -61,7 +65,7 @@ emit_error() {
   cat > "${OUT}" <<JSON
 {
   "reviewer": "${REVIEWER}",
-  "model": "gpt-5.5-error",
+  "model": "${CODEX_MODEL}-error",
   "findings": [],
   "note": "${reason}"
 }
@@ -91,7 +95,7 @@ trap 'rm -f "${PROMPT}"' EXIT
   echo "## Instruction"
   echo ""
   echo "Return findings as a single JSON object conforming to the"
-  echo "output-schema referenced above. Set \"model\": \"gpt-5.5\" and"
+  echo "output-schema referenced above. Set \"model\": \"${CODEX_MODEL}\" and"
   echo "\"reviewer\": \"${REVIEWER}\". If you cannot produce findings,"
   echo "return an empty findings array. Do NOT include any text outside"
   echo "the JSON object."
@@ -119,7 +123,7 @@ trap 'rm -f "${PROMPT}" "${LAST_MSG}" "${CODEX_ERR}"' EXIT
 # stderr is captured rather than discarded, so a failure reports its real cause
 # instead of blaming the install.
 if codex exec \
-    -m gpt-5.5 \
+    -m "${CODEX_MODEL}" \
     -c model_reasoning_effort="${CODEX_EFFORT}" \
     --sandbox read-only \
     --ephemeral \

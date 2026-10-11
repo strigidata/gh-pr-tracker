@@ -9,7 +9,7 @@ the shape below. The aggregator parses these payloads, merges them by
 ```json
 {
   "reviewer": "<reviewer-name>",
-  "model": "<claude-sonnet-5 | gpt-5.5 | other model id>",
+  "model": "<claude-sonnet-5 | gpt-6.1-sol | other model id>",
   "note": "<optional diagnostic string from the dispatch helper or reviewer; empty/omitted by default>",
   "findings": [
     {
@@ -40,7 +40,7 @@ wasn't actually delivered.
 
 - `reviewer` must match the playbook filename (without `.md`).
 - `model` identifies which model produced these findings (e.g.,
-  `claude-sonnet-5` or `gpt-5.5`). The aggregator uses this to compute
+  `claude-sonnet-5` or `gpt-6.1-sol`). The aggregator uses this to compute
   unanimous-vs-single-model findings when cross-model review is on.
 - `findings` may be empty: `{ "reviewer": "...", "model": "...", "findings": [] }`.
 - `severity` must be one of `Critical`, `Important`, `Suggestion`.
