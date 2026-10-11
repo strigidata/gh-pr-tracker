@@ -17,7 +17,10 @@
 //! public endpoint, no second credential and nothing hosted. Whoever can
 //! install the tool can see its releases, by construction.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use prtrack_core::RepoRef;
+use prtrack_github::GitHubClient;
 
 /// Where releases are published. Overridable so a fork, or a test, can point
 /// somewhere else without a rebuild.
@@ -81,6 +84,87 @@ impl Update {
             )),
             Self::Current | Self::Unknown => None,
         }
+    }
+}
+
+/// Where to look for a newer release, and where to remember the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateCheck {
+    /// The repository releases are published from.
+    pub(crate) release: RepoRef,
+    /// Where the answer is kept between runs, or `None` where there is nowhere
+    /// to keep it — which costs one request per run and nothing else.
+    pub(crate) cache: Option<PathBuf>,
+}
+
+impl UpdateCheck {
+    /// The check this machine runs: releases from [`release_repo`], the answer
+    /// kept under the state directory.
+    ///
+    /// One cache per machine, not per repository: which `prtrack` is newest
+    /// does not depend on what it is watching, and a per-repository cache would
+    /// ask GitHub once an hour for every repository somebody watches.
+    ///
+    /// `None` where the release repository override is not a repository at
+    /// all, which means no check rather than an error.
+    #[must_use]
+    pub fn for_this_machine() -> Option<Self> {
+        let release = RepoRef::parse(&release_repo()).ok()?;
+        let cache = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".local").join("state"))
+            })
+            .map(|base| base.join("prtrack").join("update-check.json"));
+        Some(Self { release, cache })
+    }
+
+    /// Asks GitHub whether a newer release exists, at most once an hour.
+    ///
+    /// Every failure is [`Update::Unknown`], which prints nothing. This is a
+    /// courtesy on top of the tool's actual job, and it must never be the
+    /// reason somebody sees an error — a token that cannot see the release
+    /// repository, an unreachable GitHub, a repository with no releases yet:
+    /// all silent.
+    pub async fn run(&self, client: &GitHubClient, now: i64) -> Update {
+        if let Some(cached) = self.cache.as_deref().and_then(read_cache) {
+            if cached.fresh_at(now) {
+                return compare(running(), cached.latest.as_deref());
+            }
+        }
+
+        let Ok(latest) = client.latest_release(&self.release).await else {
+            return Update::Unknown;
+        };
+
+        if let Some(path) = self.cache.as_deref() {
+            write_cache(
+                path,
+                &Cached {
+                    checked_at: now,
+                    latest: latest.clone(),
+                },
+            );
+        }
+        compare(running(), latest.as_deref())
+    }
+}
+
+/// The notice a long-running process last said, so it is not said again.
+#[derive(Debug, Default)]
+pub struct Announced {
+    last: Option<String>,
+}
+
+impl Announced {
+    /// Whether `notice` is new: never said, or different from the last one.
+    pub fn first_time(&mut self, notice: &str) -> bool {
+        if self.last.as_deref() == Some(notice) {
+            return false;
+        }
+        self.last = Some(notice.to_owned());
+        true
     }
 }
 
@@ -198,7 +282,25 @@ fn numeric_fields(version: &str) -> Option<Vec<u64>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare, Cached, Update, CHECK_INTERVAL_SECONDS};
+    use super::{compare, Announced, Cached, Update, CHECK_INTERVAL_SECONDS};
+
+    #[test]
+    fn a_notice_is_said_once_and_again_only_when_it_changes() {
+        // A watcher whose polls keep failing would otherwise repeat the same
+        // line every interval, and a line repeated a hundred times an hour is
+        // one nobody reads.
+        let mut announced = Announced::default();
+        let said: Vec<bool> = [
+            "❗ prtrack 0.2.0 is out",
+            "❗ prtrack 0.2.0 is out",
+            "❗ prtrack 0.3.0 is out",
+            "❗ prtrack 0.3.0 is out",
+        ]
+        .into_iter()
+        .map(|notice| announced.first_time(notice))
+        .collect();
+        assert_eq!(said, [true, false, true, false]);
+    }
 
     #[test]
     fn a_later_version_is_offered_and_an_earlier_one_is_not() {
