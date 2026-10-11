@@ -1,5 +1,7 @@
 //! Sending the query, and following it across pages.
 
+use std::num::NonZeroU8;
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use prtrack_core::RepoRef;
@@ -68,10 +70,36 @@ pub struct Asset {
     pub url: String,
 }
 
-/// Pull requests per page. Fifty with full check context costs 3 GraphQL
-/// points, which leaves the budget a non-issue at any repository size this
-/// tool is pointed at.
-const PAGE_SIZE: i64 = 50;
+/// How many pull requests one page asks for: never fewer than one, never more
+/// than the hundred GitHub accepts for `first`.
+///
+/// Time, not rate-limit points, is what bounds this. GitHub abandons a query
+/// that runs past about ten seconds, and with full check context each pull
+/// request costs roughly a fifth of a second to resolve — measured against a
+/// live repository, fifty took eleven seconds and was refused every time,
+/// while twenty-five took six. The default leaves half the limit spare, and
+/// [`PageSize::halved`] is what happens when even that does not fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PageSize(NonZeroU8);
+
+impl PageSize {
+    /// What a walk starts at.
+    const DEFAULT: Self = match NonZeroU8::new(20) {
+        Some(size) => Self(size),
+        None => Self(NonZeroU8::MIN),
+    };
+
+    /// Half as many, but never none: a page of one that still times out is
+    /// GitHub's problem, and retrying it is all that is left.
+    fn halved(self) -> Self {
+        Self(NonZeroU8::new(self.0.get() / 2).unwrap_or(NonZeroU8::MIN))
+    }
+
+    /// The value the query's `first` variable is sent as.
+    fn get(self) -> i64 {
+        i64::from(self.0.get())
+    }
+}
 
 /// How many pages to follow before giving up on ever reaching the end.
 const MAX_PAGES: usize = 100;
@@ -401,7 +429,10 @@ impl GitHubClient {
 
     /// One pass over every page, refusing a set that does not add up.
     async fn read_whole_list(&self, repo: &RepoRef) -> Result<OpenPullRequests, GitHubError> {
-        let first = self.fetch_page(repo, None).await?;
+        // Held across pages, so a size that had to shrink stays shrunk: the
+        // pages after the one that timed out are no lighter than it was.
+        let mut size = PageSize::DEFAULT;
+        let first = self.fetch_page(repo, None, &mut size).await?;
         let first_page = first.query;
         let first_total = reported_total_of(&first_page);
         let mut last_total = first_total;
@@ -413,7 +444,7 @@ impl GitHubClient {
             if pages >= MAX_PAGES {
                 return Err(GitHubError::TooManyPages { pages });
             }
-            let page = self.fetch_page(repo, Some(&cursor)).await?;
+            let page = self.fetch_page(repo, Some(&cursor), &mut size).await?;
             last_total = reported_total_of(&page.query);
             pull_requests.extend(page.pull_requests);
             next = page.next;
@@ -442,11 +473,6 @@ impl GitHubClient {
         })
     }
 
-    /// Fetches one page, retrying whatever looked transient.
-    ///
-    /// The first attempt is made outside the loop so that "the budget was
-    /// spent" is a state the types can express without a placeholder error
-    /// standing in for a failure that never happened.
     /// Every check of every pull request that came back with some missing.
     ///
     /// Only the ones that are short cost a request, so the usual repository
@@ -457,7 +483,7 @@ impl GitHubClient {
     /// is as likely to be a momentary hiccup as it ever was. What changed is
     /// that a pull request with more than the hundred checks a single
     /// connection can return is now *made* whole first, instead of being
-    /// refused, retried three times and reported as `GaveUp` on every poll
+    /// refused, retried until the budget ran out and reported as `GaveUp` on every poll
     /// forever.
     async fn top_up_contexts(
         &self,
@@ -517,7 +543,14 @@ impl GitHubClient {
 
         let status = response.status();
         if !status.is_success() {
-            return Err(refusal(status, response.headers()));
+            // A timeout here is this one pull request's checks taking too
+            // long, which no change to the size of the list page can help.
+            return Err(match refusal(status, response.headers()) {
+                AttemptFailure::Transient(error) | AttemptFailure::TooSlow(error) => {
+                    AttemptFailure::Transient(error)
+                }
+                AttemptFailure::Permanent(error) => AttemptFailure::Permanent(error),
+            });
         }
 
         let body = response.bytes().await.map_err(unreachable_host)?;
@@ -527,21 +560,38 @@ impl GitHubClient {
         contexts_of(envelope)
     }
 
-    async fn fetch_page(&self, repo: &RepoRef, after: Option<&str>) -> Result<Page, GitHubError> {
+    /// Fetches one page, retrying whatever looked transient.
+    ///
+    /// The first attempt is made outside the loop so that "the budget was
+    /// spent" is a state the types can express without a placeholder error
+    /// standing in for a failure that never happened.
+    ///
+    /// A page GitHub ran out of time on is asked for again at half the size,
+    /// and `size` keeps the smaller value for whoever fetches the next page.
+    async fn fetch_page(
+        &self,
+        repo: &RepoRef,
+        after: Option<&str>,
+        size: &mut PageSize,
+    ) -> Result<Page, GitHubError> {
         let mut attempts = 1_u32;
-        let mut failure = match self.attempt(repo, after).await {
+        let mut failure = match self.attempt(repo, after, *size).await {
             Ok(page) => return Ok(page),
-            Err(AttemptFailure::Permanent(error)) => return Err(error),
-            Err(AttemptFailure::Transient(error)) => error,
+            Err(failure) => match worth_retrying(failure, size) {
+                ControlFlow::Continue(error) => error,
+                ControlFlow::Break(error) => return Err(error),
+            },
         };
 
         for backoff in self.retry.schedule().skip(1) {
             tokio::time::sleep(backoff).await;
             attempts += 1;
-            failure = match self.attempt(repo, after).await {
+            failure = match self.attempt(repo, after, *size).await {
                 Ok(page) => return Ok(page),
-                Err(AttemptFailure::Permanent(error)) => return Err(error),
-                Err(AttemptFailure::Transient(error)) => error,
+                Err(failure) => match worth_retrying(failure, size) {
+                    ControlFlow::Continue(error) => error,
+                    ControlFlow::Break(error) => return Err(error),
+                },
             };
         }
 
@@ -552,12 +602,17 @@ impl GitHubClient {
     }
 
     /// One request, and one reading of what came back.
-    async fn attempt(&self, repo: &RepoRef, after: Option<&str>) -> Result<Page, AttemptFailure> {
+    async fn attempt(
+        &self,
+        repo: &RepoRef,
+        after: Option<&str>,
+        size: PageSize,
+    ) -> Result<Page, AttemptFailure> {
         let response = self
             .http
             .post(self.endpoint.clone())
             .timeout(self.timeout)
-            .json(&Request::page(repo, after))
+            .json(&Request::page(repo, after, size))
             .send()
             .await
             .map_err(unreachable_host)?;
@@ -589,13 +644,35 @@ impl GitHubClient {
 /// Whether a failed attempt is worth repeating.
 ///
 /// An enum rather than a `bool` beside the error, so that classifying a failure
-/// and reporting it cannot drift apart: every failure is built as one or the
-/// other at the point where the reason is known.
+/// and reporting it cannot drift apart: every failure is built as one of the
+/// three at the point where the reason is known.
 enum AttemptFailure {
     /// Worth another try — a hung connection, a 5xx, a page with a hole in it.
     Transient(GitHubError),
+    /// GitHub gave up on the query before it finished. Worth another try, but
+    /// not the same one: the same query takes the same time.
+    TooSlow(GitHubError),
     /// No amount of retrying will change the answer.
     Permanent(GitHubError),
+}
+
+/// Whether to make another attempt, carrying the error to remember if so and
+/// the one to report now if not.
+///
+/// A query GitHub ran out of time on shrinks `size` on the way through, so the
+/// next attempt asks for less.
+fn worth_retrying(
+    failure: AttemptFailure,
+    size: &mut PageSize,
+) -> ControlFlow<GitHubError, GitHubError> {
+    match failure {
+        AttemptFailure::Transient(error) => ControlFlow::Continue(error),
+        AttemptFailure::TooSlow(error) => {
+            *size = size.halved();
+            ControlFlow::Continue(error)
+        }
+        AttemptFailure::Permanent(error) => ControlFlow::Break(error),
+    }
 }
 
 /// Whether the list continues, and where from.
@@ -789,6 +866,17 @@ fn refusal(status: StatusCode, headers: &HeaderMap) -> AttemptFailure {
         // minutes, and retrying inside a second is what earns one in the first
         // place.
         AttemptFailure::Permanent(GitHubError::RateLimited)
+    } else if matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    ) {
+        // What a query that ran past GitHub's time limit comes back as, and
+        // which of the three arrives varies from one attempt to the next. An
+        // unrelated outage answers the same way and is treated the same: a
+        // smaller page costs it a request or two more, and nothing else.
+        AttemptFailure::TooSlow(GitHubError::UnexpectedStatus {
+            status: status.as_u16(),
+        })
     } else if status.is_server_error() {
         AttemptFailure::Transient(GitHubError::UnexpectedStatus {
             status: status.as_u16(),
@@ -1024,13 +1112,13 @@ struct Request<'a> {
 
 impl<'a> Request<'a> {
     /// The request for one page of `repo`'s open pull requests.
-    fn page(repo: &'a RepoRef, after: Option<&'a str>) -> Self {
+    fn page(repo: &'a RepoRef, after: Option<&'a str>, size: PageSize) -> Self {
         Self {
             query: QUERY,
             variables: Variables {
                 owner: repo.owner(),
                 name: repo.name(),
-                first: Some(PAGE_SIZE),
+                first: Some(size.get()),
                 after,
                 number: None,
             },
@@ -1138,7 +1226,7 @@ impl OpenPullRequests {
 
 #[cfg(test)]
 mod tests {
-    use super::{GitHubClient, MAX_PAGES, MERGE_INFO_PREVIEW, QUERY};
+    use super::{GitHubClient, PageSize, MAX_PAGES, MERGE_INFO_PREVIEW, QUERY};
     use crate::error::{GitHubError, Malformed, NestedList};
     use crate::retry::RetryBudget;
     use crate::token::Token;
@@ -1157,8 +1245,8 @@ mod tests {
     /// The repository the recordings claim to come from, after redaction.
     const REPO: &str = "example-org/example-repo";
 
-    /// Three attempts, the same as the default, so a test that spends the
-    /// budget spends a known number of them.
+    /// Three attempts, fewer than the default, so a test that spends the
+    /// budget spends a known number of them and the scripts stay short.
     const ATTEMPTS: u32 = 3;
 
     /// Answers a scripted sequence of responses, one per request.
@@ -1329,7 +1417,7 @@ mod tests {
         let cases = [
             ("a permanent refusal", ResponseTemplate::new(401), 2),
             (
-                "a transient failure that never clears",
+                "a gateway failure that never clears",
                 ResponseTemplate::new(502),
                 1 + ATTEMPTS as usize,
             ),
@@ -1655,9 +1743,9 @@ mod tests {
             serde_json::Value::from(PAGE_1_END_CURSOR),
             "the second request must carry the cursor the first page ended on"
         );
-        // The literal rather than `PAGE_SIZE`, which would compare the
+        // The literal rather than `PageSize::DEFAULT`, which would compare the
         // constant with itself and hold whatever it was changed to.
-        assert_eq!(variable(&sent, 0, "first"), serde_json::Value::from(50));
+        assert_eq!(variable(&sent, 0, "first"), serde_json::Value::from(20));
         assert_eq!(
             variable(&sent, 0, "owner"),
             serde_json::Value::from("example-org")
@@ -1729,6 +1817,82 @@ mod tests {
             ATTEMPTS as usize,
             "the whole budget must actually be spent"
         );
+    }
+
+    #[tokio::test]
+    async fn a_page_github_ran_out_of_time_on_is_asked_for_again_at_half_the_size() {
+        // GitHub abandons a query that runs past about ten seconds and answers
+        // with whichever gateway status it likes. The same query sent again
+        // takes the same time, so a retry at the same size only spends the
+        // budget; a smaller page is what fits. The rest of the walk keeps the
+        // smaller size, because the pages after it are just as heavy.
+        for status in [502_u16, 503, 504] {
+            let (outcome, sent) =
+                fetch(vec![ResponseTemplate::new(status), ok(PAGE_1), ok(PAGE_2)]).await;
+
+            assert!(
+                matches!(&outcome, Outcome::Fetched { collected, .. } if *collected == TOTAL_OPEN),
+                "{status}: the smaller page must recover the list: {outcome:?}"
+            );
+            let sizes: Vec<serde_json::Value> = (0..sent.len())
+                .map(|index| variable(&sent, index, "first"))
+                .collect();
+            assert_eq!(
+                sizes,
+                [20, 10, 10].map(serde_json::Value::from),
+                "{status}: the timed-out page is asked for at half the size, and so is the next"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_later_page_that_keeps_timing_out_keeps_shrinking_until_the_budget_is_spent() {
+        // Each timeout halves again rather than halving once and retrying the
+        // same too-big page, and a page past the first shrinks just as the
+        // first does.
+        let (outcome, sent) = fetch(vec![ok(PAGE_1), ResponseTemplate::new(504)]).await;
+
+        assert!(
+            matches!(
+                &outcome,
+                Outcome::Failed(GitHubError::GaveUp { attempts, source })
+                    if *attempts == ATTEMPTS
+                        && matches!(**source, GitHubError::UnexpectedStatus { status: 504 })
+            ),
+            "a page that never fits must still be reported, got {outcome:?}"
+        );
+        let sizes: Vec<serde_json::Value> = (0..sent.len())
+            .map(|index| variable(&sent, index, "first"))
+            .collect();
+        assert_eq!(sizes, [20, 20, 10, 5].map(serde_json::Value::from));
+    }
+
+    #[test]
+    fn halving_the_page_walks_down_to_one_and_stays_there() {
+        // A page of none would ask GitHub for nothing and read as an empty
+        // repository, which is the lie this crate exists to avoid.
+        let sizes: Vec<i64> =
+            std::iter::successors(Some(PageSize::DEFAULT), |size| Some(size.halved()))
+                .take(7)
+                .map(PageSize::get)
+                .collect();
+        assert_eq!(sizes, [20, 10, 5, 2, 1, 1, 1]);
+    }
+
+    #[tokio::test]
+    async fn a_failure_that_is_not_a_timeout_does_not_shrink_the_page() {
+        // A page with a hole in it is a flake, not a sign the query is too
+        // heavy. Shrinking on it would cost requests for nothing.
+        let (outcome, sent) = fetch(vec![ok("{}"), ok(PAGE_1), ok(PAGE_2)]).await;
+
+        assert!(
+            matches!(&outcome, Outcome::Fetched { collected, .. } if *collected == TOTAL_OPEN),
+            "the retry must recover the page: {outcome:?}"
+        );
+        let sizes: Vec<serde_json::Value> = (0..sent.len())
+            .map(|index| variable(&sent, index, "first"))
+            .collect();
+        assert_eq!(sizes, [20, 20, 20].map(serde_json::Value::from));
     }
 
     #[tokio::test]
@@ -2216,19 +2380,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn check_contexts_past_the_first_page_are_followed_rather_than_refused() {
-        // `first: 100` is GitHub's maximum for a single connection, so a pull
-        // request with more contexts than that can never be satisfied by the
-        // main query. Refusing short data is right; refusing it when a cursor
-        // was offered is not, and because the failure counts as retryable
-        // `--watch` looped on it forever -- measured on a real repository at
-        // 111 of 100.
-        //
-        // The fixture carries 47, so this claims a 48th exists and offers the
-        // cursor that reaches it.
-        const CONTEXT_CURSOR: &str = "Y3Vyc29yOnYyOpHOAAAAAQ==";
+    /// The cursor the short check list in [`page_1_with_a_forty_eighth_check`]
+    /// offers.
+    const CONTEXT_CURSOR: &str = "Y3Vyc29yOnYyOpHOAAAAAQ==";
 
+    /// The first recorded page, with its first pull request's checks made
+    /// short. The recording carries 47, so this claims a 48th exists and
+    /// offers the cursor that reaches it.
+    fn page_1_with_a_forty_eighth_check() -> serde_json::Value {
         let mut body =
             serde_json::from_str::<serde_json::Value>(PAGE_1).unwrap_or(serde_json::Value::Null);
         if let Some(serde_json::Value::Object(contexts)) = body.pointer_mut(
@@ -2240,6 +2399,84 @@ mod tests {
                 serde_json::json!({ "hasNextPage": true, "endCursor": CONTEXT_CURSOR }),
             );
         }
+        body
+    }
+
+    /// The follow-up's answer to [`page_1_with_a_forty_eighth_check`]: the one
+    /// missing check, and the end of the list.
+    fn the_forty_eighth_check() -> String {
+        let forty_eighth = serde_json::json!({
+            "__typename": "StatusContext",
+            "context": "ci/the-forty-eighth",
+            "state": "SUCCESS",
+            "createdAt": "2024-01-01T00:00:00Z",
+        });
+        let rollup = serde_json::json!({
+            "state": "SUCCESS",
+            "contexts": {
+                "totalCount": 48,
+                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                "nodes": [forty_eighth],
+            },
+        });
+        serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "commits": {
+                            "nodes": [{
+                                "commit": {
+                                    "committedDate": "2024-01-01T00:00:00Z",
+                                    "statusCheckRollup": rollup,
+                                },
+                            }],
+                        },
+                    },
+                },
+            },
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_check_follow_up_that_times_out_does_not_shrink_the_page() {
+        // The follow-up asks for one pull request's checks, a hundred at a
+        // time, whatever size the list pages are. Halving the list page when
+        // *it* times out makes every later page cost more requests and the
+        // follow-up no cheaper.
+        let short = page_1_with_a_forty_eighth_check().to_string();
+        let (outcome, sent) = fetch(vec![
+            ok(&short),
+            ResponseTemplate::new(504),
+            ok(&short),
+            ok(&the_forty_eighth_check()),
+            ok(PAGE_2),
+        ])
+        .await;
+
+        assert!(
+            matches!(outcome, Outcome::Fetched { .. }),
+            "the retry must recover the checks: {outcome:?}"
+        );
+        let list_page_sizes: Vec<serde_json::Value> = sent
+            .iter()
+            .map(variables)
+            .filter(|variables| variables.get("number").is_none())
+            .map(|variables| variables.get("first").cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(list_page_sizes, [20, 20, 20].map(serde_json::Value::from));
+    }
+
+    #[tokio::test]
+    async fn check_contexts_past_the_first_page_are_followed_rather_than_refused() {
+        // `first: 100` is GitHub's maximum for a single connection, so a pull
+        // request with more contexts than that can never be satisfied by the
+        // main query. Refusing short data is right; refusing it when a cursor
+        // was offered is not, and because the failure counts as retryable
+        // `--watch` looped on it forever -- measured on a real repository at
+        // 111 of 100.
+        //
+        let body = page_1_with_a_forty_eighth_check();
         // The probe has to actually be short, or this test passes for the
         // reason none of it is about. A pointer that stops resolving because
         // the recording was replaced would leave the fixture in normal form
@@ -2259,40 +2496,9 @@ mod tests {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
 
-        let forty_eighth = serde_json::json!({
-            "__typename": "StatusContext",
-            "context": "ci/the-forty-eighth",
-            "state": "SUCCESS",
-            "createdAt": "2024-01-01T00:00:00Z",
-        });
-        let rollup = serde_json::json!({
-            "state": "SUCCESS",
-            "contexts": {
-                "totalCount": 48,
-                "pageInfo": { "hasNextPage": false, "endCursor": null },
-                "nodes": [forty_eighth],
-            },
-        });
-        let follow_up = serde_json::json!({
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "commits": {
-                            "nodes": [{
-                                "commit": {
-                                    "committedDate": "2024-01-01T00:00:00Z",
-                                    "statusCheckRollup": rollup,
-                                },
-                            }],
-                        },
-                    },
-                },
-            },
-        });
-
         let (outcome, sent) = fetch(vec![
             ok(&body.to_string()),
-            ok(&follow_up.to_string()),
+            ok(&the_forty_eighth_check()),
             ok(PAGE_2),
         ])
         .await;
