@@ -48,13 +48,18 @@ struct Trouble {
 }
 
 impl Trouble {
-    /// A failure that a person must fix by changing what they typed.
-    const fn usage(cause: anyhow::Error) -> Self {
+    /// A failure that happened before anything could be asked about updates.
+    const fn new(exit: Exit, cause: anyhow::Error) -> Self {
         Self {
-            exit: Exit::Usage,
+            exit,
             cause,
             notice: None,
         }
+    }
+
+    /// A failure that a person must fix by changing what they typed.
+    const fn usage(cause: anyhow::Error) -> Self {
+        Self::new(Exit::Usage, cause)
     }
 }
 
@@ -145,11 +150,7 @@ fn watch(args: &BoardArgs) -> Result<Exit, Trouble> {
     let path = state_path(args)?;
     let runtime = tokio::runtime::Runtime::new()
         .context("could not start the async runtime")
-        .map_err(|cause| Trouble {
-            notice: None,
-            exit: Exit::Api,
-            cause,
-        })?;
+        .map_err(|cause| Trouble::new(Exit::Api, cause))?;
 
     // The whole loop runs inside one `block_on`, and the client is built once
     // outside it. Both matter. Entering and leaving the runtime around every
@@ -169,14 +170,18 @@ async fn watch_forever(
     interval: std::time::Duration,
     path: &std::path::Path,
 ) -> Result<Exit, Trouble> {
-    let client = GitHubClient::from_env().map_err(|source| Trouble {
-        notice: None,
-        exit: Exit::of(&source),
-        cause: anyhow::Error::new(source).context("could not prepare a GitHub client"),
+    let client = GitHubClient::from_env().map_err(|source| {
+        Trouble::new(
+            Exit::of(&source),
+            anyhow::Error::new(source).context("could not prepare a GitHub client"),
+        )
     })?;
 
     let mut state = remembered(path);
     let mut first_poll = true;
+    // What a failing poll last said about a newer release. The footer does the
+    // same job for a poll that worked, by replacing rather than accumulating.
+    let mut announced = update::Announced::default();
     // Whether `Loading...` is still the only thing on screen. It is drawn
     // before the first fetch and has to be *replaced* rather than printed
     // over, by the board or by the failure — whichever arrives first.
@@ -302,8 +307,12 @@ async fn watch_forever(
                 // Printed rather than put in the footer: nothing repaints the
                 // board while polls keep failing, so a footer line would never
                 // be seen — and a run of failures is when it matters most.
+                // Once, though: an outage repeats the same line every poll,
+                // and a line said a hundred times an hour is one nobody reads.
                 if let Some(notice) = &trouble.notice {
-                    eprintln!("{notice}");
+                    if announced.first_time(notice) {
+                        eprintln!("{notice}");
+                    }
                 }
                 eprintln!("prtrack: nothing recorded for this poll; trying again shortly.");
             }
@@ -545,34 +554,30 @@ fn update_binary(args: &cli::UpdateArgs) -> Result<Exit, Trouble> {
         })?,
     };
 
-    let client = GitHubClient::from_env().map_err(|source| Trouble {
-        notice: None,
-        exit: Exit::of(&source),
-        cause: anyhow::Error::new(source).context("could not prepare a GitHub client"),
+    let client = GitHubClient::from_env().map_err(|source| {
+        Trouble::new(
+            Exit::of(&source),
+            anyhow::Error::new(source).context("could not prepare a GitHub client"),
+        )
     })?;
 
     let runtime = tokio::runtime::Runtime::new()
         .context("could not start the async runtime")
-        .map_err(|cause| Trouble {
-            notice: None,
-            exit: Exit::Api,
-            cause,
-        })?;
+        .map_err(|cause| Trouble::new(Exit::Api, cause))?;
 
     let outcome = runtime
         .block_on(upgrade::run(&client, &repo))
-        .map_err(|failure| Trouble {
-            notice: None,
+        .map_err(|failure| {
             // Whatever went wrong, nothing was replaced: `upgrade::run` moves
             // the binary only after every check has passed. What differs is
             // whether trying again could help — an unwritable directory stays
             // unwritable, and telling a wrapper to retry it is a lie.
-            exit: if failure.retryable {
+            let exit = if failure.retryable {
                 Exit::Api
             } else {
                 Exit::Usage
-            },
-            cause: failure.cause,
+            };
+            Trouble::new(exit, failure.cause)
         })?;
 
     eprintln!("prtrack: {}", outcome.describe());
@@ -584,19 +589,16 @@ fn fetch(args: &BoardArgs) -> Result<(RepositoryFacts, Option<String>), Trouble>
     // The token is read from the environment and never from a flag. An
     // argument is visible to every process on the machine through `ps` and
     // survives in shell history; see `prtrack_cli::cli`.
-    let client = GitHubClient::from_env().map_err(|source| Trouble {
-        notice: None,
-        exit: Exit::of(&source),
-        cause: anyhow::Error::new(source).context("could not prepare a GitHub client"),
+    let client = GitHubClient::from_env().map_err(|source| {
+        Trouble::new(
+            Exit::of(&source),
+            anyhow::Error::new(source).context("could not prepare a GitHub client"),
+        )
     })?;
 
     let runtime = tokio::runtime::Runtime::new()
         .context("could not start the async runtime")
-        .map_err(|cause| Trouble {
-            notice: None,
-            exit: Exit::Api,
-            cause,
-        })?;
+        .map_err(|cause| Trouble::new(Exit::Api, cause))?;
 
     // The notice is computed here, where the runtime and the client already
     // exist, but *not* printed here: it belongs under the board rather than

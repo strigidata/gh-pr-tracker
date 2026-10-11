@@ -91,10 +91,10 @@ impl Update {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateCheck {
     /// The repository releases are published from.
-    pub release: RepoRef,
+    pub(crate) release: RepoRef,
     /// Where the answer is kept between runs, or `None` where there is nowhere
     /// to keep it — which costs one request per run and nothing else.
-    pub cache: Option<PathBuf>,
+    pub(crate) cache: Option<PathBuf>,
 }
 
 impl UpdateCheck {
@@ -148,6 +148,23 @@ impl UpdateCheck {
             );
         }
         compare(running(), latest.as_deref())
+    }
+}
+
+/// The notice a long-running process last said, so it is not said again.
+#[derive(Debug, Default)]
+pub struct Announced {
+    last: Option<String>,
+}
+
+impl Announced {
+    /// Whether `notice` is new: never said, or different from the last one.
+    pub fn first_time(&mut self, notice: &str) -> bool {
+        if self.last.as_deref() == Some(notice) {
+            return false;
+        }
+        self.last = Some(notice.to_owned());
+        true
     }
 }
 
@@ -265,7 +282,25 @@ fn numeric_fields(version: &str) -> Option<Vec<u64>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare, Cached, Update, CHECK_INTERVAL_SECONDS};
+    use super::{compare, Announced, Cached, Update, CHECK_INTERVAL_SECONDS};
+
+    #[test]
+    fn a_notice_is_said_once_and_again_only_when_it_changes() {
+        // A watcher whose polls keep failing would otherwise repeat the same
+        // line every interval, and a line repeated a hundred times an hour is
+        // one nobody reads.
+        let mut announced = Announced::default();
+        let said: Vec<bool> = [
+            "❗ prtrack 0.2.0 is out",
+            "❗ prtrack 0.2.0 is out",
+            "❗ prtrack 0.3.0 is out",
+            "❗ prtrack 0.3.0 is out",
+        ]
+        .into_iter()
+        .map(|notice| announced.first_time(notice))
+        .collect();
+        assert_eq!(said, [true, false, true, false]);
+    }
 
     #[test]
     fn a_later_version_is_offered_and_an_earlier_one_is_not() {
