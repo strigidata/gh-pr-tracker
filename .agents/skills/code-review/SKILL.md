@@ -140,7 +140,7 @@ wrong is highest.
 
 For each fired reviewer, dispatch a subagent with:
 
-- **Model**: `claude-sonnet-5` on Claude Code; `gpt-5.5` (fallback `gpt-5.4`) on Codex.
+- **Model**: `claude-sonnet-5` on Claude Code; `gpt-6.1-sol` (fallback `gpt-5.6-sol`) on Codex.
 - **Slice**: the changed files matching the reviewer's globs (or all changed
   files for trigger-only reviewers like `observability`).
 - **Brief**: the verbatim contents of:
@@ -172,9 +172,11 @@ For each fired reviewer, dispatch a subagent with:
 opinion is the OTHER model from your current host — never the same model twice.
 
 - Running under **Claude Code** (primary = Sonnet 5) → dispatch the second
-  opinion to GPT-5.5 via `lib/dispatch-codex-reviewer.sh`.
-- Running under **Codex** (primary = GPT-5.5) → dispatch the second opinion to
-  Sonnet 5 via `lib/dispatch-claude-reviewer.sh`.
+  opinion to GPT-6.1-Sol via `lib/dispatch-codex-reviewer.sh`.
+- Running under **Codex** (primary = GPT-6.1-Sol) → dispatch the second opinion
+  to Sonnet 5 via `lib/dispatch-claude-reviewer.sh`.
+- Each helper pins its model in one variable, overridable without an edit:
+  `CR_CODEX_MODEL` and `CR_CLAUDE_MODEL`.
 - Under another host, pick whichever helper points at a model different from
   your own.
 
