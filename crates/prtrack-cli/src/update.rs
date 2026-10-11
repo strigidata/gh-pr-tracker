@@ -17,7 +17,10 @@
 //! public endpoint, no second credential and nothing hosted. Whoever can
 //! install the tool can see its releases, by construction.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use prtrack_core::RepoRef;
+use prtrack_github::GitHubClient;
 
 /// Where releases are published. Overridable so a fork, or a test, can point
 /// somewhere else without a rebuild.
@@ -81,6 +84,70 @@ impl Update {
             )),
             Self::Current | Self::Unknown => None,
         }
+    }
+}
+
+/// Where to look for a newer release, and where to remember the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateCheck {
+    /// The repository releases are published from.
+    pub release: RepoRef,
+    /// Where the answer is kept between runs, or `None` where there is nowhere
+    /// to keep it — which costs one request per run and nothing else.
+    pub cache: Option<PathBuf>,
+}
+
+impl UpdateCheck {
+    /// The check this machine runs: releases from [`release_repo`], the answer
+    /// kept under the state directory.
+    ///
+    /// One cache per machine, not per repository: which `prtrack` is newest
+    /// does not depend on what it is watching, and a per-repository cache would
+    /// ask GitHub once an hour for every repository somebody watches.
+    ///
+    /// `None` where the release repository override is not a repository at
+    /// all, which means no check rather than an error.
+    #[must_use]
+    pub fn for_this_machine() -> Option<Self> {
+        let release = RepoRef::parse(&release_repo()).ok()?;
+        let cache = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".local").join("state"))
+            })
+            .map(|base| base.join("prtrack").join("update-check.json"));
+        Some(Self { release, cache })
+    }
+
+    /// Asks GitHub whether a newer release exists, at most once an hour.
+    ///
+    /// Every failure is [`Update::Unknown`], which prints nothing. This is a
+    /// courtesy on top of the tool's actual job, and it must never be the
+    /// reason somebody sees an error — a token that cannot see the release
+    /// repository, an unreachable GitHub, a repository with no releases yet:
+    /// all silent.
+    pub async fn run(&self, client: &GitHubClient, now: i64) -> Update {
+        if let Some(cached) = self.cache.as_deref().and_then(read_cache) {
+            if cached.fresh_at(now) {
+                return compare(running(), cached.latest.as_deref());
+            }
+        }
+
+        let Ok(latest) = client.latest_release(&self.release).await else {
+            return Update::Unknown;
+        };
+
+        if let Some(path) = self.cache.as_deref() {
+            write_cache(
+                path,
+                &Cached {
+                    checked_at: now,
+                    latest: latest.clone(),
+                },
+            );
+        }
+        compare(running(), latest.as_deref())
     }
 }
 

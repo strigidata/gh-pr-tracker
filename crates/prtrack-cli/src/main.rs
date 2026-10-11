@@ -23,6 +23,7 @@ use prtrack_cli::color::{Environment, Palette};
 use prtrack_cli::exit::Exit;
 use prtrack_cli::json::BoardJson;
 use prtrack_cli::notify;
+use prtrack_cli::poll::poll;
 use prtrack_cli::render::BoardText;
 use prtrack_cli::screen::{self, Screen};
 use prtrack_cli::state::WatchState;
@@ -40,6 +41,10 @@ use prtrack_github::{GitHubClient, RepositoryFacts};
 struct Trouble {
     exit: Exit,
     cause: anyhow::Error,
+    /// That a newer `prtrack` is out, where the run found out before failing.
+    /// Printed under the error, because a failure is exactly when somebody on
+    /// an old build most needs to know a newer one exists.
+    notice: Option<String>,
 }
 
 impl Trouble {
@@ -48,6 +53,7 @@ impl Trouble {
         Self {
             exit: Exit::Usage,
             cause,
+            notice: None,
         }
     }
 }
@@ -60,6 +66,9 @@ fn main() -> ExitCode {
             // outermost one: "could not read the board" says nothing that
             // "GitHub refused the token" does not.
             eprintln!("prtrack: {:#}", trouble.cause);
+            if let Some(notice) = trouble.notice {
+                eprintln!("{notice}");
+            }
             trouble.exit.into()
         }
     }
@@ -137,6 +146,7 @@ fn watch(args: &BoardArgs) -> Result<Exit, Trouble> {
     let runtime = tokio::runtime::Runtime::new()
         .context("could not start the async runtime")
         .map_err(|cause| Trouble {
+            notice: None,
             exit: Exit::Api,
             cause,
         })?;
@@ -160,6 +170,7 @@ async fn watch_forever(
     path: &std::path::Path,
 ) -> Result<Exit, Trouble> {
     let client = GitHubClient::from_env().map_err(|source| Trouble {
+        notice: None,
         exit: Exit::of(&source),
         cause: anyhow::Error::new(source).context("could not prepare a GitHub client"),
     })?;
@@ -210,7 +221,7 @@ async fn watch_forever(
 
     loop {
         match read_repository(&client, args).await {
-            Ok(facts) => {
+            Ok((facts, update_notice)) => {
                 let (viewer, default_branch, default_rule, pairs) = facts.into_parts();
                 let judged: Vec<(BoardRow, PolicyRules)> = pairs
                     .into_iter()
@@ -253,10 +264,7 @@ async fn watch_forever(
                 // Once per poll, which the one-hour cache turns into once an
                 // hour. A watcher left running for days is exactly who most
                 // needs telling that it has been superseded.
-                if let Some(notice) = check_for_update(&client, Utc::now().timestamp())
-                    .await
-                    .notice()
-                {
+                if let Some(notice) = update_notice {
                     if interactive {
                         // A condition rather than an event: it stays true until
                         // somebody upgrades, so it is replaced rather than
@@ -290,6 +298,12 @@ async fn watch_forever(
                 eprintln!("prtrack: {:#}", trouble.cause);
                 if !worth_retrying(trouble.exit) {
                     return Err(trouble);
+                }
+                // Printed rather than put in the footer: nothing repaints the
+                // board while polls keep failing, so a footer line would never
+                // be seen — and a run of failures is when it matters most.
+                if let Some(notice) = &trouble.notice {
+                    eprintln!("{notice}");
                 }
                 eprintln!("prtrack: nothing recorded for this poll; trying again shortly.");
             }
@@ -333,23 +347,42 @@ async fn wait_out_interval(
     true
 }
 
-/// One read of the repository, on a client the loop already owns.
+/// One read of the repository and the version check that goes with it, on a
+/// client the caller already owns.
+///
+/// The notice comes back either way: beside the facts when the read worked,
+/// and inside the [`Trouble`] when it did not, so whoever prints the failure
+/// prints the way out of it too.
 async fn read_repository(
     client: &GitHubClient,
     args: &BoardArgs,
-) -> Result<RepositoryFacts, Trouble> {
-    let fetched = client
-        .fetch_open_pull_requests(&args.repo)
-        .await
-        .map_err(|source| Trouble {
-            exit: Exit::of(&source),
-            cause: anyhow::Error::new(source)
-                .context(format!("could not read {} from GitHub", args.repo)),
-        })?;
-    RepositoryFacts::try_from(fetched).map_err(|source| Trouble {
-        exit: Exit::Api,
-        cause: anyhow::Error::new(source).context("GitHub's answer could not be read"),
-    })
+) -> Result<(RepositoryFacts, Option<String>), Trouble> {
+    let check = update::UpdateCheck::for_this_machine();
+    let polled = poll(client, &args.repo, check.as_ref(), Utc::now().timestamp()).await;
+    let notice = polled.update.notice();
+
+    let fetched = match polled.read {
+        Ok(fetched) => fetched,
+        Err(source) => {
+            return Err(Trouble {
+                exit: Exit::of(&source),
+                cause: anyhow::Error::new(source)
+                    .context(format!("could not read {} from GitHub", args.repo)),
+                notice,
+            })
+        }
+    };
+    match RepositoryFacts::try_from(fetched) {
+        Ok(facts) => Ok((facts, notice)),
+        Err(source) => Err(Trouble {
+            // A payload we cannot read is GitHub's answer being wrong, not the
+            // caller's command line, so it is retryable in the same sense a
+            // 500 is.
+            exit: Exit::Api,
+            cause: anyhow::Error::new(source).context("GitHub's answer could not be read"),
+            notice,
+        }),
+    }
 }
 
 /// Whether a failure is one another poll might get past.
@@ -469,58 +502,6 @@ fn state_path(args: &BoardArgs) -> Result<std::path::PathBuf, Trouble> {
     )))
 }
 
-/// Where the version check keeps its answer.
-///
-/// One file per machine, not per repository: which `prtrack` is newest does not
-/// depend on what it is watching, and a per-repository cache would ask GitHub
-/// once an hour for every repository somebody watches.
-///
-/// Returns `None` where there is nowhere to keep it, which costs one request
-/// per run and is not worth refusing to start over.
-fn update_cache_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| std::path::PathBuf::from(home).join(".local").join("state"))
-        })
-        .map(|base| base.join("prtrack").join("update-check.json"))
-}
-
-/// Asks GitHub whether a newer release exists, at most once an hour.
-///
-/// Every failure is [`update::Update::Unknown`], which prints nothing. This is
-/// a courtesy on top of the tool's actual job, and it must never be the reason
-/// somebody sees an error — a token that cannot see the release repository, an
-/// unreachable GitHub, a repository with no releases yet: all silent.
-async fn check_for_update(client: &GitHubClient, now: i64) -> update::Update {
-    let path = update_cache_path();
-
-    if let Some(cached) = path.as_deref().and_then(update::read_cache) {
-        if cached.fresh_at(now) {
-            return update::compare(update::running(), cached.latest.as_deref());
-        }
-    }
-
-    let Ok(repo) = RepoRef::parse(&update::release_repo()) else {
-        return update::Update::Unknown;
-    };
-    let Ok(latest) = client.latest_release(&repo).await else {
-        return update::Update::Unknown;
-    };
-
-    if let Some(path) = path.as_deref() {
-        update::write_cache(
-            path,
-            &update::Cached {
-                checked_at: now,
-                latest: latest.clone(),
-            },
-        );
-    }
-    update::compare(update::running(), latest.as_deref())
-}
-
 /// Fetches a repository's open pull requests and writes the board.
 fn board(args: &BoardArgs) -> Result<Exit, Trouble> {
     let (facts, update_notice) = fetch(args)?;
@@ -565,6 +546,7 @@ fn update_binary(args: &cli::UpdateArgs) -> Result<Exit, Trouble> {
     };
 
     let client = GitHubClient::from_env().map_err(|source| Trouble {
+        notice: None,
         exit: Exit::of(&source),
         cause: anyhow::Error::new(source).context("could not prepare a GitHub client"),
     })?;
@@ -572,6 +554,7 @@ fn update_binary(args: &cli::UpdateArgs) -> Result<Exit, Trouble> {
     let runtime = tokio::runtime::Runtime::new()
         .context("could not start the async runtime")
         .map_err(|cause| Trouble {
+            notice: None,
             exit: Exit::Api,
             cause,
         })?;
@@ -579,6 +562,7 @@ fn update_binary(args: &cli::UpdateArgs) -> Result<Exit, Trouble> {
     let outcome = runtime
         .block_on(upgrade::run(&client, &repo))
         .map_err(|failure| Trouble {
+            notice: None,
             // Whatever went wrong, nothing was replaced: `upgrade::run` moves
             // the binary only after every check has passed. What differs is
             // whether trying again could help — an unwritable directory stays
@@ -601,6 +585,7 @@ fn fetch(args: &BoardArgs) -> Result<(RepositoryFacts, Option<String>), Trouble>
     // argument is visible to every process on the machine through `ps` and
     // survives in shell history; see `prtrack_cli::cli`.
     let client = GitHubClient::from_env().map_err(|source| Trouble {
+        notice: None,
         exit: Exit::of(&source),
         cause: anyhow::Error::new(source).context("could not prepare a GitHub client"),
     })?;
@@ -608,33 +593,15 @@ fn fetch(args: &BoardArgs) -> Result<(RepositoryFacts, Option<String>), Trouble>
     let runtime = tokio::runtime::Runtime::new()
         .context("could not start the async runtime")
         .map_err(|cause| Trouble {
+            notice: None,
             exit: Exit::Api,
             cause,
         })?;
 
-    let fetched = runtime
-        .block_on(client.fetch_open_pull_requests(&args.repo))
-        .map_err(|source| Trouble {
-            exit: Exit::of(&source),
-            cause: anyhow::Error::new(source)
-                .context(format!("could not read {} from GitHub", args.repo)),
-        })?;
-
-    // Computed here, where the runtime and the client already exist, but *not*
-    // printed here: it belongs under the board rather than over it, and the
-    // board is written by the caller.
-    let notice = runtime
-        .block_on(check_for_update(&client, Utc::now().timestamp()))
-        .notice();
-
-    let facts = RepositoryFacts::try_from(fetched).map_err(|source| Trouble {
-        // A payload we cannot read is GitHub's answer being wrong, not the
-        // caller's command line, so it is retryable in the same sense a 500 is.
-        exit: Exit::Api,
-        cause: anyhow::Error::new(source).context("GitHub's answer could not be read"),
-    })?;
-
-    Ok((facts, notice))
+    // The notice is computed here, where the runtime and the client already
+    // exist, but *not* printed here: it belongs under the board rather than
+    // over it, and the board is written by the caller.
+    runtime.block_on(read_repository(&client, args))
 }
 
 /// Writes the board to stdout in the shape that was asked for.

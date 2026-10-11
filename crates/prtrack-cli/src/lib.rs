@@ -19,6 +19,7 @@ pub mod color;
 pub mod exit;
 pub mod json;
 pub mod notify;
+pub mod poll;
 pub mod render;
 pub mod screen;
 pub mod state;
