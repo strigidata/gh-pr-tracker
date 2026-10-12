@@ -577,8 +577,8 @@ mod tests {
     use crate::width::visible_width;
     use chrono::{DateTime, TimeDelta, Utc};
     use prtrack_core::{
-        Board, BoardRow, BranchName, CheckName, DraftState, HeadSha, InvalidValue, Login,
-        MergeState, MergeableState, PolicyRules, PrFacts, PrNumber, PrTitle, PrUrl, RepoRef,
+        Board, BoardRow, BranchName, CheckName, DraftState, HeadRepository, HeadSha, InvalidValue,
+        Login, MergeState, MergeableState, PolicyRules, PrFacts, PrNumber, PrTitle, PrUrl, RepoRef,
         RequiredChecks, Requirement, Reviewer, StaleReviewHandling,
     };
 
@@ -625,6 +625,7 @@ mod tests {
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse(SOME_SHA)?,
             head_ref: BranchName::new("topic/branch-01"),
+            head_repository: HeadRepository::ThisOne,
             base_ref: BranchName::new("main"),
             review_decision: None,
             mergeable: MergeableState::Mergeable,

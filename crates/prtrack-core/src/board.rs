@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::checks::{classify, Classified};
 use crate::decision::BlockedReason;
-use crate::facts::{BranchName, DraftState, PrFacts};
+use crate::facts::{BranchName, DraftState, HeadRepository, PrFacts};
 use crate::policy::PolicyRules;
 use crate::types::{Login, PrNumber};
 
@@ -723,10 +723,19 @@ impl Board {
 /// bases loops back to itself is a root too, so building the trees ends. A
 /// pull request aimed at its own branch is a loop of one and is cut with the
 /// rest; this is the only place that protection lives.
+///
+/// Only a pull request whose head is in this repository can be beneath
+/// another. A fork's branch shares nothing with a branch here but its name,
+/// and a fork whose head is `main` would otherwise sit under everything aimed
+/// at `main`; a head GitHub did not place is treated the same way. Being *on*
+/// something asks nothing of the head, since a fork's base is always here.
 fn parents(rows: &[BoardRow]) -> Vec<Option<usize>> {
     let mut by_head: HashMap<&BranchName, Vec<usize>> = HashMap::new();
     for (index, row) in rows.iter().enumerate() {
-        by_head.entry(&row.facts.head_ref).or_default().push(index);
+        match row.facts.head_repository {
+            HeadRepository::ThisOne => by_head.entry(&row.facts.head_ref).or_default().push(index),
+            HeadRepository::Fork | HeadRepository::Unstated => {}
+        }
     }
     let mut parents: Vec<Option<usize>> = rows
         .iter()
@@ -786,8 +795,8 @@ mod tests {
     use super::{Board, BoardRow, Stacks};
     use crate::checks::{Check, CheckState};
     use crate::facts::{
-        BranchName, DraftState, MergeState, MergeableState, PrFacts, PrTitle, PrUrl,
-        ReviewDecision, Reviewer, TeamSlug,
+        BranchName, DraftState, HeadRepository, MergeState, MergeableState, PrFacts, PrTitle,
+        PrUrl, ReviewDecision, Reviewer, TeamSlug,
     };
     use crate::policy::{BlockingChecks, PolicyRules, Requirement};
     use crate::types::{CheckName, HeadSha, InvalidValue, Login, PrNumber, RepoRef};
@@ -818,6 +827,7 @@ mod tests {
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse(SOME_SHA)?,
             head_ref: BranchName::new("topic/branch-01"),
+            head_repository: HeadRepository::ThisOne,
             base_ref: BranchName::new("main"),
             review_decision: None,
             mergeable: MergeableState::Mergeable,
@@ -832,7 +842,7 @@ mod tests {
         })
     }
 
-    /// `open_pr`, on `head` and aimed at `base`.
+    /// `open_pr`, on `head` in this repository and aimed at `base`.
     fn on_branch(
         number: u32,
         author: &str,
@@ -842,6 +852,18 @@ mod tests {
         let mut pr = open_pr(number, author)?;
         pr.head_ref = BranchName::new(head);
         pr.base_ref = BranchName::new(base);
+        Ok(pr)
+    }
+
+    /// `on_branch` by `hubot`, with its head in `repository` instead.
+    fn on_branch_in(
+        repository: HeadRepository,
+        number: u32,
+        head: &str,
+        base: &str,
+    ) -> Result<PrFacts, InvalidValue> {
+        let mut pr = on_branch(number, "hubot", head, base)?;
+        pr.head_repository = repository;
         Ok(pr)
     }
 
@@ -1054,6 +1076,56 @@ mod tests {
                 (105, 1, Some(101))
             ])
         );
+    }
+
+    /// The unclaimed group's shape, built from `prs`.
+    fn unclaimed_shape(
+        prs: Vec<Result<PrFacts, InvalidValue>>,
+    ) -> Result<Vec<(u32, usize, Option<u32>)>, InvalidValue> {
+        let me = Login::parse("octocat")?;
+        let built = prs.into_iter().collect::<Result<Vec<_>, _>>()?;
+        Ok(shape(board_for(built, &me).unclaimed()))
+    }
+
+    #[test]
+    fn a_fork_named_like_a_branch_here_is_never_beneath_anything() {
+        // A fork's `main` is not this repository's `main`. Read by name, 102
+        // would sit on 101, and so would every pull request aimed at `main`.
+        let drawn = unclaimed_shape(vec![
+            on_branch_in(HeadRepository::Fork, 101, "main", "main"),
+            on_branch_in(HeadRepository::ThisOne, 102, "stack/one", "main"),
+            on_branch_in(HeadRepository::ThisOne, 103, "stack/two", "stack/one"),
+        ]);
+        assert_eq!(
+            drawn,
+            Ok(vec![(101, 0, None), (102, 0, None), (103, 1, Some(102))])
+        );
+    }
+
+    #[test]
+    fn a_head_github_did_not_place_is_never_beneath_anything() {
+        // Without GitHub saying the branch is here, `stack/one` may be a fork's
+        // branch of that name, and a stack drawn onto it would be invented.
+        let drawn = unclaimed_shape(vec![
+            on_branch_in(HeadRepository::Unstated, 101, "stack/one", "main"),
+            on_branch_in(HeadRepository::ThisOne, 102, "stack/x", "main"),
+            on_branch_in(HeadRepository::ThisOne, 103, "stack/two", "stack/one"),
+        ]);
+        assert_eq!(
+            drawn,
+            Ok(vec![(101, 0, None), (102, 0, None), (103, 0, None)])
+        );
+    }
+
+    #[test]
+    fn a_fork_can_still_sit_on_a_branch_here() {
+        // A fork's base is always in this repository, so only being *beneath*
+        // something needs the head to be here.
+        let drawn = unclaimed_shape(vec![
+            on_branch_in(HeadRepository::ThisOne, 101, "stack/one", "main"),
+            on_branch_in(HeadRepository::Fork, 102, "patch-1", "stack/one"),
+        ]);
+        assert_eq!(drawn, Ok(vec![(101, 0, None), (102, 1, Some(101))]));
     }
 
     #[test]

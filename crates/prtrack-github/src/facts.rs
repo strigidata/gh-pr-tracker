@@ -15,9 +15,9 @@
 
 use chrono::{DateTime, Utc};
 use prtrack_core::{
-    BranchName, Check, CheckName, CheckState, DraftState, HeadSha, Login, MergeState,
-    MergeableState, PolicyRules, PrFacts, PrNumber, PrTitle, PrUrl, RepoRef, ReviewDecision,
-    Reviewer, TeamSlug,
+    BranchName, Check, CheckName, CheckState, DraftState, HeadRepository, HeadSha, Login,
+    MergeState, MergeableState, PolicyRules, PrFacts, PrNumber, PrTitle, PrUrl, RepoRef,
+    ReviewDecision, Reviewer, TeamSlug,
 };
 
 use crate::client::OpenPullRequests;
@@ -196,6 +196,7 @@ fn facts_of(
         },
         head: HeadSha::parse(&pull_request.head_ref_oid).map_err(refuse)?,
         head_ref: BranchName::new(&pull_request.head_ref_name),
+        head_repository: head_repository_of(pull_request.is_cross_repository),
         base_ref: BranchName::new(&pull_request.base_ref_name),
         review_decision: pull_request
             .review_decision
@@ -423,6 +424,18 @@ fn status_state_text(state: &wire::StatusState) -> String {
     }
 }
 
+/// Which repository the head branch is in, from `isCrossRepository`.
+///
+/// Absent is not taken to mean "here": the recordings lack the field, and a
+/// guess would draw stacks onto branches that may belong to a fork.
+const fn head_repository_of(is_cross_repository: Option<bool>) -> HeadRepository {
+    match is_cross_repository {
+        Some(false) => HeadRepository::ThisOne,
+        Some(true) => HeadRepository::Fork,
+        None => HeadRepository::Unstated,
+    }
+}
+
 /// The core's word for whether git can merge the branch.
 fn mergeable_of(state: &wire::MergeableState) -> MergeableState {
     match state {
@@ -477,8 +490,8 @@ mod tests {
     use crate::error::ConversionError;
     use crate::wire::{self, PAGE_1, PAGE_2, TOTAL_OPEN};
     use prtrack_core::{
-        BlockingChecks, Board, BoardRow, BranchName, CheckState, DraftState, MergeState,
-        MergeableState, RepoRef,
+        BlockingChecks, Board, BoardRow, BranchName, CheckState, DraftState, HeadRepository,
+        MergeState, MergeableState, RepoRef,
     };
 
     /// The repository the recordings are of, after redaction.
@@ -583,6 +596,45 @@ mod tests {
             // Pinned to what was recorded rather than to what is tidy.
             Some(DraftState::Draft)
         );
+    }
+
+    #[test]
+    fn where_a_head_lives_is_read_from_is_cross_repository() {
+        // Synthetic: the recordings predate `isCrossRepository`, so every
+        // recorded pull request lacks it and none could show a fork. The key
+        // is written into the JSON rather than the struct, so its spelling on
+        // the wire is under test too.
+        let cases = [
+            (Some(true), HeadRepository::Fork),
+            (Some(false), HeadRepository::ThisOne),
+            (None, HeadRepository::Unstated),
+        ];
+        for (sent, expected) in cases {
+            let read = recorded().and_then(|mut open| {
+                for pull_request in &mut open.pull_requests {
+                    let mut json = serde_json::to_value(&*pull_request).ok()?;
+                    let fields = json.as_object_mut()?;
+                    fields.remove("isCrossRepository");
+                    if let Some(flag) = sent {
+                        fields.insert("isCrossRepository".to_owned(), flag.into());
+                    }
+                    *pull_request = serde_json::from_value(json).ok()?;
+                }
+                let facts = RepositoryFacts::try_from(open).ok()?;
+                Some(
+                    facts
+                        .pull_requests()
+                        .iter()
+                        .map(|(facts, _)| facts.head_repository)
+                        .collect::<Vec<_>>(),
+                )
+            });
+            assert_eq!(
+                read,
+                Some(vec![expected; TOTAL_OPEN]),
+                "isCrossRepository {sent:?} must read as {expected:?} on every pull request"
+            );
+        }
     }
 
     #[test]

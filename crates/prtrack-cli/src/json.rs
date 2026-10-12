@@ -251,9 +251,9 @@ mod tests {
     use chrono::{DateTime, TimeDelta, Utc};
     use prtrack_core::{
         BlockingChecks, Board, BoardRow, BranchName, Check, CheckName, CheckState, DraftState,
-        HeadSha, InvalidValue, Login, MergeState, MergeableState, PolicyRules, PrFacts, PrNumber,
-        PrTitle, PrUrl, RepoRef, Requirement, ReviewDecision, Reviewer, StaleReviewHandling,
-        TeamSlug,
+        HeadRepository, HeadSha, InvalidValue, Login, MergeState, MergeableState, PolicyRules,
+        PrFacts, PrNumber, PrTitle, PrUrl, RepoRef, Requirement, ReviewDecision, Reviewer,
+        StaleReviewHandling, TeamSlug,
     };
     use serde_json::{json, Value};
 
@@ -282,6 +282,7 @@ mod tests {
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse(SOME_SHA)?,
             head_ref: BranchName::new("topic/branch-01"),
+            head_repository: HeadRepository::ThisOne,
             base_ref: BranchName::new("main"),
             review_decision: None,
             mergeable: MergeableState::Mergeable,

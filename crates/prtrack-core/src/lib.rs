@@ -59,8 +59,8 @@ pub use board::{ActionUrgency, Board, BoardRow, Placed, Reviewability, Stack, St
 pub use checks::{classify, Check, CheckState, Classified};
 pub use decision::{BlockedReason, FailingCheckCount, NonEmpty, UnresolvedThreadCount};
 pub use facts::{
-    BranchName, DraftState, MergeState, MergeableState, PrFacts, PrTitle, PrUrl, ReviewDecision,
-    Reviewer, TeamSlug,
+    BranchName, DraftState, HeadRepository, MergeState, MergeableState, PrFacts, PrTitle, PrUrl,
+    ReviewDecision, Reviewer, TeamSlug,
 };
 pub use nudge::{
     observe, ApprovalState, Nudge, Observation, ReasonKind, RequiredCheckHealth, ReviewRequest,

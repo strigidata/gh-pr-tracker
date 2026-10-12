@@ -360,8 +360,8 @@ mod tests {
     use crate::board::BoardRow;
     use crate::checks::{Check, CheckState};
     use crate::facts::{
-        BranchName, DraftState, MergeState, MergeableState, PrFacts, PrTitle, PrUrl,
-        ReviewDecision, Reviewer, TeamSlug,
+        BranchName, DraftState, HeadRepository, MergeState, MergeableState, PrFacts, PrTitle,
+        PrUrl, ReviewDecision, Reviewer, TeamSlug,
     };
     use crate::policy::{BlockingChecks, PolicyRules, Requirement, StaleReviewHandling};
     use crate::types::{CheckName, HeadSha, InvalidValue, Login, PrNumber, RepoRef};
@@ -385,6 +385,7 @@ mod tests {
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse(FIRST_HEAD)?,
             head_ref: BranchName::new("topic/branch-01"),
+            head_repository: HeadRepository::ThisOne,
             base_ref: BranchName::new("main"),
             review_decision: None,
             mergeable: MergeableState::Mergeable,

@@ -516,8 +516,8 @@ mod tests {
     use super::{BlockedReason, FailingCheckCount, NonEmpty, UnresolvedThreadCount};
     use crate::checks::{Check, CheckState};
     use crate::facts::{
-        BranchName, DraftState, MergeState, MergeableState, PrFacts, PrTitle, PrUrl,
-        ReviewDecision, Reviewer, TeamSlug,
+        BranchName, DraftState, HeadRepository, MergeState, MergeableState, PrFacts, PrTitle,
+        PrUrl, ReviewDecision, Reviewer, TeamSlug,
     };
     use crate::policy::{BlockingChecks, PolicyRules, Requirement};
     use crate::types::{CheckName, HeadSha, InvalidValue, Login, PrNumber, RepoRef};
@@ -677,6 +677,7 @@ mod tests {
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse("9f2c4e1b7a3d5068c9e4b2a17f36d8095c1e4a7b")?,
             head_ref: BranchName::new("topic/branch-01"),
+            head_repository: HeadRepository::ThisOne,
             base_ref: BranchName::new("main"),
             review_decision: Some(ReviewDecision::ReviewRequired),
             mergeable: MergeableState::Mergeable,

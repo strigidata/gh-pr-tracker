@@ -575,6 +575,13 @@ pub(crate) struct PullRequest {
     /// it.
     /// The pull request's own branch. `String!`, so never null.
     pub(crate) head_ref_name: String,
+    /// Whether the head branch lives in another repository, usually a fork.
+    ///
+    /// `Boolean!` on GitHub's side, so the live API always sends it. Optional
+    /// here because the recorded fixtures predate the field, and skipped on the
+    /// way out so a recording without it writes back without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) is_cross_repository: Option<bool>,
     pub(crate) base_ref_name: String,
     /// Whoever opened it. Null when that account is gone.
     pub(crate) author: Option<Actor>,
