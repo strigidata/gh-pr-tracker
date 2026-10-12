@@ -1552,26 +1552,102 @@ mod tests {
         assert!(rendered.contains("1 open"), "{rendered}");
     }
 
+    /// Every heading a section can print, for asserting that none was.
+    const SECTION_HEADINGS: [&str; 5] = [
+        "NEED YOUR REVIEW",
+        "YOU REVIEWED",
+        "YOUR PRS",
+        "OTHER DRAFTS",
+        "YOUR DRAFTS",
+    ];
+
+    /// The first line of each paragraph of a render, a paragraph being what a
+    /// blank line separates. Splitting on exactly one blank line means a run of
+    /// two shows up as a paragraph whose first line is empty.
+    fn paragraph_openers(rendered: &str) -> Vec<&str> {
+        rendered
+            .trim_end_matches('\n')
+            .split("\n\n")
+            .map(|paragraph| paragraph.lines().next().unwrap_or_default())
+            .collect()
+    }
+
+    /// Three kept sections around two empty ones: YOU REVIEWED between the
+    /// first two and YOUR DRAFTS between the last two.
+    fn three_sections_two_gaps() -> Result<String, InvalidValue> {
+        let me = Login::parse("octocat")?;
+        let mut theirs = open_pr(3, "hubot")?;
+        theirs.requested_reviewers = vec![Reviewer::User(me.clone())];
+        let mut their_draft = open_pr(4, "hubot")?;
+        their_draft.draft_state = DraftState::Draft;
+
+        Ok(render(
+            vec![
+                open_pr(1, "octocat")?,
+                open_pr(2, "octocat")?,
+                theirs,
+                their_draft,
+            ],
+            &enforced_rule()?,
+            &me,
+            plain(),
+        ))
+    }
+
+    #[test]
+    fn an_empty_board_prints_no_section_and_still_answers() {
+        let rendered = Login::parse("octocat")
+            .map(|me| render(Vec::new(), &PolicyRules::unprotected(), &me, plain()))
+            .unwrap_or_default();
+        for heading in SECTION_HEADINGS {
+            assert!(
+                !rendered.contains(heading),
+                "{heading:?} printed:\n{rendered}"
+            );
+        }
+        assert!(!rendered.contains("\n\n\n"), "{rendered}");
+        // The policy line, one blank line, then the summary: an empty board is
+        // visibly an answer and not a blank screen.
+        let openers = paragraph_openers(&rendered);
+        assert_eq!(openers.len(), 2, "{rendered}");
+        assert!(
+            openers
+                .last()
+                .is_some_and(|line| line.starts_with("0 open | ")),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn kept_sections_are_separated_by_exactly_one_blank_line() {
+        let rendered = three_sections_two_gaps().unwrap_or_default();
+        assert!(!rendered.contains("\n\n\n"), "{rendered}");
+        let openers = paragraph_openers(&rendered);
+        assert!(
+            openers
+                .first()
+                .is_some_and(|line| line.starts_with("prtrack ")),
+            "{rendered}"
+        );
+        assert_eq!(
+            openers.get(1..),
+            Some(
+                [
+                    "NEED YOUR REVIEW  (1)",
+                    "YOUR PRS  (2)",
+                    "OTHER DRAFTS  (1)",
+                    "4 open | 0 you have reviewed | 0 ready to merge | 0 conflicting \
+                     | 1 reviewable now",
+                ]
+                .as_slice()
+            ),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn a_section_heading_counts_the_rows_beneath_it() {
-        let rendered = Login::parse("octocat").and_then(|me| {
-            let mut theirs = open_pr(3, "hubot")?;
-            theirs.requested_reviewers = vec![Reviewer::User(me.clone())];
-            let mut their_draft = open_pr(4, "hubot")?;
-            their_draft.draft_state = DraftState::Draft;
-
-            Ok::<_, InvalidValue>(render(
-                vec![
-                    open_pr(1, "octocat")?,
-                    open_pr(2, "octocat")?,
-                    theirs,
-                    their_draft,
-                ],
-                &enforced_rule()?,
-                &me,
-                plain(),
-            ))
-        });
+        let rendered = three_sections_two_gaps();
 
         for expected in [
             "YOUR PRS  (2)",
