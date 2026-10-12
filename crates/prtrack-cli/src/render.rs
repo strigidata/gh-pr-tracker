@@ -341,10 +341,10 @@ impl BoardText<'_> {
         self.palette.paint(
             Style::Dim,
             &format!(
-                // "not your review" was accurate when the unclaimed rows were
-                // also hidden. They are on screen now, so the only rows left
-                // out are ones this viewer has already reviewed -- which is a
-                // different and more useful thing to be told.
+                // How many pull requests this viewer has already reviewed,
+                // counted by each row's own placement, so one stacked under
+                // another section still counts. Kept here so the number is
+                // visible without reading the YOU REVIEWED section.
                 "{} open | {} you have reviewed | {ready} ready to merge | \
                  {conflicting} conflicting | {reviewable} reviewable now",
                 self.board.total(),
@@ -1389,10 +1389,9 @@ mod tests {
     fn the_summary_counts_the_rows_the_sections_do_not_show() {
         // Three reviewable, not two: the unclaimed row is on screen now and
         // counts toward what somebody could pick up this minute.
-        // The three sections between them hide everything that is somebody
-        // else's problem. The count is the only place a reader learns those
-        // pull requests exist at all, so it has to come from the whole board
-        // and not from what was drawn.
+        // The count comes from the whole board and not from what was drawn
+        // under each heading: a stacked row is drawn beneath its parent's
+        // section, and it still has to count where it belongs.
         let summary = Login::parse("octocat").and_then(|me| {
             let mut mine_ready = open_pr(1, "octocat")?;
             mine_ready.review_decision = Some(prtrack_core::ReviewDecision::Approved);
