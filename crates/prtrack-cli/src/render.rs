@@ -30,6 +30,10 @@ const REASON_COLUMN: usize = 40;
 /// Only padded when something follows it. As the last column it needs no width.
 const SINCE_PUSH_COLUMN: usize = 11;
 
+/// How many cells each level of stacking adds to the PR column: the indent
+/// that pushes a stacked row's number out from under the one it sits on.
+const TREE_STEP: usize = 2;
+
 /// How much of a login is shown. One cell short of its column, so the longest
 /// login still leaves a space before the next value.
 const AUTHOR_CELLS: usize = AUTHOR_COLUMN - 1;
@@ -108,6 +112,9 @@ impl BoardText<'_> {
         // a line in the review list: asking you to review your own approval is
         // the fastest way to teach somebody to stop reading that list, and
         // hiding it lost the pull requests that went bad after you approved.
+        // One width for every section, so a stack in one section does not leave
+        // the columns of the next a few cells to the left of it.
+        let pr_column = PR_COLUMN + self.tree_width();
         let review = self
             .board
             .needs_your_review()
@@ -116,15 +123,30 @@ impl BoardText<'_> {
             .chain(self.board.unclaimed().walk())
             .collect::<Vec<_>>();
         let sections = [
-            self.section("NEED YOUR REVIEW", &review, true),
-            self.section("YOU REVIEWED", &self.board.you_reviewed().walk(), true),
-            self.section("YOUR PRS", &self.board.yours().walk(), true),
+            self.section("NEED YOUR REVIEW", &review, true, pr_column),
+            self.section(
+                "YOU REVIEWED",
+                &self.board.you_reviewed().walk(),
+                true,
+                pr_column,
+            ),
+            self.section("YOUR PRS", &self.board.yours().walk(), true, pr_column),
             // Directly under your open work, because it is the same question
             // asked one step earlier: what have you got going, and what have
             // you not asked for yet.
-            self.section("YOUR DRAFTS", &self.board.your_drafts().walk(), true),
+            self.section(
+                "YOUR DRAFTS",
+                &self.board.your_drafts().walk(),
+                true,
+                pr_column,
+            ),
             // No column header: nobody scans a draft they do not own for its CI.
-            self.section("OTHER DRAFTS", &self.board.other_drafts().walk(), false),
+            self.section(
+                "OTHER DRAFTS",
+                &self.board.other_drafts().walk(),
+                false,
+                pr_column,
+            ),
         ];
         for block in sections.into_iter().filter(|block| !block.is_empty()) {
             lines.extend(block);
@@ -136,6 +158,17 @@ impl BoardText<'_> {
         let mut rendered = lines.join("\n");
         rendered.push('\n');
         rendered
+    }
+
+    /// How much wider the PR column is than [`PR_COLUMN`], so that the deepest
+    /// stack on the board still leaves every other column aligned.
+    fn tree_width(&self) -> usize {
+        self.board
+            .walk()
+            .map(|placed| placed.depth())
+            .max()
+            .unwrap_or(0)
+            * TREE_STEP
     }
 
     /// What the repository enforces on the branch these rows target.
@@ -186,7 +219,16 @@ impl BoardText<'_> {
     /// A heading, optionally a column header, and the rows — or nothing at all
     /// when there are none: an empty section is noise, and the summary line
     /// still counts every pull request.
-    fn section(&self, title: &str, rows: &[Placed<'_>], with_columns: bool) -> Vec<String> {
+    ///
+    /// `pr_column` is the PR column's width on this board, which a stack
+    /// anywhere on it widens.
+    fn section(
+        &self,
+        title: &str,
+        rows: &[Placed<'_>],
+        with_columns: bool,
+        pr_column: usize,
+    ) -> Vec<String> {
         if rows.is_empty() {
             return Vec::new();
         }
@@ -197,18 +239,18 @@ impl BoardText<'_> {
                 .paint(Style::Dim, &format!("  ({})", rows.len()))
         )];
         if with_columns {
-            lines.push(self.column_header());
+            lines.push(self.column_header(pr_column));
         }
-        lines.extend(rows.iter().map(|placed| self.row_line(placed.row())));
+        lines.extend(rows.iter().map(|placed| self.row_line(placed, pr_column)));
         lines
     }
 
     /// The column header, which must be padded by the same rules as a row or
     /// it will not sit above it.
-    fn column_header(&self) -> String {
+    fn column_header(&self, pr_column: usize) -> String {
         let header = format!(
             "{}{}{}{}{}{}{}",
-            pad_to("PR", PR_COLUMN),
+            pad_to("PR", pr_column),
             pad_to("AUTHOR", AUTHOR_COLUMN),
             pad_to("CI", CI_COLUMN),
             pad_to("OPEN.CMT", THREADS_COLUMN),
@@ -243,7 +285,11 @@ impl BoardText<'_> {
     ///
     /// Each cell is padded after it is painted, using the width it *shows*
     /// rather than the bytes it holds.
-    fn row_line(&self, row: &BoardRow) -> String {
+    ///
+    /// A stacked row's number is indented under the one it sits on, behind a
+    /// branch mark; `pr_column` is wide enough for the deepest of them.
+    fn row_line(&self, placed: &Placed<'_>, pr_column: usize) -> String {
+        let row = placed.row();
         let facts = row.facts();
         let is_draft = facts.draft_state == DraftState::Draft;
         let unreadable = row.reviewability() >= Reviewability::CiRunning;
@@ -260,12 +306,17 @@ impl BoardText<'_> {
             // The number is a link to the pull request. OSC 8 costs no columns,
             // so the URL is reachable without a column wide enough to print it
             // — and the row stays scannable, which a full URL per row does not.
+            // The tree mark sits outside the link: it is not the pull request.
             pad_to(
-                &palette.link(
-                    facts.url.as_str(),
-                    &palette.paint(Style::Plain, &format!("#{}", facts.number.get())),
+                &format!(
+                    "{}{}",
+                    tree_prefix(placed.depth()),
+                    palette.link(
+                        facts.url.as_str(),
+                        &palette.paint(Style::Plain, &format!("#{}", facts.number.get())),
+                    )
                 ),
-                PR_COLUMN
+                pr_column
             ),
             pad_to(
                 &palette.paint(Style::Plain, truncate_to(author, AUTHOR_CELLS)),
@@ -370,6 +421,17 @@ impl BoardText<'_> {
 /// nothing blocks. An empty rollup is called out rather than drawn as a pass,
 /// because "CI never ran" and "CI is green" are the two readings a board must
 /// never confuse.
+/// The indent and branch mark in front of a stacked row's number: nothing for a
+/// root, `└ ` one level up, and [`TREE_STEP`] more cells of indent per level
+/// above that.
+fn tree_prefix(depth: usize) -> String {
+    depth
+        .checked_sub(1)
+        .map_or_else(String::new, |levels_below| {
+            format!("{}└ ", " ".repeat(levels_below * TREE_STEP))
+        })
+}
+
 fn checks_cell(row: &BoardRow, palette: Palette) -> String {
     let checks = row.checks();
     let (blocking, advisory) = (checks.blocking().len(), checks.advisory().len());
@@ -1740,5 +1802,75 @@ mod tests {
             .find(|line| line.starts_with("#101 "))
             .unwrap_or_default();
         assert!(row.contains("CONFLICT"), "{rendered}");
+    }
+
+    #[test]
+    fn a_stack_is_drawn_under_the_pull_request_it_sits_on() {
+        let rendered = Login::parse("octocat")
+            .and_then(|me| {
+                let on = |n: u32, head: &str, base: &str| {
+                    open_pr(n, "hubot").map(|mut pr| {
+                        pr.head_ref = BranchName::new(head);
+                        pr.base_ref = BranchName::new(base);
+                        pr
+                    })
+                };
+                Ok(render(
+                    vec![
+                        on(103, "stack/three", "stack/two")?,
+                        on(101, "stack/one", "main")?,
+                        on(102, "stack/two", "stack/one")?,
+                        open_pr(104, "monalisa")?,
+                    ],
+                    &PolicyRules::unprotected(),
+                    &me,
+                    plain(),
+                ))
+            })
+            .unwrap_or_default();
+        let lines: Vec<&str> = rendered.lines().collect();
+        let line_of = |needle: &str| lines.iter().position(|line| line.contains(needle));
+
+        assert!(
+            lines.iter().any(|line| line.starts_with("#101 ")),
+            "{rendered}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("└ #102 ")),
+            "{rendered}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("  └ #103 ")),
+            "{rendered}"
+        );
+        assert!(
+            line_of("#101 ") < line_of("#102 ") && line_of("#102 ") < line_of("#103 "),
+            "{rendered}"
+        );
+        // Every row's author column starts where the header's does. Measured in
+        // cells, not bytes: `└` is three bytes and one cell, so a byte offset
+        // would call an aligned stacked row misaligned.
+        let cells_before = |line: &str, at: usize| line.get(..at).map(visible_width);
+        let author_at = |line: &str| {
+            line.find("hubot")
+                .or_else(|| line.find("monalisa"))
+                .and_then(|at| cells_before(line, at))
+        };
+        let header = lines
+            .iter()
+            .find(|line| line.starts_with("PR "))
+            .copied()
+            .unwrap_or_default();
+        let header_author = header
+            .find("AUTHOR")
+            .and_then(|at| cells_before(header, at));
+        assert!(header_author.is_some(), "{rendered}");
+        for n in ["#101 ", "#102 ", "#103 ", "#104 "] {
+            let row = line_of(n)
+                .and_then(|at| lines.get(at))
+                .copied()
+                .unwrap_or_default();
+            assert_eq!(author_at(row), header_author, "{n} misaligned:\n{rendered}");
+        }
     }
 }
