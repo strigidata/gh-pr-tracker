@@ -186,7 +186,7 @@ impl Reviewability {
 /// point of view.
 ///
 /// Private because [`Board`] is the answer: a caller reads the section a pull
-/// request landed in by finding it in one, and the four are a partition so
+/// request landed in by finding it in one, and the six are a partition so
 /// there is always exactly one to find.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -207,14 +207,15 @@ enum Section {
     /// Somebody else's work, open for review, that the viewer has neither been
     /// asked about nor already reviewed.
     ///
-    /// Separate from [`Section::NotWaitingOnYou`] because it is the one group
+    /// Separate from [`Section::YouReviewed`] because it is the one group
     /// there that somebody could usefully pick up. A pull request the viewer
     /// has already approved is *not* here: GitHub removes a reviewer from the
     /// request list the moment they submit, so without checking who has already
     /// reviewed, approved work is indistinguishable from unclaimed work.
     Unclaimed,
-    /// Somebody else's work that is not waiting on the viewer at all.
-    NotWaitingOnYou,
+    /// Somebody else's work, open for review, that the viewer has already
+    /// approved or asked changes on.
+    YouReviewed,
 }
 
 impl Section {
@@ -249,7 +250,7 @@ impl Section {
         // move is somebody else's, and showing it as reviewable would be asking
         // you to do a thing you have done.
         if facts.reviewed_by.contains(viewer) {
-            return Self::NotWaitingOnYou;
+            return Self::YouReviewed;
         }
         Self::Unclaimed
     }
@@ -338,9 +339,9 @@ impl BoardRow {
 ///
 /// # Nothing is dropped
 ///
-/// The four groups partition the input: every row goes in exactly one, and
-/// [`Board::total`] equals the number of rows handed in. Three of them are
-/// meant to be rendered. The fourth, [`Board::not_waiting_on_you`], usually is
+/// The six groups partition the input: every row goes in exactly one, and
+/// [`Board::total`] equals the number of rows handed in. Five of them are
+/// meant to be rendered. The sixth, [`Board::you_reviewed`], usually is
 /// not — but it is kept rather than discarded, because a pull request that
 /// quietly stopped existing is the failure this crate is built to prevent, and
 /// a board that can only report "37 open" while showing nine of them has to get
@@ -354,7 +355,7 @@ impl BoardRow {
 /// viewer an implicit reviewer who never appears by name, so this section
 /// under-reports. Closing that needs team-membership data this crate does not
 /// have and deliberately does not guess at. The pull request is not lost — it
-/// lands in [`Board::not_waiting_on_you`] with its reviewers intact — so the
+/// lands in [`Board::unclaimed`] with its reviewers intact — so the
 /// gap is a row in the wrong group rather than a row that disappeared.
 ///
 /// [`Reviewer::Team`]: crate::Reviewer::Team
@@ -365,7 +366,7 @@ pub struct Board {
     your_drafts: Vec<BoardRow>,
     needs_your_review: Vec<BoardRow>,
     other_drafts: Vec<BoardRow>,
-    not_waiting_on_you: Vec<BoardRow>,
+    you_reviewed: Vec<BoardRow>,
 }
 
 impl Board {
@@ -383,7 +384,7 @@ impl Board {
             your_drafts: Vec::new(),
             needs_your_review: Vec::new(),
             other_drafts: Vec::new(),
-            not_waiting_on_you: Vec::new(),
+            you_reviewed: Vec::new(),
         };
 
         for row in rows {
@@ -393,7 +394,7 @@ impl Board {
                 Section::NeedsYourReview => &mut board.needs_your_review,
                 Section::Unclaimed => &mut board.unclaimed,
                 Section::OtherDrafts => &mut board.other_drafts,
-                Section::NotWaitingOnYou => &mut board.not_waiting_on_you,
+                Section::YouReviewed => &mut board.you_reviewed,
             };
             group.push(row);
         }
@@ -433,9 +434,7 @@ impl Board {
                 row.facts.number.get(),
             )
         });
-        board
-            .not_waiting_on_you
-            .sort_by_key(|row| row.facts.number.get());
+        board.you_reviewed.sort_by_key(|row| row.facts.number.get());
 
         board
     }
@@ -497,24 +496,21 @@ impl Board {
         &self.unclaimed
     }
 
-    /// Everything left — including anything the viewer has already reviewed.
+    /// Somebody else's pull requests the viewer has already approved or asked
+    /// changes on, ordered by number.
     ///
-    /// An approval is the common case here, and it is why this exists as a
-    /// separate group: GitHub removes a reviewer from the request list the
-    /// moment they submit, so without checking who has already reviewed, work
-    /// the viewer approved is indistinguishable from work nobody has touched.
-    ///
-    /// Ordered by pull request number, since no urgency applies. Counted rather
-    /// than rendered; see the type's documentation for why it is kept.
+    /// GitHub removes a reviewer from the request list the moment they submit,
+    /// so without checking who has reviewed, work the viewer approved would be
+    /// indistinguishable from work nobody has touched.
     #[must_use]
-    pub fn not_waiting_on_you(&self) -> &[BoardRow] {
-        &self.not_waiting_on_you
+    pub fn you_reviewed(&self) -> &[BoardRow] {
+        &self.you_reviewed
     }
 
     /// How many pull requests the board was built from.
     ///
     /// Equal to the number of rows handed to [`Board::assemble`], because the
-    /// four groups are a partition of them.
+    /// six groups are a partition of them.
     #[must_use]
     pub const fn total(&self) -> usize {
         self.yours.len()
@@ -522,7 +518,7 @@ impl Board {
             + self.unclaimed.len()
             + self.needs_your_review.len()
             + self.other_drafts.len()
-            + self.not_waiting_on_you.len()
+            + self.you_reviewed.len()
     }
 }
 
@@ -1032,7 +1028,7 @@ mod tests {
                 numbers(board.your_drafts()),
                 numbers(board.needs_your_review()),
                 numbers(board.other_drafts()),
-                // Unclaimed, not `not_waiting_on_you`: nobody asked the viewer
+                // Unclaimed, not `you_reviewed`: nobody asked the viewer
                 // about these and the viewer has not reviewed them, so they are
                 // the group that gets rendered.
                 numbers(board.unclaimed()),

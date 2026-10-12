@@ -119,7 +119,7 @@ impl BoardJson<'_> {
             // what was asked of somebody must not be handed what was not.
             "unclaimed": listed(self.board.unclaimed(), "unclaimed"),
             "drafts": listed(self.board.other_drafts(), "drafts"),
-            "neither": listed(self.board.not_waiting_on_you(), "neither"),
+            "neither": listed(self.board.you_reviewed(), "neither"),
         })
     }
 }

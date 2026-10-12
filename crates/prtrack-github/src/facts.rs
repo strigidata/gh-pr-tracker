@@ -1057,7 +1057,7 @@ mod tests {
                     + board.your_drafts().len()
                     + board.needs_your_review().len()
                     + board.other_drafts().len()
-                    + board.not_waiting_on_you().len(),
+                    + board.you_reviewed().len(),
                 TOTAL_OPEN,
                 "every pull request lands in exactly one section"
             );

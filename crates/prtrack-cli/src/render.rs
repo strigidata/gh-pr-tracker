@@ -332,7 +332,7 @@ impl BoardText<'_> {
                 .chain(self.board.your_drafts())
                 .chain(self.board.other_drafts())
                 .chain(self.board.unclaimed())
-                .chain(self.board.not_waiting_on_you())
+                .chain(self.board.you_reviewed())
         };
         let ready = every_row()
             .filter(|row| matches!(row.reason(), BlockedReason::ReadyToMerge))
@@ -363,7 +363,7 @@ impl BoardText<'_> {
                 "{} open | {} you have reviewed | {ready} ready to merge | \
                  {conflicting} conflicting | {reviewable} reviewable now",
                 self.board.total(),
-                self.board.not_waiting_on_you().len(),
+                self.board.you_reviewed().len(),
             ),
         )
     }
