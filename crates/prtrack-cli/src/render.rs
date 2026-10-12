@@ -414,13 +414,6 @@ impl BoardText<'_> {
     }
 }
 
-/// What CI says, in the space of one column.
-///
-/// The order is a ladder: a blocking failure is the only thing worth saying
-/// when there is one, and an advisory failure is worth saying only when
-/// nothing blocks. An empty rollup is called out rather than drawn as a pass,
-/// because "CI never ran" and "CI is green" are the two readings a board must
-/// never confuse.
 /// The indent and branch mark in front of a stacked row's number: nothing for a
 /// root, `└ ` one level up, and [`TREE_STEP`] more cells of indent per level
 /// above that.
@@ -432,6 +425,13 @@ fn tree_prefix(depth: usize) -> String {
         })
 }
 
+/// What CI says, in the space of one column.
+///
+/// The order is a ladder: a blocking failure is the only thing worth saying
+/// when there is one, and an advisory failure is worth saying only when
+/// nothing blocks. An empty rollup is called out rather than drawn as a pass,
+/// because "CI never ran" and "CI is green" are the two readings a board must
+/// never confuse.
 fn checks_cell(row: &BoardRow, palette: Palette) -> String {
     let checks = row.checks();
     let (blocking, advisory) = (checks.blocking().len(), checks.advisory().len());
@@ -1804,9 +1804,15 @@ mod tests {
         assert!(row.contains("CONFLICT"), "{rendered}");
     }
 
-    #[test]
-    fn a_stack_is_drawn_under_the_pull_request_it_sits_on() {
-        let rendered = Login::parse("octocat")
+    /// The pull requests on the stacked board, in the order a reader sees them:
+    /// #101 at the root, #102 and #103 stacked one and two deep, and #104 on
+    /// its own.
+    const STACKED_NUMBERS: [&str; 4] = ["#101", "#102", "#103", "#104"];
+
+    /// A three-deep stack and one unstacked pull request, drawn with `palette`.
+    /// Handed over out of order, so the tree is the renderer's doing.
+    fn stacked_board(palette: Palette) -> String {
+        Login::parse("octocat")
             .and_then(|me| {
                 let on = |n: u32, head: &str, base: &str| {
                     open_pr(n, "hubot").map(|mut pr| {
@@ -1824,10 +1830,45 @@ mod tests {
                     ],
                     &PolicyRules::unprotected(),
                     &me,
-                    plain(),
+                    palette,
                 ))
             })
+            .unwrap_or_default()
+    }
+
+    /// Asserts every row of [`stacked_board`] starts its author column where
+    /// the header does, painted or not.
+    ///
+    /// Measured in cells with [`visible_width`], not bytes: `└` is three bytes
+    /// and one cell, and a colour escape or a link's URL is many bytes and no
+    /// cells, so a byte offset would call an aligned row misaligned.
+    fn assert_stack_aligned(rendered: &str) {
+        let cells_before = |line: &str, at: usize| line.get(..at).map(visible_width);
+        let author_at = |line: &str| {
+            line.find("hubot")
+                .or_else(|| line.find("monalisa"))
+                .and_then(|at| cells_before(line, at))
+        };
+        let header = rendered
+            .lines()
+            .find(|line| line.contains("AUTHOR"))
             .unwrap_or_default();
+        let header_author = header
+            .find("AUTHOR")
+            .and_then(|at| cells_before(header, at));
+        assert!(header_author.is_some(), "{rendered}");
+        for n in STACKED_NUMBERS {
+            let row = rendered
+                .lines()
+                .find(|line| line.contains(n))
+                .unwrap_or_default();
+            assert_eq!(author_at(row), header_author, "{n} misaligned:\n{rendered}");
+        }
+    }
+
+    #[test]
+    fn a_stack_is_drawn_under_the_pull_request_it_sits_on() {
+        let rendered = stacked_board(plain());
         let lines: Vec<&str> = rendered.lines().collect();
         let line_of = |needle: &str| lines.iter().position(|line| line.contains(needle));
 
@@ -1847,30 +1888,28 @@ mod tests {
             line_of("#101 ") < line_of("#102 ") && line_of("#102 ") < line_of("#103 "),
             "{rendered}"
         );
-        // Every row's author column starts where the header's does. Measured in
-        // cells, not bytes: `└` is three bytes and one cell, so a byte offset
-        // would call an aligned stacked row misaligned.
-        let cells_before = |line: &str, at: usize| line.get(..at).map(visible_width);
-        let author_at = |line: &str| {
-            line.find("hubot")
-                .or_else(|| line.find("monalisa"))
-                .and_then(|at| cells_before(line, at))
-        };
-        let header = lines
-            .iter()
-            .find(|line| line.starts_with("PR "))
-            .copied()
-            .unwrap_or_default();
-        let header_author = header
-            .find("AUTHOR")
-            .and_then(|at| cells_before(header, at));
-        assert!(header_author.is_some(), "{rendered}");
-        for n in ["#101 ", "#102 ", "#103 ", "#104 "] {
-            let row = line_of(n)
-                .and_then(|at| lines.get(at))
-                .copied()
-                .unwrap_or_default();
-            assert_eq!(author_at(row), header_author, "{n} misaligned:\n{rendered}");
+        assert_stack_aligned(&rendered);
+    }
+
+    #[test]
+    fn a_stack_stays_aligned_when_painted_and_linked() {
+        // Colour and OSC 8 add bytes and no cells to the PR column, which is
+        // exactly where the tree mark adds cells. Both have to be measured the
+        // same way or a stacked row shears only on a real terminal.
+        let rendered = stacked_board(painting());
+        assert!(rendered.contains("\u{1b}]8;;"), "links are on:\n{rendered}");
+        assert_stack_aligned(&rendered);
+
+        // The tree mark sits outside the link: what the link draws is the
+        // pull request's number and nothing else.
+        for n in STACKED_NUMBERS {
+            let linked = rendered
+                .lines()
+                .find(|line| line.contains(n))
+                .and_then(|row| row.split("\u{1b}]8;;").nth(1))
+                .and_then(|opened| opened.split_once("\u{1b}\\"))
+                .map(|(_url, text)| visible_width(text));
+            assert_eq!(linked, Some(n.len()), "{n} link text:\n{rendered}");
         }
     }
 }
