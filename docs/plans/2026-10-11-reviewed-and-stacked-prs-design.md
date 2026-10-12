@@ -48,6 +48,23 @@ Two failures, both found on a live repository with a three-PR stack:
 - **Nothing is dropped.** `Board::total()` still counts every pull request, and
   every pull request appears exactly once in exactly one tree.
 
+### Pull requests from forks (decided during implementation)
+
+Linking by branch name alone mis-links onto a pull request opened from a fork:
+a fork's `main`, aimed at `main` here, would have every pull request based on
+`main` drawn on top of it. Review caught this during implementation, and the
+user chose to read GitHub's `isCrossRepository`:
+
+- `PrFacts::head_repository: HeadRepository { ThisOne, Fork, Unstated }`,
+  converted from the wire's `isCrossRepository` (`false`, `true`, absent).
+- Only a `ThisOne` head can have something stacked on it. A fork can still sit
+  on a branch here, since its base is in this repository.
+- `Unstated` is treated as "not here": a missing edge is better than a wrong
+  one. The recorded fixtures predate the field, so every recorded pull request
+  is `Unstated`. They are not re-recorded, because the recorder keeps real pull
+  request numbers. The drift test lists the field in
+  `ASKED_FOR_AFTER_THE_RECORDING` until the next re-recording.
+
 ### Renderer (`prtrack-cli`, `render.rs`, `json.rs`)
 
 - A stacked row is indented under its parent with `└`, one step per level. Its
