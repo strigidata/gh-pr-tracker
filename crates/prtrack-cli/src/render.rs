@@ -115,35 +115,21 @@ impl BoardText<'_> {
             .into_iter()
             .chain(self.board.unclaimed().walk())
             .collect::<Vec<_>>();
-        lines.extend(self.section("NEED YOUR REVIEW", &review, "nothing waiting on you", true));
-        lines.push(String::new());
-        lines.extend(self.section(
-            "YOU REVIEWED",
-            &self.board.you_reviewed().walk(),
-            "none",
-            true,
-        ));
-        lines.push(String::new());
-        lines.extend(self.section("YOUR PRS", &self.board.yours().walk(), "nothing open", true));
-        lines.push(String::new());
-        // Directly under your open work, because it is the same question asked
-        // one step earlier: what have you got going, and what have you not
-        // asked for yet.
-        lines.extend(self.section(
-            "YOUR DRAFTS",
-            &self.board.your_drafts().walk(),
-            "none",
-            true,
-        ));
-        lines.push(String::new());
-        // No column header: nobody scans a draft they do not own for its CI.
-        lines.extend(self.section(
-            "OTHER DRAFTS",
-            &self.board.other_drafts().walk(),
-            "none",
-            false,
-        ));
-        lines.push(String::new());
+        let sections = [
+            self.section("NEED YOUR REVIEW", &review, true),
+            self.section("YOU REVIEWED", &self.board.you_reviewed().walk(), true),
+            self.section("YOUR PRS", &self.board.yours().walk(), true),
+            // Directly under your open work, because it is the same question
+            // asked one step earlier: what have you got going, and what have
+            // you not asked for yet.
+            self.section("YOUR DRAFTS", &self.board.your_drafts().walk(), true),
+            // No column header: nobody scans a draft they do not own for its CI.
+            self.section("OTHER DRAFTS", &self.board.other_drafts().walk(), false),
+        ];
+        for block in sections.into_iter().filter(|block| !block.is_empty()) {
+            lines.extend(block);
+            lines.push(String::new());
+        }
         lines.push(self.summary_line());
         lines.push(self.legend_line());
 
@@ -197,15 +183,13 @@ impl BoardText<'_> {
         )
     }
 
-    /// A heading, optionally a column header, and either rows or a note that
-    /// there are none.
-    fn section(
-        &self,
-        title: &str,
-        rows: &[Placed<'_>],
-        when_empty: &str,
-        with_columns: bool,
-    ) -> Vec<String> {
+    /// A heading, optionally a column header, and the rows — or nothing at all
+    /// when there are none: an empty section is noise, and the summary line
+    /// still counts every pull request.
+    fn section(&self, title: &str, rows: &[Placed<'_>], with_columns: bool) -> Vec<String> {
+        if rows.is_empty() {
+            return Vec::new();
+        }
         let mut lines = vec![format!(
             "{}{}",
             self.palette.paint(Style::Bold, title),
@@ -215,11 +199,7 @@ impl BoardText<'_> {
         if with_columns {
             lines.push(self.column_header());
         }
-        if rows.is_empty() {
-            lines.push(self.palette.paint(Style::Dim, &format!("  {when_empty}")));
-        } else {
-            lines.extend(rows.iter().map(|placed| self.row_line(placed.row())));
-        }
+        lines.extend(rows.iter().map(|placed| self.row_line(placed.row())));
         lines
     }
 
@@ -1539,28 +1519,38 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_section_says_it_is_empty_rather_than_vanishing() {
-        // A heading with nothing under it reads as a rendering failure. Naming
-        // the emptiness is the difference between "you have nothing open" and
-        // "the board broke".
-        let rendered = Login::parse("nobody-here").and_then(|me| {
-            Ok::<_, InvalidValue>(render(Vec::new(), &enforced_rule()?, &me, plain()))
-        });
-
-        for expected in [
-            "YOUR PRS  (0)",
-            "  nothing open",
-            "NEED YOUR REVIEW  (0)",
-            "  nothing waiting on you",
-            "OTHER DRAFTS  (0)",
+    fn a_section_with_nothing_in_it_is_not_printed() {
+        let rendered = Login::parse("octocat")
+            .and_then(|me| {
+                Ok::<_, InvalidValue>(render(
+                    vec![open_pr(101, "hubot")?],
+                    &PolicyRules::unprotected(),
+                    &me,
+                    plain(),
+                ))
+            })
+            .unwrap_or_default();
+        assert!(rendered.contains("NEED YOUR REVIEW  (1)"), "{rendered}");
+        for absent in [
+            "YOUR PRS",
+            "YOUR DRAFTS",
+            "OTHER DRAFTS",
+            "YOU REVIEWED",
+            "nothing open",
             "  none",
         ] {
-            assert_eq!(
-                rendered.as_ref().map(|text| text.contains(expected)),
-                Ok(true),
-                "the empty board must still say {expected:?}"
+            assert!(
+                !rendered.contains(absent),
+                "{absent:?} printed:\n{rendered}"
             );
         }
+        assert!(
+            !rendered.contains("\n\n\n"),
+            "no run of blank lines where a section was:\n{rendered}"
+        );
+        // The summary still tells an empty board from a failed read: the
+        // failure exits non-zero and never reaches here.
+        assert!(rendered.contains("1 open"), "{rendered}");
     }
 
     #[test]
