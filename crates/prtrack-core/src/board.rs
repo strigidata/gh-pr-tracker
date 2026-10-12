@@ -1,10 +1,11 @@
 //! Which section of the board a pull request belongs in, and where it sorts.
 
 use std::cmp::Reverse;
+use std::collections::HashMap;
 
 use crate::checks::{classify, Classified};
 use crate::decision::BlockedReason;
-use crate::facts::{DraftState, PrFacts};
+use crate::facts::{BranchName, DraftState, PrFacts};
 use crate::policy::PolicyRules;
 use crate::types::{Login, PrNumber};
 
@@ -474,13 +475,16 @@ impl Stacks {
 
 /// Every open pull request, grouped by what the viewer can do about it.
 ///
-/// Each group is a [`Stacks`]: its pull requests held as trees, so that one
-/// stacked on another can be drawn above it. A pull request stacked on nothing
-/// is a tree of one.
+/// Each group is a [`Stacks`]: every stack *rooted* there, held as a tree so
+/// that a pull request whose base is another's head is drawn above it. A pull
+/// request stacked on nothing is a tree of one. A stacked row is drawn in its
+/// root's section, not its own, so a stack is never split across the board;
+/// the counts ([`Board::awaiting_review`], [`Board::you_have_reviewed`]) still
+/// read where each row would sit on its own.
 ///
 /// # Nothing is dropped
 ///
-/// The six groups partition the input: every row goes in exactly one, and
+/// The six groups partition the input: every row is drawn in exactly one, and
 /// [`Board::total`] equals the number of rows handed in. Five of them are
 /// meant to be rendered. The sixth, [`Board::you_reviewed`], usually is
 /// not — but it is kept rather than discarded, because a pull request that
@@ -519,14 +523,23 @@ impl Board {
     /// [`Login`]: crate::Login
     #[must_use]
     pub fn assemble(rows: Vec<BoardRow>, viewer: &Login) -> Self {
+        let parents = parents(&rows);
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); rows.len()];
+        for (child, parent) in parents.iter().enumerate() {
+            if let Some(below) = parent.and_then(|parent| children.get_mut(parent)) {
+                below.push(child);
+            }
+        }
+        let mut slots: Vec<Option<BoardRow>> = rows.into_iter().map(Some).collect();
+
         let mut board = Self::default();
-        for row in rows {
-            let own = Section::of(&row.facts, viewer);
-            board.group_mut(own).0.push(Stack {
-                row,
-                own,
-                above: Vec::new(),
-            });
+        for (root, parent) in parents.iter().enumerate() {
+            if parent.is_some() {
+                continue;
+            }
+            if let Some(stack) = grow(root, &mut slots, &children, viewer) {
+                board.group_mut(stack.own).0.push(stack);
+            }
         }
         board.sort();
         board
@@ -647,8 +660,12 @@ impl Board {
         &self.unclaimed
     }
 
-    /// Somebody else's pull requests the viewer has already approved or asked
-    /// changes on, ordered by number.
+    /// Stacks rooted on somebody else's pull request the viewer has already
+    /// approved or asked changes on, ordered by number.
+    ///
+    /// A row stacked on such a pull request is drawn here with it, whether or
+    /// not the viewer has reviewed that row too; [`Board::you_have_reviewed`]
+    /// and [`Board::awaiting_review`] count each row where it would sit alone.
     ///
     /// GitHub removes a reviewer from the request list the moment they submit,
     /// so without checking who has reviewed, work the viewer approved would be
@@ -697,6 +714,71 @@ impl Board {
     pub fn total(&self) -> usize {
         self.walk().count()
     }
+}
+
+/// The pull request each row is stacked on, by index, or `None` for a root.
+///
+/// A row sits on the one open pull request whose head is its base. None, more
+/// than one, or itself all make it a root: guessing between two branches that
+/// share a name would draw a stack that does not exist. Any row whose chain of
+/// bases loops back to itself is a root too, so building the trees ends.
+fn parents(rows: &[BoardRow]) -> Vec<Option<usize>> {
+    let mut by_head: HashMap<&BranchName, Vec<usize>> = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        by_head.entry(&row.facts.head_ref).or_default().push(index);
+    }
+    let mut parents: Vec<Option<usize>> = rows
+        .iter()
+        .enumerate()
+        .map(
+            |(index, row)| match by_head.get(&row.facts.base_ref).map(Vec::as_slice) {
+                Some(&[only]) if only != index => Some(only),
+                Some(_) | None => None,
+            },
+        )
+        .collect();
+
+    let looping: Vec<bool> = (0..parents.len())
+        .map(|start| {
+            let mut at = parents.get(start).copied().flatten();
+            for _ in 0..parents.len() {
+                match at {
+                    Some(next) if next == start => return true,
+                    Some(next) => at = parents.get(next).copied().flatten(),
+                    None => return false,
+                }
+            }
+            false
+        })
+        .collect();
+    for (parent, looped) in parents.iter_mut().zip(looping) {
+        if looped {
+            *parent = None;
+        }
+    }
+    parents
+}
+
+/// The tree rooted at `at`, taking each row out of `slots` as it is placed.
+fn grow(
+    at: usize,
+    slots: &mut [Option<BoardRow>],
+    children: &[Vec<usize>],
+    viewer: &Login,
+) -> Option<Stack> {
+    let row = slots.get_mut(at)?.take()?;
+    let mut above: Vec<Stack> = children
+        .get(at)
+        .into_iter()
+        .flatten()
+        .filter_map(|&child| grow(child, slots, children, viewer))
+        .collect();
+    above.sort_by_key(|stack| stack.row.facts.number.get());
+    Some(Stack {
+        own: Section::of(&row.facts, viewer),
+        row,
+        above,
+    })
 }
 
 #[cfg(test)]
@@ -750,9 +832,37 @@ mod tests {
         })
     }
 
+    /// `open_pr`, on `head` and aimed at `base`.
+    fn on_branch(
+        number: u32,
+        author: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<PrFacts, InvalidValue> {
+        let mut pr = open_pr(number, author)?;
+        pr.head_ref = BranchName::new(head);
+        pr.base_ref = BranchName::new(base);
+        Ok(pr)
+    }
+
     /// The pull request numbers a section holds, in the order it holds them.
     fn numbers(group: &Stacks) -> Vec<u32> {
         group.rows().map(|row| row.facts().number.get()).collect()
+    }
+
+    /// Every row as (number, depth, stacked on), in drawing order.
+    fn shape(group: &Stacks) -> Vec<(u32, usize, Option<u32>)> {
+        group
+            .walk()
+            .into_iter()
+            .map(|at| {
+                (
+                    at.row().facts().number.get(),
+                    at.depth(),
+                    at.stacked_on().map(PrNumber::get),
+                )
+            })
+            .collect()
     }
 
     /// Reduces every pull request against the same rule and arranges the board.
@@ -813,6 +923,133 @@ mod tests {
             )
         });
         assert_eq!(placed, Ok(vec![(101, 0, None)]));
+    }
+
+    #[test]
+    fn a_stack_is_one_tree_in_order_from_the_bottom() {
+        // Handed in top first, so the order is the board's work, not the input's.
+        let drawn = Login::parse("octocat").and_then(|me| {
+            let board = board_for(
+                vec![
+                    on_branch(103, "hubot", "stack/three", "stack/two")?,
+                    on_branch(101, "hubot", "stack/one", "main")?,
+                    on_branch(102, "hubot", "stack/two", "stack/one")?,
+                ],
+                &me,
+            );
+            Ok::<_, InvalidValue>(shape(board.unclaimed()))
+        });
+        assert_eq!(
+            drawn,
+            Ok(vec![
+                (101, 0, None),
+                (102, 1, Some(101)),
+                (103, 2, Some(102))
+            ])
+        );
+    }
+
+    #[test]
+    fn a_base_that_cannot_be_named_with_certainty_makes_a_root() {
+        // A merged base, two open pull requests sharing a head, and a loop: in
+        // each the honest answer is "this sits on nothing we can show".
+        let cases = [
+            ("base already merged", vec![(102, "stack/two", "stack/one")]),
+            (
+                "two pull requests share the base's name",
+                vec![
+                    (101, "stack/one", "main"),
+                    (104, "stack/one", "main"),
+                    (102, "stack/two", "stack/one"),
+                ],
+            ),
+            (
+                "a loop",
+                vec![
+                    (101, "stack/one", "stack/two"),
+                    (102, "stack/two", "stack/one"),
+                ],
+            ),
+        ];
+        for (what, prs) in cases {
+            let drawn = Login::parse("octocat").and_then(|me| {
+                let built = prs
+                    .iter()
+                    .map(|&(n, head, base)| on_branch(n, "hubot", head, base))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let board = board_for(built, &me);
+                Ok::<_, InvalidValue>(shape(board.unclaimed()))
+            });
+            // Every row present *and* a root. Asking only that the rows found
+            // are roots passes when a loop drops them all, because no row in a
+            // loop is a root to grow a tree from.
+            let mut roots: Vec<(u32, usize, Option<u32>)> =
+                prs.iter().map(|&(n, _, _)| (n, 0, None)).collect();
+            roots.sort_unstable();
+            assert_eq!(drawn, Ok(roots), "{what}: every row must be a root");
+        }
+    }
+
+    #[test]
+    fn a_stack_is_drawn_in_its_roots_section_and_counted_where_each_row_belongs() {
+        // The bottom was reviewed by the viewer; the two above it were not.
+        let placed = Login::parse("octocat").and_then(|me| {
+            let mut bottom = on_branch(101, "hubot", "stack/one", "main")?;
+            bottom.reviewed_by = vec![me.clone()];
+            let board = board_for(
+                vec![
+                    bottom,
+                    on_branch(102, "hubot", "stack/two", "stack/one")?,
+                    on_branch(103, "hubot", "stack/three", "stack/two")?,
+                ],
+                &me,
+            );
+            Ok::<_, InvalidValue>((
+                numbers(board.you_reviewed()),
+                numbers(board.unclaimed()),
+                board.you_have_reviewed(),
+                board.awaiting_review().count(),
+                board.total(),
+            ))
+        });
+        assert_eq!(placed, Ok((vec![101, 102, 103], vec![], 1, 2, 3)));
+    }
+
+    #[test]
+    fn a_draft_at_the_bottom_takes_its_stack_with_it() {
+        let placed = Login::parse("octocat").and_then(|me| {
+            let mut bottom = on_branch(101, "hubot", "stack/one", "main")?;
+            bottom.draft_state = DraftState::Draft;
+            let board = board_for(
+                vec![bottom, on_branch(102, "hubot", "stack/two", "stack/one")?],
+                &me,
+            );
+            Ok::<_, InvalidValue>((numbers(board.other_drafts()), numbers(board.unclaimed())))
+        });
+        assert_eq!(placed, Ok((vec![101, 102], vec![])));
+    }
+
+    #[test]
+    fn two_branches_cut_from_one_are_siblings_by_number() {
+        let drawn = Login::parse("octocat").and_then(|me| {
+            let board = board_for(
+                vec![
+                    on_branch(105, "hubot", "stack/b", "stack/one")?,
+                    on_branch(101, "hubot", "stack/one", "main")?,
+                    on_branch(103, "hubot", "stack/a", "stack/one")?,
+                ],
+                &me,
+            );
+            Ok::<_, InvalidValue>(shape(board.unclaimed()))
+        });
+        assert_eq!(
+            drawn,
+            Ok(vec![
+                (101, 0, None),
+                (103, 1, Some(101)),
+                (105, 1, Some(101))
+            ])
+        );
     }
 
     #[test]
