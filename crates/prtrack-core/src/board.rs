@@ -485,12 +485,11 @@ impl Stacks {
 /// # Nothing is dropped
 ///
 /// The six groups partition the input: every row is drawn in exactly one, and
-/// [`Board::total`] equals the number of rows handed in. Five of them are
-/// meant to be rendered. The sixth, [`Board::you_reviewed`], usually is
-/// not — but it is kept rather than discarded, because a pull request that
-/// quietly stopped existing is the failure this crate is built to prevent, and
-/// a board that can only report "37 open" while showing nine of them has to get
-/// that number from somewhere honest.
+/// [`Board::total`] equals the number of rows handed in. All six are rendered,
+/// [`Board::you_reviewed`] included, and none is a bin for rows that fit
+/// nowhere else: a pull request that quietly stopped existing is the failure
+/// this crate is built to prevent, and a board that reports "37 open" has to
+/// get that number from the rows it actually holds.
 ///
 /// # A team request cannot find the viewer
 ///
@@ -721,7 +720,9 @@ impl Board {
 /// A row sits on the one open pull request whose head is its base. None, more
 /// than one, or itself all make it a root: guessing between two branches that
 /// share a name would draw a stack that does not exist. Any row whose chain of
-/// bases loops back to itself is a root too, so building the trees ends.
+/// bases loops back to itself is a root too, so building the trees ends. A
+/// pull request aimed at its own branch is a loop of one and is cut with the
+/// rest; this is the only place that protection lives.
 fn parents(rows: &[BoardRow]) -> Vec<Option<usize>> {
     let mut by_head: HashMap<&BranchName, Vec<usize>> = HashMap::new();
     for (index, row) in rows.iter().enumerate() {
@@ -729,10 +730,9 @@ fn parents(rows: &[BoardRow]) -> Vec<Option<usize>> {
     }
     let mut parents: Vec<Option<usize>> = rows
         .iter()
-        .enumerate()
         .map(
-            |(index, row)| match by_head.get(&row.facts.base_ref).map(Vec::as_slice) {
-                Some(&[only]) if only != index => Some(only),
+            |row| match by_head.get(&row.facts.base_ref).map(Vec::as_slice) {
+                Some(&[only]) => Some(only),
                 Some(_) | None => None,
             },
         )
@@ -951,10 +951,14 @@ mod tests {
 
     #[test]
     fn a_base_that_cannot_be_named_with_certainty_makes_a_root() {
-        // A merged base, two open pull requests sharing a head, and a loop: in
-        // each the honest answer is "this sits on nothing we can show".
+        // A merged base, two open pull requests sharing a head, and two loops:
+        // in each the honest answer is "this sits on nothing we can show".
         let cases = [
             ("base already merged", vec![(102, "stack/two", "stack/one")]),
+            (
+                "aimed at its own branch",
+                vec![(101, "stack/one", "stack/one")],
+            ),
             (
                 "two pull requests share the base's name",
                 vec![
@@ -1458,7 +1462,7 @@ mod tests {
                 numbers(board.other_drafts()),
                 // Unclaimed, not `you_reviewed`: nobody asked the viewer
                 // about these and the viewer has not reviewed them, so they are
-                // the group that gets rendered.
+                // the group somebody could usefully pick up.
                 numbers(board.unclaimed()),
                 board.total(),
             ))
