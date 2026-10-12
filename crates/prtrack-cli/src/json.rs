@@ -11,7 +11,7 @@
 
 use prtrack_core::{
     BlockedReason, BlockingChecks, Board, BoardRow, DraftState, Login, MergeState, MergeableState,
-    PolicyRules, Requirement, ReviewDecision, Reviewer,
+    PolicyRules, Requirement, ReviewDecision, Reviewer, Stacks,
 };
 use serde_json::{json, Map, Value};
 
@@ -103,8 +103,8 @@ impl BoardJson<'_> {
     /// membership — which is what lets a diff catch a sort divergence without
     /// comparing sort keys at all.
     fn sections(&self) -> Value {
-        fn listed(rows: &[BoardRow], section: &str) -> Vec<Value> {
-            rows.iter()
+        fn listed(rows: &Stacks, section: &str) -> Vec<Value> {
+            rows.rows()
                 .map(|row| json!({ "n": row.facts().number.get(), "section": section }))
                 .collect()
         }

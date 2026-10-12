@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use chrono::{DateTime, Utc};
 use prtrack_core::{
     BlockedReason, BlockingChecks, Board, BoardRow, DraftState, Login, MergeState, MergeableState,
-    PolicyRules, Requirement, Reviewability, Reviewer, StaleReviewHandling,
+    Placed, PolicyRules, Requirement, Reviewability, Reviewer, StaleReviewHandling,
 };
 
 use crate::color::{Palette, Style};
@@ -109,24 +109,34 @@ impl BoardText<'_> {
         // request looks exactly like an unclaimed one unless who-has-reviewed
         // is checked — and asking you to review your own approval is the
         // clearest way to teach somebody to stop reading the section.
-        let review: Vec<BoardRow> = self
+        let review = self
             .board
             .needs_your_review()
-            .iter()
-            .chain(self.board.unclaimed())
-            .cloned()
-            .collect();
+            .walk()
+            .into_iter()
+            .chain(self.board.unclaimed().walk())
+            .collect::<Vec<_>>();
         lines.extend(self.section("NEED YOUR REVIEW", &review, "nothing waiting on you", true));
         lines.push(String::new());
-        lines.extend(self.section("YOUR PRS", self.board.yours(), "nothing open", true));
+        lines.extend(self.section("YOUR PRS", &self.board.yours().walk(), "nothing open", true));
         lines.push(String::new());
         // Directly under your open work, because it is the same question asked
         // one step earlier: what have you got going, and what have you not
         // asked for yet.
-        lines.extend(self.section("YOUR DRAFTS", self.board.your_drafts(), "none", true));
+        lines.extend(self.section(
+            "YOUR DRAFTS",
+            &self.board.your_drafts().walk(),
+            "none",
+            true,
+        ));
         lines.push(String::new());
         // No column header: nobody scans a draft they do not own for its CI.
-        lines.extend(self.section("OTHER DRAFTS", self.board.other_drafts(), "none", false));
+        lines.extend(self.section(
+            "OTHER DRAFTS",
+            &self.board.other_drafts().walk(),
+            "none",
+            false,
+        ));
         lines.push(String::new());
         lines.push(self.summary_line());
         lines.push(self.legend_line());
@@ -186,7 +196,7 @@ impl BoardText<'_> {
     fn section(
         &self,
         title: &str,
-        rows: &[BoardRow],
+        rows: &[Placed<'_>],
         when_empty: &str,
         with_columns: bool,
     ) -> Vec<String> {
@@ -202,7 +212,7 @@ impl BoardText<'_> {
         if rows.is_empty() {
             lines.push(self.palette.paint(Style::Dim, &format!("  {when_empty}")));
         } else {
-            lines.extend(rows.iter().map(|row| self.row_line(row)));
+            lines.extend(rows.iter().map(|placed| self.row_line(placed.row())));
         }
         lines
     }
@@ -324,16 +334,7 @@ impl BoardText<'_> {
 
     /// The tallies under the board.
     fn summary_line(&self) -> String {
-        let every_row = || {
-            self.board
-                .yours()
-                .iter()
-                .chain(self.board.needs_your_review())
-                .chain(self.board.your_drafts())
-                .chain(self.board.other_drafts())
-                .chain(self.board.unclaimed())
-                .chain(self.board.you_reviewed())
-        };
+        let every_row = || self.board.walk().map(|placed| placed.row());
         let ready = every_row()
             .filter(|row| matches!(row.reason(), BlockedReason::ReadyToMerge))
             .count();
@@ -347,9 +348,7 @@ impl BoardText<'_> {
         // includes the unclaimed rows appended to it.
         let reviewable = self
             .board
-            .needs_your_review()
-            .iter()
-            .chain(self.board.unclaimed())
+            .awaiting_review()
             .filter(|row| row.reviewability() < Reviewability::CiRunning)
             .count();
 
@@ -363,7 +362,7 @@ impl BoardText<'_> {
                 "{} open | {} you have reviewed | {ready} ready to merge | \
                  {conflicting} conflicting | {reviewable} reviewable now",
                 self.board.total(),
-                self.board.you_reviewed().len(),
+                self.board.you_have_reviewed(),
             ),
         )
     }

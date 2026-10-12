@@ -55,7 +55,7 @@ mod nudge;
 mod policy;
 mod types;
 
-pub use board::{ActionUrgency, Board, BoardRow, Reviewability};
+pub use board::{ActionUrgency, Board, BoardRow, Placed, Reviewability, Stack, Stacks};
 pub use checks::{classify, Check, CheckState, Classified};
 pub use decision::{BlockedReason, FailingCheckCount, NonEmpty, UnresolvedThreadCount};
 pub use facts::{
