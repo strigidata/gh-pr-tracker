@@ -5,26 +5,29 @@ never does: **why each one cannot merge yet** — and interrupts you when that
 answer changes.
 
 ```
-prtrack 0.1.2 | policy on main: 4 required checks | 1 approval(s) | threads must be resolved
+prtrack 0.1.8 | policy on main: 2 required checks | 1 approval(s) | threads must be resolved
 
-YOUR PRS  (15)
-PR     AUTHOR      CI          OPEN.CMT MERGE      WHY IT CANNOT MERGE          SINCE PUSH
-#3449  octocat     ! 2 adv     0.19     CONFLICT   approved - REBASE NEEDED     22d
-#4429  octocat     ! 1 adv     0.11     CONFLICT   conflicting - rebase first   3h
-#4349  octocat     ~ 1/42 run  0.11     -          CI running                   1h
-#4445  octocat     ok 53/53    0.5      clean      review: hubot +2             3h
+NEED YOUR REVIEW  (1)
+PR         AUTHOR        CI             OPEN.CMT MERGE      WHY IT CANNOT MERGE                     SINCE PUSH BRANCH
+#104       monalisa      no checks      0.0      clean      NOBODY ASSIGNED                         0m         fix/rounding
 
-NEED YOUR REVIEW  (9)
-#4225  octofix     ! 1 adv     0.2      clean      review: octocat +2           6d
-#4323  monalisa    ok 34/34    0.11     clean      review: octocat +2           1h
-#4324  monalisa    x 3         0.10     -          required check failing       1h
+YOU REVIEWED  (3)
+PR         AUTHOR        CI             OPEN.CMT MERGE      WHY IT CANNOT MERGE                     SINCE PUSH BRANCH
+#101       hubot         no checks      0.0      CONFLICT   changes requested by octocat            0m         stack/catalog
+└ #102     hubot         no checks      0.0      clean      NOBODY ASSIGNED                         0m         stack/listing
+  └ #103   hubot         no checks      0.0      clean      NOBODY ASSIGNED                         0m         stack/credentials
 
-35 open | 0 ready to merge | 7 conflicting | 5 reviewable now
+YOUR PRS  (1)
+PR         AUTHOR        CI             OPEN.CMT MERGE      WHY IT CANNOT MERGE                     SINCE PUSH BRANCH
+#105       octocat       no checks      0.0      clean      NOBODY ASSIGNED                         0m         feat/export
+
+5 open | 1 you have reviewed | 0 ready to merge | 1 conflicting | 3 reviewable now
 ```
 
-`#3449` has been approved and conflicting for twenty-two days. `#4225` has been
-waiting for a review for six. Neither shows up as urgent anywhere in GitHub's
-interface, and both are somebody else's work blocked on you.
+`#101` conflicts with `main` and is waiting on its author, and `#102` and `#103`
+are stacked on it, so the whole stack is drawn under it rather than scattered.
+A pull request you have already reviewed stays on the board under `YOU
+REVIEWED`. A section with nothing in it is not printed.
 
 ## Install
 
