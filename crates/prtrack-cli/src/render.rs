@@ -104,11 +104,10 @@ impl BoardText<'_> {
         // shows up nowhere else. No sub-heading, because each row's reason
         // already says `NOBODY ASSIGNED` or names whoever *was* asked.
         //
-        // Anything you have already reviewed is *not* here. GitHub drops you
-        // from the request list the moment you submit, so an approved pull
-        // request looks exactly like an unclaimed one unless who-has-reviewed
-        // is checked — and asking you to review your own approval is the
-        // clearest way to teach somebody to stop reading the section.
+        // What you have already reviewed has a section of its own rather than
+        // a line in the review list: asking you to review your own approval is
+        // the fastest way to teach somebody to stop reading that list, and
+        // hiding it lost the pull requests that went bad after you approved.
         let review = self
             .board
             .needs_your_review()
@@ -117,6 +116,13 @@ impl BoardText<'_> {
             .chain(self.board.unclaimed().walk())
             .collect::<Vec<_>>();
         lines.extend(self.section("NEED YOUR REVIEW", &review, "nothing waiting on you", true));
+        lines.push(String::new());
+        lines.extend(self.section(
+            "YOU REVIEWED",
+            &self.board.you_reviewed().walk(),
+            "none",
+            true,
+        ));
         lines.push(String::new());
         lines.extend(self.section("YOUR PRS", &self.board.yours().walk(), "nothing open", true));
         lines.push(String::new());
@@ -1646,5 +1652,28 @@ mod tests {
                 crate::update::running()
             ))
         );
+    }
+
+    #[test]
+    fn a_pull_request_you_reviewed_stays_on_the_board_with_its_blocker() {
+        let rendered = Login::parse("octocat")
+            .and_then(|me| {
+                let mut reviewed = open_pr(101, "hubot")?;
+                reviewed.reviewed_by = vec![me.clone()];
+                reviewed.mergeable = MergeableState::Conflicting;
+                Ok(render(
+                    vec![reviewed],
+                    &PolicyRules::unprotected(),
+                    &me,
+                    plain(),
+                ))
+            })
+            .unwrap_or_default();
+        assert!(rendered.contains("YOU REVIEWED  (1)"), "{rendered}");
+        let row = rendered
+            .lines()
+            .find(|line| line.starts_with("#101 "))
+            .unwrap_or_default();
+        assert!(row.contains("CONFLICT"), "{rendered}");
     }
 }
