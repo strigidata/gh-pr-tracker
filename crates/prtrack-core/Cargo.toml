@@ -1,6 +1,6 @@
 [package]
 name = "prtrack-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pure domain model for prtrack: the facts about a pull request, the policy that governs it, and the decision about why it cannot merge. Performs no IO."
 edition.workspace = true
 license.workspace = true
