@@ -438,6 +438,23 @@ impl From<bool> for DraftState {
     }
 }
 
+/// Where a pull request's head branch lives.
+///
+/// A branch name alone does not say which repository it is in. A pull request
+/// opened from a fork very often has a head called `main`, and read by name
+/// alone every pull request aimed at `main` here would look stacked on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadRepository {
+    /// This repository: another pull request can be based on its branch.
+    ThisOne,
+    /// Another repository, almost always a fork. Its branch name says
+    /// nothing about any branch here, however alike they look.
+    Fork,
+    /// GitHub did not say. Treated as "not here" wherever it matters, since
+    /// a stack drawn onto a branch that may not exist is a wrong cell.
+    Unstated,
+}
+
 /// Where GitHub's own review requirements stand on a pull request.
 ///
 /// This is `reviewDecision`, GitHub's summary of the review state *after* it
@@ -818,6 +835,14 @@ pub struct PrFacts {
     /// and the thing a reader copies rather than retypes.
     pub head_ref: BranchName,
 
+    /// Which repository [`head_ref`] is a branch of.
+    ///
+    /// Only a head in this repository can be the base of another pull request
+    /// here, so only such a pull request can have a stack drawn on top of it.
+    ///
+    /// [`head_ref`]: PrFacts::head_ref
+    pub head_repository: HeadRepository,
+
     /// The branch it wants to merge into.
     ///
     /// Read to decide *which* [`PolicyRules`] apply. A rule protects a pattern
@@ -933,8 +958,8 @@ pub struct PrFacts {
 #[cfg(test)]
 mod tests {
     use super::{
-        BranchName, DraftState, MergeState, MergeableState, PrFacts, PrTitle, PrUrl,
-        ReviewDecision, Reviewer, TeamSlug,
+        BranchName, DraftState, HeadRepository, MergeState, MergeableState, PrFacts, PrTitle,
+        PrUrl, ReviewDecision, Reviewer, TeamSlug,
     };
     use crate::checks::{classify, Check, CheckState};
     use crate::policy::{BlockingChecks, PolicyRules, Requirement};
@@ -1016,6 +1041,7 @@ mod tests {
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse("9f2c4e1b7a3d5068c9e4b2a17f36d8095c1e4a7b")?,
             head_ref: BranchName::new("topic/branch-01"),
+            head_repository: HeadRepository::ThisOne,
             base_ref: BranchName::new("main"),
             review_decision: Some(ReviewDecision::Approved),
             mergeable: MergeableState::Conflicting,

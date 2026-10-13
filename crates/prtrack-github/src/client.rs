@@ -1559,6 +1559,15 @@ mod tests {
     /// lose that request entirely.
     const REQUESTED_BUT_NEVER_RETURNED: [&str; 1] = ["slug"];
 
+    /// A field the query asks for that was added after the recordings were made.
+    ///
+    /// Not the same claim as [`REQUESTED_BUT_NEVER_RETURNED`]: GitHub always
+    /// returns `isCrossRepository`, and these recordings lack it only because
+    /// they predate the selection. They are not re-recorded because the
+    /// recorder keeps real pull request numbers. Remove the entry when the
+    /// fixtures are next re-recorded.
+    const ASKED_FOR_AFTER_THE_RECORDING: [&str; 1] = ["isCrossRepository"];
+
     #[test]
     fn the_query_asks_for_every_field_the_recording_contains() {
         // Without this the document is verified by nothing: the fixtures are
@@ -1584,6 +1593,7 @@ mod tests {
             .into_iter()
             .filter(|name| !recorded.contains(name))
             .filter(|name| !REQUESTED_BUT_NEVER_RETURNED.contains(&name.as_str()))
+            .filter(|name| !ASKED_FOR_AFTER_THE_RECORDING.contains(&name.as_str()))
             .collect();
         assert!(
             unexplained.is_empty(),

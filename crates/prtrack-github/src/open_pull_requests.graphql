@@ -71,6 +71,7 @@ query OpenPullRequests($owner: String!, $name: String!, $first: Int!, $after: St
         createdAt
         headRefOid
         headRefName
+        isCrossRepository
         baseRefName
         author {
           login

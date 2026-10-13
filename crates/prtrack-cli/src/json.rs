@@ -9,9 +9,11 @@
 //! here can see, so the list is pinned by a test rather than left to whatever
 //! the emitter happens to write.
 
+use std::collections::HashMap;
+
 use prtrack_core::{
     BlockedReason, BlockingChecks, Board, BoardRow, DraftState, Login, MergeState, MergeableState,
-    PolicyRules, Requirement, ReviewDecision, Reviewer,
+    PolicyRules, Requirement, ReviewDecision, Reviewer, Stacks,
 };
 use serde_json::{json, Map, Value};
 
@@ -58,12 +60,22 @@ impl BoardJson<'_> {
         // content rather than on the order GitHub happened to return.
         pull_requests.sort_by_key(|(row, _)| row.facts().number.get());
 
+        // The board decided which pull request sits on which; this only reads
+        // the answer back, so the link cannot disagree with what is drawn.
+        let stacked_on: HashMap<u32, u32> = self
+            .board
+            .walk()
+            .filter_map(|at| Some((at.row().facts().number.get(), at.stacked_on()?.get())))
+            .collect();
+
         json!({
             "policy": self.policy(),
             "sections": self.sections(),
             "prs": pull_requests
                 .into_iter()
-                .map(|(row, rules)| pull_request(row, rules))
+                .map(|(row, rules)| {
+                    pull_request(row, rules, stacked_on.get(&row.facts().number.get()).copied())
+                })
                 .collect::<Vec<_>>(),
         })
     }
@@ -103,8 +115,8 @@ impl BoardJson<'_> {
     /// membership — which is what lets a diff catch a sort divergence without
     /// comparing sort keys at all.
     fn sections(&self) -> Value {
-        fn listed(rows: &[BoardRow], section: &str) -> Vec<Value> {
-            rows.iter()
+        fn listed(rows: &Stacks, section: &str) -> Vec<Value> {
+            rows.rows()
                 .map(|row| json!({ "n": row.facts().number.get(), "section": section }))
                 .collect()
         }
@@ -119,13 +131,16 @@ impl BoardJson<'_> {
             // what was asked of somebody must not be handed what was not.
             "unclaimed": listed(self.board.unclaimed(), "unclaimed"),
             "drafts": listed(self.board.other_drafts(), "drafts"),
-            "neither": listed(self.board.not_waiting_on_you(), "neither"),
+            "neither": listed(self.board.you_reviewed(), "neither"),
         })
     }
 }
 
 /// One pull request, with everything the diff compares.
-fn pull_request(row: &BoardRow, rules: &PolicyRules) -> Value {
+///
+/// `stacked_on` is the pull request directly beneath it on the board, or
+/// `None` for one at the root of its stack, which goes out as `null`.
+fn pull_request(row: &BoardRow, rules: &PolicyRules, stacked_on: Option<u32>) -> Value {
     let facts = row.facts();
     let checks = row.checks();
 
@@ -188,6 +203,7 @@ fn pull_request(row: &BoardRow, rules: &PolicyRules) -> Value {
     fields.insert("unnamed".to_owned(), json!(unnamed));
     fields.insert("changes_requested_by".to_owned(), json!(blockers));
     fields.insert("blocked".to_owned(), json!(plain_reason(row.reason())));
+    fields.insert("stacked_on".to_owned(), json!(stacked_on));
     Value::Object(fields)
 }
 
@@ -251,9 +267,9 @@ mod tests {
     use chrono::{DateTime, TimeDelta, Utc};
     use prtrack_core::{
         BlockingChecks, Board, BoardRow, BranchName, Check, CheckName, CheckState, DraftState,
-        HeadSha, InvalidValue, Login, MergeState, MergeableState, PolicyRules, PrFacts, PrNumber,
-        PrTitle, PrUrl, RepoRef, Requirement, ReviewDecision, Reviewer, StaleReviewHandling,
-        TeamSlug,
+        HeadRepository, HeadSha, InvalidValue, Login, MergeState, MergeableState, PolicyRules,
+        PrFacts, PrNumber, PrTitle, PrUrl, RepoRef, Requirement, ReviewDecision, Reviewer,
+        StaleReviewHandling, TeamSlug,
     };
     use serde_json::{json, Value};
 
@@ -282,6 +298,7 @@ mod tests {
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse(SOME_SHA)?,
             head_ref: BranchName::new("topic/branch-01"),
+            head_repository: HeadRepository::ThisOne,
             base_ref: BranchName::new("main"),
             review_decision: None,
             mergeable: MergeableState::Mergeable,
@@ -453,6 +470,7 @@ mod tests {
                 "unnamed": 0,
                 "changes_requested_by": ["alpha", "zeta"],
                 "blocked": "changes requested by zeta, alpha",
+                "stacked_on": null,
             })),
             "changes_requested_by is sorted for the diff; the sentence keeps the reported order"
         );
@@ -608,12 +626,38 @@ mod tests {
     }
 
     #[test]
+    fn a_stacked_pull_request_names_the_one_beneath_it() {
+        // Handed over top-first, so a projection that read the link off the
+        // input order rather than the board would get it backwards.
+        let document = Login::parse("octocat").and_then(|me| {
+            let mut bottom = open_pr(101, "hubot")?;
+            bottom.head_ref = BranchName::new("stack/one");
+            let mut top = open_pr(102, "hubot")?;
+            top.head_ref = BranchName::new("stack/two");
+            top.base_ref = BranchName::new("stack/one");
+            Ok(project(vec![top, bottom], &PolicyRules::unprotected(), &me))
+        });
+
+        let stacked_on = |n: u64| {
+            document.as_ref().map(|value| {
+                node(value, "/prs")
+                    .as_array()
+                    .and_then(|prs| prs.iter().find(|pr| node(pr, "/n").as_u64() == Some(n)))
+                    .map(|pr| pr.get("stacked_on").cloned())
+            })
+        };
+
+        assert_eq!(stacked_on(101), Ok(Some(Some(Value::Null))));
+        assert_eq!(stacked_on(102), Ok(Some(Some(json!(101)))));
+    }
+
+    #[test]
     fn the_document_carries_exactly_the_keys_it_promises() {
         // The key set is a contract with whatever reads `--format json`, so
         // adding or dropping one is a breaking change to a script nobody here
         // can see. Pinned as a list rather than derived, so a change has to be
         // typed on purpose.
-        const PR_KEYS: [&str; 17] = [
+        const PR_KEYS: [&str; 18] = [
             "author",
             "blocked",
             "changes_requested_by",
@@ -628,6 +672,7 @@ mod tests {
             "requested",
             "review_decision",
             "running",
+            "stacked_on",
             "total",
             "unnamed",
             "unresolved_threads",

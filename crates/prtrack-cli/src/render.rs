@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use chrono::{DateTime, Utc};
 use prtrack_core::{
     BlockedReason, BlockingChecks, Board, BoardRow, DraftState, Login, MergeState, MergeableState,
-    PolicyRules, Requirement, Reviewability, Reviewer, StaleReviewHandling,
+    Placed, PolicyRules, Requirement, Reviewability, Reviewer, StaleReviewHandling,
 };
 
 use crate::color::{Palette, Style};
@@ -29,6 +29,10 @@ const MERGE_COLUMN: usize = 11;
 const REASON_COLUMN: usize = 40;
 /// Only padded when something follows it. As the last column it needs no width.
 const SINCE_PUSH_COLUMN: usize = 11;
+
+/// How many cells each level of stacking adds to the PR column: the indent
+/// that pushes a stacked row's number out from under the one it sits on.
+const TREE_STEP: usize = 2;
 
 /// How much of a login is shown. One cell short of its column, so the longest
 /// login still leaves a space before the next value.
@@ -104,36 +108,67 @@ impl BoardText<'_> {
         // shows up nowhere else. No sub-heading, because each row's reason
         // already says `NOBODY ASSIGNED` or names whoever *was* asked.
         //
-        // Anything you have already reviewed is *not* here. GitHub drops you
-        // from the request list the moment you submit, so an approved pull
-        // request looks exactly like an unclaimed one unless who-has-reviewed
-        // is checked — and asking you to review your own approval is the
-        // clearest way to teach somebody to stop reading the section.
-        let review: Vec<BoardRow> = self
+        // What you have already reviewed has a section of its own rather than
+        // a line in the review list: asking you to review your own approval is
+        // the fastest way to teach somebody to stop reading that list, and
+        // hiding it lost the pull requests that went bad after you approved.
+        // One width for every section, so a stack in one section does not leave
+        // the columns of the next a few cells to the left of it.
+        let pr_column = PR_COLUMN + self.tree_width();
+        let review = self
             .board
             .needs_your_review()
-            .iter()
-            .chain(self.board.unclaimed())
-            .cloned()
-            .collect();
-        lines.extend(self.section("NEED YOUR REVIEW", &review, "nothing waiting on you", true));
-        lines.push(String::new());
-        lines.extend(self.section("YOUR PRS", self.board.yours(), "nothing open", true));
-        lines.push(String::new());
-        // Directly under your open work, because it is the same question asked
-        // one step earlier: what have you got going, and what have you not
-        // asked for yet.
-        lines.extend(self.section("YOUR DRAFTS", self.board.your_drafts(), "none", true));
-        lines.push(String::new());
-        // No column header: nobody scans a draft they do not own for its CI.
-        lines.extend(self.section("OTHER DRAFTS", self.board.other_drafts(), "none", false));
-        lines.push(String::new());
+            .walk()
+            .into_iter()
+            .chain(self.board.unclaimed().walk())
+            .collect::<Vec<_>>();
+        let sections = [
+            self.section("NEED YOUR REVIEW", &review, true, pr_column),
+            self.section(
+                "YOU REVIEWED",
+                &self.board.you_reviewed().walk(),
+                true,
+                pr_column,
+            ),
+            self.section("YOUR PRS", &self.board.yours().walk(), true, pr_column),
+            // Directly under your open work, because it is the same question
+            // asked one step earlier: what have you got going, and what have
+            // you not asked for yet.
+            self.section(
+                "YOUR DRAFTS",
+                &self.board.your_drafts().walk(),
+                true,
+                pr_column,
+            ),
+            // No column header: nobody scans a draft they do not own for its CI.
+            self.section(
+                "OTHER DRAFTS",
+                &self.board.other_drafts().walk(),
+                false,
+                pr_column,
+            ),
+        ];
+        for block in sections.into_iter().filter(|block| !block.is_empty()) {
+            lines.extend(block);
+            lines.push(String::new());
+        }
         lines.push(self.summary_line());
         lines.push(self.legend_line());
 
         let mut rendered = lines.join("\n");
         rendered.push('\n');
         rendered
+    }
+
+    /// How much wider the PR column is than [`PR_COLUMN`], so that the deepest
+    /// stack on the board still leaves every other column aligned.
+    fn tree_width(&self) -> usize {
+        self.board
+            .walk()
+            .map(|placed| placed.depth())
+            .max()
+            .unwrap_or(0)
+            * TREE_STEP
     }
 
     /// What the repository enforces on the branch these rows target.
@@ -181,15 +216,22 @@ impl BoardText<'_> {
         )
     }
 
-    /// A heading, optionally a column header, and either rows or a note that
-    /// there are none.
+    /// A heading, optionally a column header, and the rows — or nothing at all
+    /// when there are none: an empty section is noise, and the summary line
+    /// still counts every pull request.
+    ///
+    /// `pr_column` is the PR column's width on this board, which a stack
+    /// anywhere on it widens.
     fn section(
         &self,
         title: &str,
-        rows: &[BoardRow],
-        when_empty: &str,
+        rows: &[Placed<'_>],
         with_columns: bool,
+        pr_column: usize,
     ) -> Vec<String> {
+        if rows.is_empty() {
+            return Vec::new();
+        }
         let mut lines = vec![format!(
             "{}{}",
             self.palette.paint(Style::Bold, title),
@@ -197,22 +239,18 @@ impl BoardText<'_> {
                 .paint(Style::Dim, &format!("  ({})", rows.len()))
         )];
         if with_columns {
-            lines.push(self.column_header());
+            lines.push(self.column_header(pr_column));
         }
-        if rows.is_empty() {
-            lines.push(self.palette.paint(Style::Dim, &format!("  {when_empty}")));
-        } else {
-            lines.extend(rows.iter().map(|row| self.row_line(row)));
-        }
+        lines.extend(rows.iter().map(|placed| self.row_line(placed, pr_column)));
         lines
     }
 
     /// The column header, which must be padded by the same rules as a row or
     /// it will not sit above it.
-    fn column_header(&self) -> String {
+    fn column_header(&self, pr_column: usize) -> String {
         let header = format!(
             "{}{}{}{}{}{}{}",
-            pad_to("PR", PR_COLUMN),
+            pad_to("PR", pr_column),
             pad_to("AUTHOR", AUTHOR_COLUMN),
             pad_to("CI", CI_COLUMN),
             pad_to("OPEN.CMT", THREADS_COLUMN),
@@ -247,7 +285,11 @@ impl BoardText<'_> {
     ///
     /// Each cell is padded after it is painted, using the width it *shows*
     /// rather than the bytes it holds.
-    fn row_line(&self, row: &BoardRow) -> String {
+    ///
+    /// A stacked row's number is indented under the one it sits on, behind a
+    /// branch mark; `pr_column` is wide enough for the deepest of them.
+    fn row_line(&self, placed: &Placed<'_>, pr_column: usize) -> String {
+        let row = placed.row();
         let facts = row.facts();
         let is_draft = facts.draft_state == DraftState::Draft;
         let unreadable = row.reviewability() >= Reviewability::CiRunning;
@@ -261,16 +303,7 @@ impl BoardText<'_> {
 
         let line = format!(
             "{}{}{}{}{}{}{}",
-            // The number is a link to the pull request. OSC 8 costs no columns,
-            // so the URL is reachable without a column wide enough to print it
-            // — and the row stays scannable, which a full URL per row does not.
-            pad_to(
-                &palette.link(
-                    facts.url.as_str(),
-                    &palette.paint(Style::Plain, &format!("#{}", facts.number.get())),
-                ),
-                PR_COLUMN
-            ),
+            pad_to(&pr_cell(placed, palette), pr_column),
             pad_to(
                 &palette.paint(Style::Plain, truncate_to(author, AUTHOR_CELLS)),
                 AUTHOR_COLUMN
@@ -282,14 +315,7 @@ impl BoardText<'_> {
             pad_to(&threads_cell(row, self.rules, self.palette), THREADS_COLUMN),
             pad_to(&merge_cell(row, is_draft, palette), MERGE_COLUMN),
             pad_to(&reason_cell(row.reason(), self.palette), REASON_COLUMN),
-            if self.show_branch {
-                pad_to(
-                    &palette.paint(Style::Plain, &self.age_of(row)),
-                    SINCE_PUSH_COLUMN,
-                )
-            } else {
-                palette.paint(Style::Plain, &self.age_of(row))
-            },
+            self.since_push_cell(row, palette),
         );
         if self.show_branch {
             // Dim in every row, including one that is otherwise bright: the
@@ -303,6 +329,17 @@ impl BoardText<'_> {
             format!("{line}{branch}")
         } else {
             line
+        }
+    }
+
+    /// The age column: padded when the branch column follows it, left as it is
+    /// when it ends the row.
+    fn since_push_cell(&self, row: &BoardRow, palette: Palette) -> String {
+        let age = palette.paint(Style::Plain, &self.age_of(row));
+        if self.show_branch {
+            pad_to(&age, SINCE_PUSH_COLUMN)
+        } else {
+            age
         }
     }
 
@@ -324,16 +361,7 @@ impl BoardText<'_> {
 
     /// The tallies under the board.
     fn summary_line(&self) -> String {
-        let every_row = || {
-            self.board
-                .yours()
-                .iter()
-                .chain(self.board.needs_your_review())
-                .chain(self.board.your_drafts())
-                .chain(self.board.other_drafts())
-                .chain(self.board.unclaimed())
-                .chain(self.board.not_waiting_on_you())
-        };
+        let every_row = || self.board.walk().map(|placed| placed.row());
         let ready = every_row()
             .filter(|row| matches!(row.reason(), BlockedReason::ReadyToMerge))
             .count();
@@ -347,23 +375,21 @@ impl BoardText<'_> {
         // includes the unclaimed rows appended to it.
         let reviewable = self
             .board
-            .needs_your_review()
-            .iter()
-            .chain(self.board.unclaimed())
+            .awaiting_review()
             .filter(|row| row.reviewability() < Reviewability::CiRunning)
             .count();
 
         self.palette.paint(
             Style::Dim,
             &format!(
-                // "not your review" was accurate when the unclaimed rows were
-                // also hidden. They are on screen now, so the only rows left
-                // out are ones this viewer has already reviewed -- which is a
-                // different and more useful thing to be told.
+                // How many pull requests this viewer has already reviewed,
+                // counted by each row's own placement, so one stacked under
+                // another section still counts. Kept here so the number is
+                // visible without reading the YOU REVIEWED section.
                 "{} open | {} you have reviewed | {ready} ready to merge | \
                  {conflicting} conflicting | {reviewable} reviewable now",
                 self.board.total(),
-                self.board.not_waiting_on_you().len(),
+                self.board.you_have_reviewed(),
             ),
         )
     }
@@ -376,6 +402,34 @@ impl BoardText<'_> {
              OPEN.CMT=unresolved threads.comments   MERGE shown only once CI is green",
         )
     }
+}
+
+/// The indent and branch mark in front of a stacked row's number: nothing for a
+/// root, `└ ` one level up, and [`TREE_STEP`] more cells of indent per level
+/// above that.
+fn tree_prefix(depth: usize) -> String {
+    depth
+        .checked_sub(1)
+        .map_or_else(String::new, |levels_below| {
+            format!("{}└ ", " ".repeat(levels_below * TREE_STEP))
+        })
+}
+
+/// The number, as a link to the pull request, behind its tree mark if stacked.
+///
+/// OSC 8 costs no columns, so the URL is reachable without a column wide enough
+/// to print it, and the row stays scannable, which a full URL per row does not.
+/// The tree mark sits outside the link: it is not the pull request.
+fn pr_cell(placed: &Placed<'_>, palette: Palette) -> String {
+    let facts = placed.row().facts();
+    format!(
+        "{}{}",
+        tree_prefix(placed.depth()),
+        palette.link(
+            facts.url.as_str(),
+            &palette.paint(Style::Plain, &format!("#{}", facts.number.get())),
+        )
+    )
 }
 
 /// What CI says, in the space of one column.
@@ -578,8 +632,8 @@ mod tests {
     use crate::width::visible_width;
     use chrono::{DateTime, TimeDelta, Utc};
     use prtrack_core::{
-        Board, BoardRow, BranchName, CheckName, DraftState, HeadSha, InvalidValue, Login,
-        MergeState, MergeableState, PolicyRules, PrFacts, PrNumber, PrTitle, PrUrl, RepoRef,
+        Board, BoardRow, BranchName, CheckName, DraftState, HeadRepository, HeadSha, InvalidValue,
+        Login, MergeState, MergeableState, PolicyRules, PrFacts, PrNumber, PrTitle, PrUrl, RepoRef,
         RequiredChecks, Requirement, Reviewer, StaleReviewHandling,
     };
 
@@ -626,6 +680,7 @@ mod tests {
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse(SOME_SHA)?,
             head_ref: BranchName::new("topic/branch-01"),
+            head_repository: HeadRepository::ThisOne,
             base_ref: BranchName::new("main"),
             review_decision: None,
             mergeable: MergeableState::Mergeable,
@@ -1403,10 +1458,9 @@ mod tests {
     fn the_summary_counts_the_rows_the_sections_do_not_show() {
         // Three reviewable, not two: the unclaimed row is on screen now and
         // counts toward what somebody could pick up this minute.
-        // The three sections between them hide everything that is somebody
-        // else's problem. The count is the only place a reader learns those
-        // pull requests exist at all, so it has to come from the whole board
-        // and not from what was drawn.
+        // The count comes from the whole board and not from what was drawn
+        // under each heading: a stacked row is drawn beneath its parent's
+        // section, and it still has to count where it belongs.
         let summary = Login::parse("octocat").and_then(|me| {
             let mut mine_ready = open_pr(1, "octocat")?;
             mine_ready.review_decision = Some(prtrack_core::ReviewDecision::Approved);
@@ -1533,50 +1587,136 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_section_says_it_is_empty_rather_than_vanishing() {
-        // A heading with nothing under it reads as a rendering failure. Naming
-        // the emptiness is the difference between "you have nothing open" and
-        // "the board broke".
-        let rendered = Login::parse("nobody-here").and_then(|me| {
-            Ok::<_, InvalidValue>(render(Vec::new(), &enforced_rule()?, &me, plain()))
-        });
-
-        for expected in [
-            "YOUR PRS  (0)",
-            "  nothing open",
-            "NEED YOUR REVIEW  (0)",
-            "  nothing waiting on you",
-            "OTHER DRAFTS  (0)",
+    fn a_section_with_nothing_in_it_is_not_printed() {
+        let rendered = Login::parse("octocat")
+            .and_then(|me| {
+                Ok::<_, InvalidValue>(render(
+                    vec![open_pr(101, "hubot")?],
+                    &PolicyRules::unprotected(),
+                    &me,
+                    plain(),
+                ))
+            })
+            .unwrap_or_default();
+        assert!(rendered.contains("NEED YOUR REVIEW  (1)"), "{rendered}");
+        for absent in [
+            "YOUR PRS",
+            "YOUR DRAFTS",
+            "OTHER DRAFTS",
+            "YOU REVIEWED",
+            "nothing open",
             "  none",
         ] {
-            assert_eq!(
-                rendered.as_ref().map(|text| text.contains(expected)),
-                Ok(true),
-                "the empty board must still say {expected:?}"
+            assert!(
+                !rendered.contains(absent),
+                "{absent:?} printed:\n{rendered}"
             );
         }
+        assert!(
+            !rendered.contains("\n\n\n"),
+            "no run of blank lines where a section was:\n{rendered}"
+        );
+        // The summary still tells an empty board from a failed read: the
+        // failure exits non-zero and never reaches here.
+        assert!(rendered.contains("1 open"), "{rendered}");
+    }
+
+    /// Every heading a section can print, for asserting that none was.
+    const SECTION_HEADINGS: [&str; 5] = [
+        "NEED YOUR REVIEW",
+        "YOU REVIEWED",
+        "YOUR PRS",
+        "OTHER DRAFTS",
+        "YOUR DRAFTS",
+    ];
+
+    /// The first line of each paragraph of a render, a paragraph being what a
+    /// blank line separates. Splitting on exactly one blank line means a run of
+    /// two shows up as a paragraph whose first line is empty.
+    fn paragraph_openers(rendered: &str) -> Vec<&str> {
+        rendered
+            .trim_end_matches('\n')
+            .split("\n\n")
+            .map(|paragraph| paragraph.lines().next().unwrap_or_default())
+            .collect()
+    }
+
+    /// Three kept sections around two empty ones: YOU REVIEWED between the
+    /// first two and YOUR DRAFTS between the last two.
+    fn three_sections_two_gaps() -> Result<String, InvalidValue> {
+        let me = Login::parse("octocat")?;
+        let mut theirs = open_pr(3, "hubot")?;
+        theirs.requested_reviewers = vec![Reviewer::User(me.clone())];
+        let mut their_draft = open_pr(4, "hubot")?;
+        their_draft.draft_state = DraftState::Draft;
+
+        Ok(render(
+            vec![
+                open_pr(1, "octocat")?,
+                open_pr(2, "octocat")?,
+                theirs,
+                their_draft,
+            ],
+            &enforced_rule()?,
+            &me,
+            plain(),
+        ))
+    }
+
+    #[test]
+    fn an_empty_board_prints_no_section_and_still_answers() {
+        let rendered = Login::parse("octocat")
+            .map(|me| render(Vec::new(), &PolicyRules::unprotected(), &me, plain()))
+            .unwrap_or_default();
+        for heading in SECTION_HEADINGS {
+            assert!(
+                !rendered.contains(heading),
+                "{heading:?} printed:\n{rendered}"
+            );
+        }
+        assert!(!rendered.contains("\n\n\n"), "{rendered}");
+        // The policy line, one blank line, then the summary: an empty board is
+        // visibly an answer and not a blank screen.
+        let openers = paragraph_openers(&rendered);
+        assert_eq!(openers.len(), 2, "{rendered}");
+        assert!(
+            openers
+                .last()
+                .is_some_and(|line| line.starts_with("0 open | ")),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn kept_sections_are_separated_by_exactly_one_blank_line() {
+        let rendered = three_sections_two_gaps().unwrap_or_default();
+        assert!(!rendered.contains("\n\n\n"), "{rendered}");
+        let openers = paragraph_openers(&rendered);
+        assert!(
+            openers
+                .first()
+                .is_some_and(|line| line.starts_with("prtrack ")),
+            "{rendered}"
+        );
+        assert_eq!(
+            openers.get(1..),
+            Some(
+                [
+                    "NEED YOUR REVIEW  (1)",
+                    "YOUR PRS  (2)",
+                    "OTHER DRAFTS  (1)",
+                    "4 open | 0 you have reviewed | 0 ready to merge | 0 conflicting \
+                     | 1 reviewable now",
+                ]
+                .as_slice()
+            ),
+            "{rendered}"
+        );
     }
 
     #[test]
     fn a_section_heading_counts_the_rows_beneath_it() {
-        let rendered = Login::parse("octocat").and_then(|me| {
-            let mut theirs = open_pr(3, "hubot")?;
-            theirs.requested_reviewers = vec![Reviewer::User(me.clone())];
-            let mut their_draft = open_pr(4, "hubot")?;
-            their_draft.draft_state = DraftState::Draft;
-
-            Ok::<_, InvalidValue>(render(
-                vec![
-                    open_pr(1, "octocat")?,
-                    open_pr(2, "octocat")?,
-                    theirs,
-                    their_draft,
-                ],
-                &enforced_rule()?,
-                &me,
-                plain(),
-            ))
-        });
+        let rendered = three_sections_two_gaps();
 
         for expected in [
             "YOUR PRS  (2)",
@@ -1646,5 +1786,137 @@ mod tests {
                 crate::update::running()
             ))
         );
+    }
+
+    #[test]
+    fn a_pull_request_you_reviewed_stays_on_the_board_with_its_blocker() {
+        let rendered = Login::parse("octocat")
+            .and_then(|me| {
+                let mut reviewed = open_pr(101, "hubot")?;
+                reviewed.reviewed_by = vec![me.clone()];
+                reviewed.mergeable = MergeableState::Conflicting;
+                Ok(render(
+                    vec![reviewed],
+                    &PolicyRules::unprotected(),
+                    &me,
+                    plain(),
+                ))
+            })
+            .unwrap_or_default();
+        assert!(rendered.contains("YOU REVIEWED  (1)"), "{rendered}");
+        let row = rendered
+            .lines()
+            .find(|line| line.starts_with("#101 "))
+            .unwrap_or_default();
+        assert!(row.contains("CONFLICT"), "{rendered}");
+    }
+
+    /// The pull requests on the stacked board, in the order a reader sees them:
+    /// #101 at the root, #102 and #103 stacked one and two deep, and #104 on
+    /// its own.
+    const STACKED_NUMBERS: [&str; 4] = ["#101", "#102", "#103", "#104"];
+
+    /// A three-deep stack and one unstacked pull request, drawn with `palette`.
+    /// Handed over out of order, so the tree is the renderer's doing.
+    fn stacked_board(palette: Palette) -> String {
+        Login::parse("octocat")
+            .and_then(|me| {
+                let on = |n: u32, head: &str, base: &str| {
+                    open_pr(n, "hubot").map(|mut pr| {
+                        pr.head_ref = BranchName::new(head);
+                        pr.base_ref = BranchName::new(base);
+                        pr
+                    })
+                };
+                Ok(render(
+                    vec![
+                        on(103, "stack/three", "stack/two")?,
+                        on(101, "stack/one", "main")?,
+                        on(102, "stack/two", "stack/one")?,
+                        open_pr(104, "monalisa")?,
+                    ],
+                    &PolicyRules::unprotected(),
+                    &me,
+                    palette,
+                ))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Asserts every row of [`stacked_board`] starts its author column where
+    /// the header does, painted or not.
+    ///
+    /// Measured in cells with [`visible_width`], not bytes: `└` is three bytes
+    /// and one cell, and a colour escape or a link's URL is many bytes and no
+    /// cells, so a byte offset would call an aligned row misaligned.
+    fn assert_stack_aligned(rendered: &str) {
+        let cells_before = |line: &str, at: usize| line.get(..at).map(visible_width);
+        let author_at = |line: &str| {
+            line.find("hubot")
+                .or_else(|| line.find("monalisa"))
+                .and_then(|at| cells_before(line, at))
+        };
+        let header = rendered
+            .lines()
+            .find(|line| line.contains("AUTHOR"))
+            .unwrap_or_default();
+        let header_author = header
+            .find("AUTHOR")
+            .and_then(|at| cells_before(header, at));
+        assert!(header_author.is_some(), "{rendered}");
+        for n in STACKED_NUMBERS {
+            let row = rendered
+                .lines()
+                .find(|line| line.contains(n))
+                .unwrap_or_default();
+            assert_eq!(author_at(row), header_author, "{n} misaligned:\n{rendered}");
+        }
+    }
+
+    #[test]
+    fn a_stack_is_drawn_under_the_pull_request_it_sits_on() {
+        let rendered = stacked_board(plain());
+        let lines: Vec<&str> = rendered.lines().collect();
+        let line_of = |needle: &str| lines.iter().position(|line| line.contains(needle));
+
+        assert!(
+            lines.iter().any(|line| line.starts_with("#101 ")),
+            "{rendered}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("└ #102 ")),
+            "{rendered}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("  └ #103 ")),
+            "{rendered}"
+        );
+        assert!(
+            line_of("#101 ") < line_of("#102 ") && line_of("#102 ") < line_of("#103 "),
+            "{rendered}"
+        );
+        assert_stack_aligned(&rendered);
+    }
+
+    #[test]
+    fn a_stack_stays_aligned_when_painted_and_linked() {
+        // Colour and OSC 8 add bytes and no cells to the PR column, which is
+        // exactly where the tree mark adds cells. Both have to be measured the
+        // same way or a stacked row shears only on a real terminal.
+        let rendered = stacked_board(painting());
+        assert!(rendered.contains("\u{1b}]8;;"), "links are on:\n{rendered}");
+        assert_stack_aligned(&rendered);
+
+        // The tree mark sits outside the link: what the link draws is the
+        // pull request's number and nothing else.
+        for n in STACKED_NUMBERS {
+            let linked = rendered
+                .lines()
+                .find(|line| line.contains(n))
+                .and_then(|row| row.split("\u{1b}]8;;").nth(1))
+                .and_then(|opened| opened.split_once("\u{1b}\\"))
+                .map(|(_url, text)| visible_width(text));
+            assert_eq!(linked, Some(n.len()), "{n} link text:\n{rendered}");
+        }
     }
 }

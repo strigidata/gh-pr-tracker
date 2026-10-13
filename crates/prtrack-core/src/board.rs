@@ -1,12 +1,13 @@
 //! Which section of the board a pull request belongs in, and where it sorts.
 
 use std::cmp::Reverse;
+use std::collections::HashMap;
 
 use crate::checks::{classify, Classified};
 use crate::decision::BlockedReason;
-use crate::facts::{DraftState, PrFacts};
+use crate::facts::{BranchName, DraftState, HeadRepository, PrFacts};
 use crate::policy::PolicyRules;
-use crate::types::Login;
+use crate::types::{Login, PrNumber};
 
 /// How soon the viewer should deal with their own pull request.
 ///
@@ -186,7 +187,7 @@ impl Reviewability {
 /// point of view.
 ///
 /// Private because [`Board`] is the answer: a caller reads the section a pull
-/// request landed in by finding it in one, and the four are a partition so
+/// request landed in by finding it in one, and the six are a partition so
 /// there is always exactly one to find.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -207,14 +208,15 @@ enum Section {
     /// Somebody else's work, open for review, that the viewer has neither been
     /// asked about nor already reviewed.
     ///
-    /// Separate from [`Section::NotWaitingOnYou`] because it is the one group
+    /// Separate from [`Section::YouReviewed`] because it is the one group
     /// there that somebody could usefully pick up. A pull request the viewer
     /// has already approved is *not* here: GitHub removes a reviewer from the
     /// request list the moment they submit, so without checking who has already
     /// reviewed, approved work is indistinguishable from unclaimed work.
     Unclaimed,
-    /// Somebody else's work that is not waiting on the viewer at all.
-    NotWaitingOnYou,
+    /// Somebody else's work, open for review, that the viewer has already
+    /// approved or asked changes on.
+    YouReviewed,
 }
 
 impl Section {
@@ -249,7 +251,7 @@ impl Section {
         // move is somebody else's, and showing it as reviewable would be asking
         // you to do a thing you have done.
         if facts.reviewed_by.contains(viewer) {
-            return Self::NotWaitingOnYou;
+            return Self::YouReviewed;
         }
         Self::Unclaimed
     }
@@ -334,17 +336,160 @@ impl BoardRow {
     }
 }
 
+/// One pull request, and every pull request stacked on top of it.
+///
+/// A tree rather than a list: two branches can be cut from the same feature
+/// branch, and each becomes a pull request whose base is that branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stack {
+    row: BoardRow,
+    /// Where this row would sit on its own. A stacked row is drawn in its
+    /// root's section, and the counts under the board still read this.
+    own: Section,
+    above: Vec<Self>,
+}
+
+impl Stack {
+    /// The pull request at the bottom of this stack.
+    #[must_use]
+    pub const fn row(&self) -> &BoardRow {
+        &self.row
+    }
+
+    /// The pull requests whose base is this one's branch, by number.
+    #[must_use]
+    pub fn above(&self) -> &[Self] {
+        &self.above
+    }
+
+    fn len(&self) -> usize {
+        1 + self.above.iter().map(Self::len).sum::<usize>()
+    }
+
+    fn walk_into<'a>(&'a self, position: Position, out: &mut Vec<Placed<'a>>) {
+        out.push(Placed {
+            row: &self.row,
+            own: self.own,
+            position,
+        });
+        let depth = position.depth().saturating_add(1);
+        for stack in &self.above {
+            stack.walk_into(
+                Position::Stacked {
+                    on: self.row.facts.number,
+                    depth,
+                },
+                out,
+            );
+        }
+    }
+}
+
+/// Where a row sits in its tree.
+///
+/// An enum so that "stacked on nothing at depth three" cannot be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Position {
+    Root,
+    Stacked { on: PrNumber, depth: usize },
+}
+
+impl Position {
+    const fn depth(self) -> usize {
+        match self {
+            Self::Root => 0,
+            Self::Stacked { depth, .. } => depth,
+        }
+    }
+}
+
+/// One row as a reader meets it: in pre-order, with how far up a stack it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placed<'a> {
+    row: &'a BoardRow,
+    own: Section,
+    position: Position,
+}
+
+impl<'a> Placed<'a> {
+    /// The pull request.
+    #[must_use]
+    pub const fn row(&self) -> &'a BoardRow {
+        self.row
+    }
+
+    /// How many pull requests it is stacked on. Zero for a root.
+    #[must_use]
+    pub const fn depth(&self) -> usize {
+        self.position.depth()
+    }
+
+    /// The pull request directly beneath it, or `None` for a root.
+    #[must_use]
+    pub const fn stacked_on(&self) -> Option<PrNumber> {
+        match self.position {
+            Position::Root => None,
+            Position::Stacked { on, .. } => Some(on),
+        }
+    }
+}
+
+/// One section of the board: its stacks, roots in the section's order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Stacks(Vec<Stack>);
+
+impl Stacks {
+    /// The trees, roots in order.
+    #[must_use]
+    pub fn stacks(&self) -> &[Stack] {
+        &self.0
+    }
+
+    /// How many pull requests, counting every row in every tree.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.iter().map(Stack::len).sum()
+    }
+
+    /// Whether the section has no pull requests at all.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Every row in pre-order: each root, then what is stacked on it.
+    #[must_use]
+    pub fn walk(&self) -> Vec<Placed<'_>> {
+        let mut out = Vec::with_capacity(self.len());
+        for stack in &self.0 {
+            stack.walk_into(Position::Root, &mut out);
+        }
+        out
+    }
+
+    /// Every row in pre-order, without its position.
+    pub fn rows(&self) -> impl Iterator<Item = &BoardRow> {
+        self.walk().into_iter().map(|placed| placed.row)
+    }
+}
+
 /// Every open pull request, grouped by what the viewer can do about it.
+///
+/// Each group is a [`Stacks`]: every stack *rooted* there, held as a tree so
+/// that a pull request whose base is another's head is drawn above it. A pull
+/// request stacked on nothing is a tree of one. A stacked row is drawn in its
+/// root's section, not its own, so a stack is never split across the board;
+/// the counts ([`Board::awaiting_review`], [`Board::you_have_reviewed`]) still
+/// read where each row would sit on its own.
 ///
 /// # Nothing is dropped
 ///
-/// The four groups partition the input: every row goes in exactly one, and
-/// [`Board::total`] equals the number of rows handed in. Three of them are
-/// meant to be rendered. The fourth, [`Board::not_waiting_on_you`], usually is
-/// not — but it is kept rather than discarded, because a pull request that
-/// quietly stopped existing is the failure this crate is built to prevent, and
-/// a board that can only report "37 open" while showing nine of them has to get
-/// that number from somewhere honest.
+/// The six groups partition the input: every row is drawn in exactly one, and
+/// [`Board::total`] equals the number of rows handed in. All six are rendered,
+/// [`Board::you_reviewed`] included, and none is a bin for rows that fit
+/// nowhere else: a pull request that quietly stopped existing is the failure
+/// this crate is built to prevent, and a board that reports "37 open" has to
+/// get that number from the rows it actually holds.
 ///
 /// # A team request cannot find the viewer
 ///
@@ -354,18 +499,18 @@ impl BoardRow {
 /// viewer an implicit reviewer who never appears by name, so this section
 /// under-reports. Closing that needs team-membership data this crate does not
 /// have and deliberately does not guess at. The pull request is not lost — it
-/// lands in [`Board::not_waiting_on_you`] with its reviewers intact — so the
+/// lands in [`Board::unclaimed`] with its reviewers intact — so the
 /// gap is a row in the wrong group rather than a row that disappeared.
 ///
 /// [`Reviewer::Team`]: crate::Reviewer::Team
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Board {
-    yours: Vec<BoardRow>,
-    unclaimed: Vec<BoardRow>,
-    your_drafts: Vec<BoardRow>,
-    needs_your_review: Vec<BoardRow>,
-    other_drafts: Vec<BoardRow>,
-    not_waiting_on_you: Vec<BoardRow>,
+    yours: Stacks,
+    unclaimed: Stacks,
+    your_drafts: Stacks,
+    needs_your_review: Stacks,
+    other_drafts: Stacks,
+    you_reviewed: Stacks,
 }
 
 impl Board {
@@ -377,67 +522,84 @@ impl Board {
     /// [`Login`]: crate::Login
     #[must_use]
     pub fn assemble(rows: Vec<BoardRow>, viewer: &Login) -> Self {
-        let mut board = Self {
-            yours: Vec::new(),
-            unclaimed: Vec::new(),
-            your_drafts: Vec::new(),
-            needs_your_review: Vec::new(),
-            other_drafts: Vec::new(),
-            not_waiting_on_you: Vec::new(),
-        };
-
-        for row in rows {
-            let group = match Section::of(&row.facts, viewer) {
-                Section::Yours => &mut board.yours,
-                Section::YourDrafts => &mut board.your_drafts,
-                Section::NeedsYourReview => &mut board.needs_your_review,
-                Section::Unclaimed => &mut board.unclaimed,
-                Section::OtherDrafts => &mut board.other_drafts,
-                Section::NotWaitingOnYou => &mut board.not_waiting_on_you,
-            };
-            group.push(row);
+        let parents = parents(&rows);
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); rows.len()];
+        for (child, parent) in parents.iter().enumerate() {
+            if let Some(below) = parent.and_then(|parent| children.get_mut(parent)) {
+                below.push(child);
+            }
         }
+        let mut slots: Vec<Option<BoardRow>> = rows.into_iter().map(Some).collect();
 
+        let mut board = Self::default();
+        for (root, parent) in parents.iter().enumerate() {
+            if parent.is_some() {
+                continue;
+            }
+            if let Some(stack) = grow(root, &mut slots, &children, viewer) {
+                board.group_mut(stack.own).0.push(stack);
+            }
+        }
+        board.sort();
         board
-            .yours
-            .sort_by_key(|row| (row.urgency(), row.facts.last_push, row.facts.number.get()));
-        board.needs_your_review.sort_by_key(|row| {
+    }
+
+    const fn group_mut(&mut self, section: Section) -> &mut Stacks {
+        match section {
+            Section::Yours => &mut self.yours,
+            Section::YourDrafts => &mut self.your_drafts,
+            Section::NeedsYourReview => &mut self.needs_your_review,
+            Section::Unclaimed => &mut self.unclaimed,
+            Section::OtherDrafts => &mut self.other_drafts,
+            Section::YouReviewed => &mut self.you_reviewed,
+        }
+    }
+
+    /// Orders each group's roots by the question that group asks.
+    fn sort(&mut self) {
+        self.yours.0.sort_by_key(|stack| {
             (
-                row.reviewability(),
-                row.facts.last_push,
-                row.facts.number.get(),
+                stack.row.urgency(),
+                stack.row.facts.last_push,
+                stack.row.facts.number.get(),
+            )
+        });
+        self.needs_your_review.0.sort_by_key(|stack| {
+            (
+                stack.row.reviewability(),
+                stack.row.facts.last_push,
+                stack.row.facts.number.get(),
             )
         });
         // Both draft sections run newest-push first: a draft is a thing you
         // are still working on, so the one you touched last is the one you
         // meant to come back to.
-        board
-            .your_drafts
-            .sort_by_key(|row| (Reverse(row.facts.last_push), row.facts.number.get()));
-        board
-            .other_drafts
-            .sort_by_key(|row| (Reverse(row.facts.last_push), row.facts.number.get()));
-        // Not by number. These are rendered under the review section now, and
-        // the useful order there is the same question that section asks: what
-        // would it help most for somebody to pick up? A pull request nobody has
-        // been asked to review is the one that stalls indefinitely, so it leads;
-        // one already assigned to other people is somebody else's job and
-        // follows.
-        // Rendered under the review section, so ordered by the same question
-        // it asks. Nobody asked for these, so the tie-break that matters is how
-        // long they have sat.
-        board.unclaimed.sort_by_key(|row| {
+        self.your_drafts.0.sort_by_key(|stack| {
             (
-                row.reviewability(),
-                row.facts.last_push,
-                row.facts.number.get(),
+                Reverse(stack.row.facts.last_push),
+                stack.row.facts.number.get(),
             )
         });
-        board
-            .not_waiting_on_you
-            .sort_by_key(|row| row.facts.number.get());
-
-        board
+        self.other_drafts.0.sort_by_key(|stack| {
+            (
+                Reverse(stack.row.facts.last_push),
+                stack.row.facts.number.get(),
+            )
+        });
+        // Not by number. These are rendered under the review section, so they
+        // are ordered by the question that section asks: what would it help
+        // most for somebody to pick up? Among equally reviewable rows, the one
+        // that has sat longest comes first.
+        self.unclaimed.0.sort_by_key(|stack| {
+            (
+                stack.row.reviewability(),
+                stack.row.facts.last_push,
+                stack.row.facts.number.get(),
+            )
+        });
+        self.you_reviewed
+            .0
+            .sort_by_key(|stack| stack.row.facts.number.get());
     }
 
     /// The viewer's own pull requests that are open for review, most urgent
@@ -450,7 +612,7 @@ impl Board {
     /// sorted to the bottom of this list, which made it longer than the thing
     /// it measures: what somebody else is waiting on.
     #[must_use]
-    pub fn yours(&self) -> &[BoardRow] {
+    pub const fn yours(&self) -> &Stacks {
         &self.yours
     }
 
@@ -459,7 +621,7 @@ impl Board {
     /// Nobody is waiting on these, so they are not ordered by urgency — the
     /// useful order is the one you were last working in.
     #[must_use]
-    pub fn your_drafts(&self) -> &[BoardRow] {
+    pub const fn your_drafts(&self) -> &Stacks {
         &self.your_drafts
     }
 
@@ -469,7 +631,7 @@ impl Board {
     /// Drafts are never here; they are in [`Board::other_drafts`] whether or
     /// not a review was requested.
     #[must_use]
-    pub fn needs_your_review(&self) -> &[BoardRow] {
+    pub const fn needs_your_review(&self) -> &Stacks {
         &self.needs_your_review
     }
 
@@ -478,7 +640,7 @@ impl Board {
     /// Present for completeness rather than for action: nobody is expected to
     /// do anything about a draft that is not theirs.
     #[must_use]
-    pub fn other_drafts(&self) -> &[BoardRow] {
+    pub const fn other_drafts(&self) -> &Stacks {
         &self.other_drafts
     }
 
@@ -493,46 +655,148 @@ impl Board {
     /// says `NOBODY ASSIGNED` or names whoever *was*, so the two groups stay
     /// distinguishable without a sub-heading.
     #[must_use]
-    pub fn unclaimed(&self) -> &[BoardRow] {
+    pub const fn unclaimed(&self) -> &Stacks {
         &self.unclaimed
     }
 
-    /// Everything left — including anything the viewer has already reviewed.
+    /// Stacks rooted on somebody else's pull request the viewer has already
+    /// approved or asked changes on, ordered by number.
     ///
-    /// An approval is the common case here, and it is why this exists as a
-    /// separate group: GitHub removes a reviewer from the request list the
-    /// moment they submit, so without checking who has already reviewed, work
-    /// the viewer approved is indistinguishable from work nobody has touched.
+    /// A row stacked on such a pull request is drawn here with it, whether or
+    /// not the viewer has reviewed that row too; [`Board::you_have_reviewed`]
+    /// and [`Board::awaiting_review`] count each row where it would sit alone.
     ///
-    /// Ordered by pull request number, since no urgency applies. Counted rather
-    /// than rendered; see the type's documentation for why it is kept.
+    /// GitHub removes a reviewer from the request list the moment they submit,
+    /// so without checking who has reviewed, work the viewer approved would be
+    /// indistinguishable from work nobody has touched.
     #[must_use]
-    pub fn not_waiting_on_you(&self) -> &[BoardRow] {
-        &self.not_waiting_on_you
+    pub const fn you_reviewed(&self) -> &Stacks {
+        &self.you_reviewed
+    }
+
+    /// Every row on the board, section by section in drawing order.
+    pub fn walk(&self) -> impl Iterator<Item = Placed<'_>> {
+        [
+            &self.needs_your_review,
+            &self.unclaimed,
+            &self.you_reviewed,
+            &self.yours,
+            &self.your_drafts,
+            &self.other_drafts,
+        ]
+        .into_iter()
+        .flat_map(Stacks::walk)
+    }
+
+    /// Rows that would be in the review section on their own: asked of the
+    /// viewer, or asked of nobody. Counted by row, not by tree, so a row
+    /// stacked into another section still counts where it belongs.
+    pub fn awaiting_review(&self) -> impl Iterator<Item = &BoardRow> {
+        self.walk()
+            .filter(|placed| matches!(placed.own, Section::NeedsYourReview | Section::Unclaimed))
+            .map(|placed| placed.row)
+    }
+
+    /// How many rows the viewer has already reviewed, wherever they are drawn.
+    #[must_use]
+    pub fn you_have_reviewed(&self) -> usize {
+        self.walk()
+            .filter(|placed| placed.own == Section::YouReviewed)
+            .count()
     }
 
     /// How many pull requests the board was built from.
     ///
     /// Equal to the number of rows handed to [`Board::assemble`], because the
-    /// four groups are a partition of them.
+    /// six groups are a partition of them.
     #[must_use]
-    pub const fn total(&self) -> usize {
-        self.yours.len()
-            + self.your_drafts.len()
-            + self.unclaimed.len()
-            + self.needs_your_review.len()
-            + self.other_drafts.len()
-            + self.not_waiting_on_you.len()
+    pub fn total(&self) -> usize {
+        self.walk().count()
     }
+}
+
+/// The pull request each row is stacked on, by index, or `None` for a root.
+///
+/// A row sits on the one open pull request whose head is its base. None, more
+/// than one, or itself all make it a root: guessing between two branches that
+/// share a name would draw a stack that does not exist. Any row whose chain of
+/// bases loops back to itself is a root too, so building the trees ends. A
+/// pull request aimed at its own branch is a loop of one and is cut with the
+/// rest; this is the only place that protection lives.
+///
+/// Only a pull request whose head is in this repository can be beneath
+/// another. A fork's branch shares nothing with a branch here but its name,
+/// and a fork whose head is `main` would otherwise sit under everything aimed
+/// at `main`; a head GitHub did not place is treated the same way. Being *on*
+/// something asks nothing of the head, since a fork's base is always here.
+fn parents(rows: &[BoardRow]) -> Vec<Option<usize>> {
+    let mut by_head: HashMap<&BranchName, Vec<usize>> = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        match row.facts.head_repository {
+            HeadRepository::ThisOne => by_head.entry(&row.facts.head_ref).or_default().push(index),
+            HeadRepository::Fork | HeadRepository::Unstated => {}
+        }
+    }
+    let mut parents: Vec<Option<usize>> = rows
+        .iter()
+        .map(
+            |row| match by_head.get(&row.facts.base_ref).map(Vec::as_slice) {
+                Some(&[only]) => Some(only),
+                Some(_) | None => None,
+            },
+        )
+        .collect();
+
+    let looping: Vec<bool> = (0..parents.len())
+        .map(|start| {
+            let mut at = parents.get(start).copied().flatten();
+            for _ in 0..parents.len() {
+                match at {
+                    Some(next) if next == start => return true,
+                    Some(next) => at = parents.get(next).copied().flatten(),
+                    None => return false,
+                }
+            }
+            false
+        })
+        .collect();
+    for (parent, looped) in parents.iter_mut().zip(looping) {
+        if looped {
+            *parent = None;
+        }
+    }
+    parents
+}
+
+/// The tree rooted at `at`, taking each row out of `slots` as it is placed.
+fn grow(
+    at: usize,
+    slots: &mut [Option<BoardRow>],
+    children: &[Vec<usize>],
+    viewer: &Login,
+) -> Option<Stack> {
+    let row = slots.get_mut(at)?.take()?;
+    let mut above: Vec<Stack> = children
+        .get(at)
+        .into_iter()
+        .flatten()
+        .filter_map(|&child| grow(child, slots, children, viewer))
+        .collect();
+    above.sort_by_key(|stack| stack.row.facts.number.get());
+    Some(Stack {
+        own: Section::of(&row.facts, viewer),
+        row,
+        above,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Board, BoardRow};
+    use super::{Board, BoardRow, Stacks};
     use crate::checks::{Check, CheckState};
     use crate::facts::{
-        BranchName, DraftState, MergeState, MergeableState, PrFacts, PrTitle, PrUrl,
-        ReviewDecision, Reviewer, TeamSlug,
+        BranchName, DraftState, HeadRepository, MergeState, MergeableState, PrFacts, PrTitle,
+        PrUrl, ReviewDecision, Reviewer, TeamSlug,
     };
     use crate::policy::{BlockingChecks, PolicyRules, Requirement};
     use crate::types::{CheckName, HeadSha, InvalidValue, Login, PrNumber, RepoRef};
@@ -563,6 +827,7 @@ mod tests {
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse(SOME_SHA)?,
             head_ref: BranchName::new("topic/branch-01"),
+            head_repository: HeadRepository::ThisOne,
             base_ref: BranchName::new("main"),
             review_decision: None,
             mergeable: MergeableState::Mergeable,
@@ -577,9 +842,49 @@ mod tests {
         })
     }
 
+    /// `open_pr`, on `head` in this repository and aimed at `base`.
+    fn on_branch(
+        number: u32,
+        author: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<PrFacts, InvalidValue> {
+        let mut pr = open_pr(number, author)?;
+        pr.head_ref = BranchName::new(head);
+        pr.base_ref = BranchName::new(base);
+        Ok(pr)
+    }
+
+    /// `on_branch` by `hubot`, with its head in `repository` instead.
+    fn on_branch_in(
+        repository: HeadRepository,
+        number: u32,
+        head: &str,
+        base: &str,
+    ) -> Result<PrFacts, InvalidValue> {
+        let mut pr = on_branch(number, "hubot", head, base)?;
+        pr.head_repository = repository;
+        Ok(pr)
+    }
+
     /// The pull request numbers a section holds, in the order it holds them.
-    fn numbers(rows: &[BoardRow]) -> Vec<u32> {
-        rows.iter().map(|row| row.facts().number.get()).collect()
+    fn numbers(group: &Stacks) -> Vec<u32> {
+        group.rows().map(|row| row.facts().number.get()).collect()
+    }
+
+    /// Every row as (number, depth, stacked on), in drawing order.
+    fn shape(group: &Stacks) -> Vec<(u32, usize, Option<u32>)> {
+        group
+            .walk()
+            .into_iter()
+            .map(|at| {
+                (
+                    at.row().facts().number.get(),
+                    at.depth(),
+                    at.stacked_on().map(PrNumber::get),
+                )
+            })
+            .collect()
     }
 
     /// Reduces every pull request against the same rule and arranges the board.
@@ -626,6 +931,201 @@ mod tests {
             .map(|facts| BoardRow::reduce(facts, policy))
             .collect();
         Board::assemble(rows, viewer)
+    }
+
+    #[test]
+    fn a_pull_request_on_nothing_is_a_root_at_depth_zero() {
+        let placed = Login::parse("octocat").and_then(|me| {
+            let board = board_for(vec![open_pr(101, "hubot")?], &me);
+            Ok::<_, InvalidValue>(
+                board
+                    .walk()
+                    .map(|at| (at.row().facts().number.get(), at.depth(), at.stacked_on()))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(placed, Ok(vec![(101, 0, None)]));
+    }
+
+    #[test]
+    fn a_stack_is_one_tree_in_order_from_the_bottom() {
+        // Handed in top first, so the order is the board's work, not the input's.
+        let drawn = Login::parse("octocat").and_then(|me| {
+            let board = board_for(
+                vec![
+                    on_branch(103, "hubot", "stack/three", "stack/two")?,
+                    on_branch(101, "hubot", "stack/one", "main")?,
+                    on_branch(102, "hubot", "stack/two", "stack/one")?,
+                ],
+                &me,
+            );
+            Ok::<_, InvalidValue>(shape(board.unclaimed()))
+        });
+        assert_eq!(
+            drawn,
+            Ok(vec![
+                (101, 0, None),
+                (102, 1, Some(101)),
+                (103, 2, Some(102))
+            ])
+        );
+    }
+
+    #[test]
+    fn a_base_that_cannot_be_named_with_certainty_makes_a_root() {
+        // A merged base, two open pull requests sharing a head, and two loops:
+        // in each the honest answer is "this sits on nothing we can show".
+        let cases = [
+            ("base already merged", vec![(102, "stack/two", "stack/one")]),
+            (
+                "aimed at its own branch",
+                vec![(101, "stack/one", "stack/one")],
+            ),
+            (
+                "two pull requests share the base's name",
+                vec![
+                    (101, "stack/one", "main"),
+                    (104, "stack/one", "main"),
+                    (102, "stack/two", "stack/one"),
+                ],
+            ),
+            (
+                "a loop",
+                vec![
+                    (101, "stack/one", "stack/two"),
+                    (102, "stack/two", "stack/one"),
+                ],
+            ),
+        ];
+        for (what, prs) in cases {
+            let drawn = Login::parse("octocat").and_then(|me| {
+                let built = prs
+                    .iter()
+                    .map(|&(n, head, base)| on_branch(n, "hubot", head, base))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let board = board_for(built, &me);
+                Ok::<_, InvalidValue>(shape(board.unclaimed()))
+            });
+            // Every row present *and* a root. Asking only that the rows found
+            // are roots passes when a loop drops them all, because no row in a
+            // loop is a root to grow a tree from.
+            let mut roots: Vec<(u32, usize, Option<u32>)> =
+                prs.iter().map(|&(n, _, _)| (n, 0, None)).collect();
+            roots.sort_unstable();
+            assert_eq!(drawn, Ok(roots), "{what}: every row must be a root");
+        }
+    }
+
+    #[test]
+    fn a_stack_is_drawn_in_its_roots_section_and_counted_where_each_row_belongs() {
+        // The bottom was reviewed by the viewer; the two above it were not.
+        let placed = Login::parse("octocat").and_then(|me| {
+            let mut bottom = on_branch(101, "hubot", "stack/one", "main")?;
+            bottom.reviewed_by = vec![me.clone()];
+            let board = board_for(
+                vec![
+                    bottom,
+                    on_branch(102, "hubot", "stack/two", "stack/one")?,
+                    on_branch(103, "hubot", "stack/three", "stack/two")?,
+                ],
+                &me,
+            );
+            Ok::<_, InvalidValue>((
+                numbers(board.you_reviewed()),
+                numbers(board.unclaimed()),
+                board.you_have_reviewed(),
+                board.awaiting_review().count(),
+                board.total(),
+            ))
+        });
+        assert_eq!(placed, Ok((vec![101, 102, 103], vec![], 1, 2, 3)));
+    }
+
+    #[test]
+    fn a_draft_at_the_bottom_takes_its_stack_with_it() {
+        let placed = Login::parse("octocat").and_then(|me| {
+            let mut bottom = on_branch(101, "hubot", "stack/one", "main")?;
+            bottom.draft_state = DraftState::Draft;
+            let board = board_for(
+                vec![bottom, on_branch(102, "hubot", "stack/two", "stack/one")?],
+                &me,
+            );
+            Ok::<_, InvalidValue>((numbers(board.other_drafts()), numbers(board.unclaimed())))
+        });
+        assert_eq!(placed, Ok((vec![101, 102], vec![])));
+    }
+
+    #[test]
+    fn two_branches_cut_from_one_are_siblings_by_number() {
+        let drawn = Login::parse("octocat").and_then(|me| {
+            let board = board_for(
+                vec![
+                    on_branch(105, "hubot", "stack/b", "stack/one")?,
+                    on_branch(101, "hubot", "stack/one", "main")?,
+                    on_branch(103, "hubot", "stack/a", "stack/one")?,
+                ],
+                &me,
+            );
+            Ok::<_, InvalidValue>(shape(board.unclaimed()))
+        });
+        assert_eq!(
+            drawn,
+            Ok(vec![
+                (101, 0, None),
+                (103, 1, Some(101)),
+                (105, 1, Some(101))
+            ])
+        );
+    }
+
+    /// The unclaimed group's shape, built from `prs`.
+    fn unclaimed_shape(
+        prs: Vec<Result<PrFacts, InvalidValue>>,
+    ) -> Result<Vec<(u32, usize, Option<u32>)>, InvalidValue> {
+        let me = Login::parse("octocat")?;
+        let built = prs.into_iter().collect::<Result<Vec<_>, _>>()?;
+        Ok(shape(board_for(built, &me).unclaimed()))
+    }
+
+    #[test]
+    fn a_fork_named_like_a_branch_here_is_never_beneath_anything() {
+        // A fork's `main` is not this repository's `main`. Read by name, 102
+        // would sit on 101, and so would every pull request aimed at `main`.
+        let drawn = unclaimed_shape(vec![
+            on_branch_in(HeadRepository::Fork, 101, "main", "main"),
+            on_branch_in(HeadRepository::ThisOne, 102, "stack/one", "main"),
+            on_branch_in(HeadRepository::ThisOne, 103, "stack/two", "stack/one"),
+        ]);
+        assert_eq!(
+            drawn,
+            Ok(vec![(101, 0, None), (102, 0, None), (103, 1, Some(102))])
+        );
+    }
+
+    #[test]
+    fn a_head_github_did_not_place_is_never_beneath_anything() {
+        // Without GitHub saying the branch is here, `stack/one` may be a fork's
+        // branch of that name, and a stack drawn onto it would be invented.
+        let drawn = unclaimed_shape(vec![
+            on_branch_in(HeadRepository::Unstated, 101, "stack/one", "main"),
+            on_branch_in(HeadRepository::ThisOne, 102, "stack/x", "main"),
+            on_branch_in(HeadRepository::ThisOne, 103, "stack/two", "stack/one"),
+        ]);
+        assert_eq!(
+            drawn,
+            Ok(vec![(101, 0, None), (102, 0, None), (103, 0, None)])
+        );
+    }
+
+    #[test]
+    fn a_fork_can_still_sit_on_a_branch_here() {
+        // A fork's base is always in this repository, so only being *beneath*
+        // something needs the head to be here.
+        let drawn = unclaimed_shape(vec![
+            on_branch_in(HeadRepository::ThisOne, 101, "stack/one", "main"),
+            on_branch_in(HeadRepository::Fork, 102, "patch-1", "stack/one"),
+        ]);
+        assert_eq!(drawn, Ok(vec![(101, 0, None), (102, 1, Some(101))]));
     }
 
     #[test]
@@ -1032,9 +1532,9 @@ mod tests {
                 numbers(board.your_drafts()),
                 numbers(board.needs_your_review()),
                 numbers(board.other_drafts()),
-                // Unclaimed, not `not_waiting_on_you`: nobody asked the viewer
+                // Unclaimed, not `you_reviewed`: nobody asked the viewer
                 // about these and the viewer has not reviewed them, so they are
-                // the group that gets rendered.
+                // the group somebody could usefully pick up.
                 numbers(board.unclaimed()),
                 board.total(),
             ))
@@ -1145,7 +1645,7 @@ mod tests {
             let board = board_for(vec![team_only], &me);
             let still_named = board
                 .unclaimed()
-                .iter()
+                .rows()
                 .flat_map(|row| row.facts().requested_reviewers.iter())
                 .filter_map(Reviewer::name)
                 .map(str::to_owned)
