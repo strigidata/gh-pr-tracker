@@ -303,21 +303,7 @@ impl BoardText<'_> {
 
         let line = format!(
             "{}{}{}{}{}{}{}",
-            // The number is a link to the pull request. OSC 8 costs no columns,
-            // so the URL is reachable without a column wide enough to print it
-            // — and the row stays scannable, which a full URL per row does not.
-            // The tree mark sits outside the link: it is not the pull request.
-            pad_to(
-                &format!(
-                    "{}{}",
-                    tree_prefix(placed.depth()),
-                    palette.link(
-                        facts.url.as_str(),
-                        &palette.paint(Style::Plain, &format!("#{}", facts.number.get())),
-                    )
-                ),
-                pr_column
-            ),
+            pad_to(&pr_cell(placed, palette), pr_column),
             pad_to(
                 &palette.paint(Style::Plain, truncate_to(author, AUTHOR_CELLS)),
                 AUTHOR_COLUMN
@@ -329,14 +315,7 @@ impl BoardText<'_> {
             pad_to(&threads_cell(row, self.rules, self.palette), THREADS_COLUMN),
             pad_to(&merge_cell(row, is_draft, palette), MERGE_COLUMN),
             pad_to(&reason_cell(row.reason(), self.palette), REASON_COLUMN),
-            if self.show_branch {
-                pad_to(
-                    &palette.paint(Style::Plain, &self.age_of(row)),
-                    SINCE_PUSH_COLUMN,
-                )
-            } else {
-                palette.paint(Style::Plain, &self.age_of(row))
-            },
+            self.since_push_cell(row, palette),
         );
         if self.show_branch {
             // Dim in every row, including one that is otherwise bright: the
@@ -350,6 +329,17 @@ impl BoardText<'_> {
             format!("{line}{branch}")
         } else {
             line
+        }
+    }
+
+    /// The age column: padded when the branch column follows it, left as it is
+    /// when it ends the row.
+    fn since_push_cell(&self, row: &BoardRow, palette: Palette) -> String {
+        let age = palette.paint(Style::Plain, &self.age_of(row));
+        if self.show_branch {
+            pad_to(&age, SINCE_PUSH_COLUMN)
+        } else {
+            age
         }
     }
 
@@ -423,6 +413,23 @@ fn tree_prefix(depth: usize) -> String {
         .map_or_else(String::new, |levels_below| {
             format!("{}└ ", " ".repeat(levels_below * TREE_STEP))
         })
+}
+
+/// The number, as a link to the pull request, behind its tree mark if stacked.
+///
+/// OSC 8 costs no columns, so the URL is reachable without a column wide enough
+/// to print it, and the row stays scannable, which a full URL per row does not.
+/// The tree mark sits outside the link: it is not the pull request.
+fn pr_cell(placed: &Placed<'_>, palette: Palette) -> String {
+    let facts = placed.row().facts();
+    format!(
+        "{}{}",
+        tree_prefix(placed.depth()),
+        palette.link(
+            facts.url.as_str(),
+            &palette.paint(Style::Plain, &format!("#{}", facts.number.get())),
+        )
+    )
 }
 
 /// What CI says, in the space of one column.
