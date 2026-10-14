@@ -63,8 +63,8 @@ pub use facts::{
     Review, ReviewDecision, Reviewer, TeamSlug, Verdict,
 };
 pub use nudge::{
-    observe, ApprovalState, Nudge, Observation, ReasonKind, RequiredCheckHealth, ReviewRequest,
-    Watched,
+    observe, ApprovalState, Nudge, Observation, ReasonKind, RequiredCheckHealth, Rereview,
+    ReviewRequest, Watched,
 };
 pub use policy::{BlockingChecks, PolicyRules, RequiredChecks, Requirement, StaleReviewHandling};
 pub use types::{CheckName, HeadSha, InvalidValue, Login, PrNumber, RepoRef};

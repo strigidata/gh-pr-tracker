@@ -10,8 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use prtrack_core::{
-    ApprovalState, HeadSha, InvalidValue, PrNumber, ReasonKind, RequiredCheckHealth, ReviewRequest,
-    Watched,
+    ApprovalState, HeadSha, InvalidValue, PrNumber, ReasonKind, RequiredCheckHealth, Rereview,
+    ReviewRequest, Watched,
 };
 use serde::{Deserialize, Serialize};
 
@@ -83,6 +83,11 @@ struct StoredPullRequest {
     review_request: String,
     approval: String,
     required_checks: String,
+    /// Absent from a file written before re-reviews were tracked, which reads
+    /// as not due: the next push after an upgrade then still nudges, where
+    /// refusing the file would have made every pull request a first sighting.
+    #[serde(default)]
+    rereview: String,
 }
 
 /// The file.
@@ -251,6 +256,11 @@ fn store(watched: &Watched) -> StoredPullRequest {
             RequiredCheckHealth::NoneFailing => "none-failing",
         }
         .to_owned(),
+        rereview: match watched.rereview() {
+            Rereview::Due => "due",
+            Rereview::NotDue => "not-due",
+        }
+        .to_owned(),
     }
 }
 
@@ -271,12 +281,17 @@ fn restore(entry: &StoredPullRequest) -> Result<Watched, StateError> {
         "some-failing" => RequiredCheckHealth::SomeFailing,
         _ => RequiredCheckHealth::NoneFailing,
     };
+    let rereview = match entry.rereview.as_str() {
+        "due" => Rereview::Due,
+        _ => Rereview::NotDue,
+    };
     Ok(Watched::restored(
         reason,
         HeadSha::parse(&entry.head)?,
         review_request,
         approval,
         required_checks,
+        rereview,
     ))
 }
 
@@ -328,7 +343,7 @@ fn reason_of(name: &str) -> Option<ReasonKind> {
 mod tests {
     use super::{StateError, WatchState};
     use prtrack_core::{
-        ApprovalState, HeadSha, InvalidValue, PrNumber, ReasonKind, RequiredCheckHealth,
+        ApprovalState, HeadSha, InvalidValue, PrNumber, ReasonKind, RequiredCheckHealth, Rereview,
         ReviewRequest, Watched,
     };
     use std::fs;
@@ -376,6 +391,7 @@ mod tests {
             ReviewRequest::NotAskedOfYou,
             ApprovalState::Approved,
             RequiredCheckHealth::NoneFailing,
+            Rereview::NotDue,
         ))
     }
 
@@ -579,5 +595,55 @@ mod tests {
             "expected the unknown rung to be named, got {:?}",
             loaded.map(|state| state.len())
         );
+    }
+
+    #[test]
+    fn a_due_re_review_survives_a_restart() {
+        // Losing it would make the next poll see "not due" and the one after
+        // see "due" again -- the transition fired a second time, by a restart.
+        let scratch = Scratch::new("rereview");
+        let restored = (|| -> Result<_, String> {
+            let due = Watched::restored(
+                ReasonKind::ChangesRequested,
+                HeadSha::parse(A_HEAD).map_err(|e| e.to_string())?,
+                ReviewRequest::NotAskedOfYou,
+                ApprovalState::NotApproved,
+                RequiredCheckHealth::NoneFailing,
+                Rereview::Due,
+            );
+            let one = PrNumber::new(101).map_err(|e| e.to_string())?;
+            let mut state = WatchState::default();
+            state.remember(one, due);
+            state.save(&scratch.file()).map_err(|e| said(&e))?;
+
+            let reloaded = WatchState::load(&scratch.file()).map_err(|e| said(&e))?;
+            Ok(reloaded.remembered(one).map(Watched::rereview))
+        })();
+
+        assert_eq!(restored, Ok(Some(Rereview::Due)));
+    }
+
+    #[test]
+    fn a_state_file_from_before_re_reviews_were_tracked_still_loads() {
+        // Written by a build that did not know the field. Refusing it would
+        // turn an upgrade into a first sighting for every pull request; reading
+        // it as not due means the first push after the upgrade still nudges.
+        let scratch = Scratch::new("pre-rereview");
+        let written = fs::write(
+            scratch.file(),
+            format!(
+                r#"{{"version":1,"pull_requests":{{"101":{{"reason":"changes-requested","head":"{A_HEAD}","review_request":"not-asked-of-you","approval":"not-approved","required_checks":"none-failing"}}}}}}"#
+            ),
+        );
+        assert!(written.is_ok());
+
+        let restored = WatchState::load(&scratch.file())
+            .map_err(|error| said(&error))
+            .and_then(|state| {
+                let one = PrNumber::new(101).map_err(|e| e.to_string())?;
+                Ok(state.remembered(one).map(Watched::rereview))
+            });
+
+        assert_eq!(restored, Ok(Some(Rereview::NotDue)));
     }
 }
