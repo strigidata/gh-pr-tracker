@@ -16,8 +16,8 @@
 use chrono::{DateTime, Utc};
 use prtrack_core::{
     BranchName, Check, CheckName, CheckState, DraftState, HeadRepository, HeadSha, Login,
-    MergeState, MergeableState, PolicyRules, PrFacts, PrNumber, PrTitle, PrUrl, RepoRef,
-    ReviewDecision, Reviewer, TeamSlug,
+    MergeState, MergeableState, PolicyRules, PrFacts, PrNumber, PrTitle, PrUrl, RepoRef, Review,
+    ReviewDecision, Reviewer, TeamSlug, Verdict,
 };
 
 use crate::client::OpenPullRequests;
@@ -206,7 +206,7 @@ fn facts_of(
         merge_state: merge_state_of(&pull_request.merge_state_status),
         requested_reviewers: reviewers_of(pull_request).map_err(refuse)?,
         changes_requested_by: changes_requested_by(pull_request).map_err(refuse)?,
-        reviewed_by: reviewed_by(pull_request).map_err(refuse)?,
+        reviews: reviews_of(pull_request).map_err(refuse)?,
         unresolved_threads: unresolved_threads(pull_request),
         comments: u32::try_from(pull_request.comments.total_count).map_err(|_source| {
             ConversionError::NegativeCount {
@@ -246,10 +246,13 @@ fn reviewers_of(
         .collect()
 }
 
-/// Everyone whose review still stands.
+/// Every review that still stands, with the commit it was made on.
 ///
 /// Answers "have I already had my say", which the request list cannot: GitHub
-/// removes a reviewer from `reviewRequests` the moment they submit.
+/// removes a reviewer from `reviewRequests` the moment they submit. The commit
+/// answers "and has it changed since?" — absent where GitHub did not report
+/// one, and refused where it reported one no commit could have, the same way a
+/// malformed head is.
 ///
 /// # Only verdicts that still count
 ///
@@ -262,25 +265,46 @@ fn reviewers_of(
 /// `Commented` is excluded too: a comment is not a verdict, and somebody who
 /// asked a question has not reviewed. `Pending` is a draft review nobody has
 /// submitted.
-fn reviewed_by(pull_request: &wire::PullRequest) -> Result<Vec<Login>, prtrack_core::InvalidValue> {
+fn reviews_of(pull_request: &wire::PullRequest) -> Result<Vec<Review>, prtrack_core::InvalidValue> {
     pull_request
         .latest_reviews
         .nodes
         .iter()
         .flatten()
         .flatten()
-        .filter(|review| match review.state {
-            wire::ReviewState::Approved | wire::ReviewState::ChangesRequested => true,
-            // Named rather than wildcarded, so a state GitHub adds later is a
-            // compile error here instead of a silent "yes, they reviewed it".
-            wire::ReviewState::Dismissed
-            | wire::ReviewState::Commented
-            | wire::ReviewState::Pending
-            | wire::ReviewState::Unknown(_) => false,
+        .filter_map(|review| {
+            let verdict = match review.state {
+                wire::ReviewState::Approved => Verdict::Approved,
+                wire::ReviewState::ChangesRequested => Verdict::ChangesRequested,
+                // Named rather than wildcarded, so a state GitHub adds later is
+                // a compile error here instead of a silent "yes, they reviewed
+                // it".
+                wire::ReviewState::Dismissed
+                | wire::ReviewState::Commented
+                | wire::ReviewState::Pending
+                | wire::ReviewState::Unknown(_) => return None,
+            };
+            // A review by an account since deleted names nobody to compare
+            // the viewer against.
+            let actor = review.author.as_ref()?;
+            Some(review_of(actor, verdict, review.commit.as_ref()))
         })
-        .filter_map(|review| review.author.as_ref())
-        .map(|actor| Login::parse(&actor.login))
         .collect()
+}
+
+/// One standing review, its reviewer and commit checked.
+fn review_of(
+    actor: &wire::Actor,
+    verdict: Verdict,
+    commit: Option<&wire::ReviewCommit>,
+) -> Result<Review, prtrack_core::InvalidValue> {
+    Ok(Review {
+        by: Login::parse(&actor.login)?,
+        verdict,
+        on: commit
+            .map(|commit| HeadSha::parse(&commit.oid))
+            .transpose()?,
+    })
 }
 
 /// The reviewers whose latest word was a request for changes.
@@ -491,7 +515,7 @@ mod tests {
     use crate::wire::{self, PAGE_1, PAGE_2, TOTAL_OPEN};
     use prtrack_core::{
         BlockingChecks, Board, BoardRow, BranchName, CheckState, DraftState, HeadRepository,
-        MergeState, MergeableState, RepoRef,
+        HeadSha, Login, MergeState, MergeableState, RepoRef, Review, Verdict,
     };
 
     /// The repository the recordings are of, after redaction.
@@ -1069,7 +1093,7 @@ mod tests {
                 facts
                     .pull_requests()
                     .iter()
-                    .map(|(pr, _)| pr.reviewed_by.len())
+                    .map(|(pr, _)| pr.reviews.len())
                     .sum::<usize>()
             })
         };
@@ -1085,6 +1109,83 @@ mod tests {
             dismissed,
             Some(0),
             "a dismissed review is not a review that still stands"
+        );
+    }
+
+    /// The recording with every pull request's latest reviews replaced by the
+    /// one review given, written into the JSON rather than the struct so that
+    /// its spelling on the wire is under test too.
+    fn recorded_with_review(review: &serde_json::Value) -> Option<OpenPullRequests> {
+        let mut open = recorded()?;
+        for pull_request in &mut open.pull_requests {
+            let mut json = serde_json::to_value(&*pull_request).ok()?;
+            let reviews = json.get_mut("latestReviews")?.as_object_mut()?;
+            reviews.insert(
+                "nodes".to_owned(),
+                serde_json::Value::Array(vec![review.clone()]),
+            );
+            *pull_request = serde_json::from_value(json).ok()?;
+        }
+        Some(open)
+    }
+
+    #[test]
+    fn a_review_remembers_the_commit_it_was_made_on() {
+        // Synthetic: the recordings predate `commit { oid }` on a review, so
+        // no recorded review carries one, and a conversion that dropped it
+        // would pass every test built on them.
+        const ON: &str = "0123456789abcdef0123456789abcdef01234567";
+        let review = |state: &str, commit: Option<&str>| {
+            let mut json = serde_json::json!({
+                "state": state,
+                "author": { "login": "octocat" },
+                "submittedAt": "2026-08-24T11:24:06Z",
+            });
+            if let (Some(oid), Some(fields)) = (commit, json.as_object_mut()) {
+                fields.insert("commit".to_owned(), serde_json::json!({ "oid": oid }));
+            }
+            json
+        };
+        let first_reviews = |review: &serde_json::Value| {
+            recorded_with_review(review)
+                .and_then(|open| RepositoryFacts::try_from(open).ok())
+                .and_then(|facts| {
+                    facts
+                        .pull_requests()
+                        .first()
+                        .map(|(facts, _)| facts.reviews.clone())
+                })
+        };
+        let expected = |on: Option<&str>| -> Option<Vec<Review>> {
+            Some(vec![Review {
+                by: Login::parse("octocat").ok()?,
+                verdict: Verdict::ChangesRequested,
+                on: on.map(HeadSha::parse).transpose().ok()?,
+            }])
+        };
+
+        assert_eq!(
+            first_reviews(&review("CHANGES_REQUESTED", Some(ON))),
+            expected(Some(ON)),
+            "a review GitHub placed on a commit keeps that commit"
+        );
+        assert_eq!(
+            first_reviews(&review("CHANGES_REQUESTED", None)),
+            expected(None),
+            "a review GitHub placed on no commit is still a review, on nothing known"
+        );
+        assert_eq!(
+            first_reviews(&review("COMMENTED", Some(ON))),
+            Some(Vec::new()),
+            "a comment is not a verdict, whatever commit it was on"
+        );
+
+        let refused = recorded_with_review(&review("APPROVED", Some("not-a-commit")))
+            .and_then(|open| RepositoryFacts::try_from(open).err());
+        assert!(
+            matches!(refused, Some(ConversionError::PullRequest { .. })),
+            "an oid no commit could have is a broken response, refused like a malformed head: \
+             {refused:?}"
         );
     }
 

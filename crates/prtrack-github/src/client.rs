@@ -1561,12 +1561,13 @@ mod tests {
 
     /// A field the query asks for that was added after the recordings were made.
     ///
-    /// Not the same claim as [`REQUESTED_BUT_NEVER_RETURNED`]: GitHub always
-    /// returns `isCrossRepository`, and these recordings lack it only because
-    /// they predate the selection. They are not re-recorded because the
-    /// recorder keeps real pull request numbers. Remove the entry when the
-    /// fixtures are next re-recorded.
-    const ASKED_FOR_AFTER_THE_RECORDING: [&str; 1] = ["isCrossRepository"];
+    /// Not the same claim as [`REQUESTED_BUT_NEVER_RETURNED`]: GitHub returns
+    /// `isCrossRepository` on every pull request and `oid` on every review it
+    /// can place on a commit, and these recordings lack both only because they
+    /// predate the selections. They are not re-recorded because the recorder
+    /// keeps real pull request numbers. Remove the entries when the fixtures
+    /// are next re-recorded.
+    const ASKED_FOR_AFTER_THE_RECORDING: [&str; 2] = ["isCrossRepository", "oid"];
 
     #[test]
     fn the_query_asks_for_every_field_the_recording_contains() {
@@ -1650,9 +1651,14 @@ mod tests {
             // Anchoring on the whole commit selection is what makes this a
             // guard rather than a spot check.
             //
+            // The head commit's `commit {`, found inside the `commits`
+            // connection. A review selects a `commit {` of its own, earlier in
+            // the main query, and anchoring on the first one would compare
+            // the review's fields and everything after them instead.
             // `commit {` rather than `commit`, so it cannot match `commits`.
             let from_commit = without_arguments
-                .split_once("commit {")
+                .split_once("commits")
+                .and_then(|(_, rest)| rest.split_once("commit {"))
                 .map_or("", |(_, rest)| rest);
             // In order, and not deduplicated. A sorted set cannot see the
             // failure this exists to catch: `state` is selected twice in the

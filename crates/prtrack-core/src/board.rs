@@ -250,7 +250,7 @@ impl Section {
         // Already had your say — approved it, or asked for changes. The next
         // move is somebody else's, and showing it as reviewable would be asking
         // you to do a thing you have done.
-        if facts.reviewed_by.contains(viewer) {
+        if facts.reviews.iter().any(|review| &review.by == viewer) {
             return Self::YouReviewed;
         }
         Self::Unclaimed
@@ -796,7 +796,7 @@ mod tests {
     use crate::checks::{Check, CheckState};
     use crate::facts::{
         BranchName, DraftState, HeadRepository, MergeState, MergeableState, PrFacts, PrTitle,
-        PrUrl, ReviewDecision, Reviewer, TeamSlug,
+        PrUrl, Review, ReviewDecision, Reviewer, TeamSlug, Verdict,
     };
     use crate::policy::{BlockingChecks, PolicyRules, Requirement};
     use crate::types::{CheckName, HeadSha, InvalidValue, Login, PrNumber, RepoRef};
@@ -834,7 +834,7 @@ mod tests {
             merge_state: MergeState::Clean,
             requested_reviewers: Vec::new(),
             changes_requested_by: Vec::new(),
-            reviewed_by: Vec::new(),
+            reviews: Vec::new(),
             unresolved_threads: 0,
             comments: 0,
             checks: Vec::new(),
@@ -1021,7 +1021,11 @@ mod tests {
         // The bottom was reviewed by the viewer; the two above it were not.
         let placed = Login::parse("octocat").and_then(|me| {
             let mut bottom = on_branch(101, "hubot", "stack/one", "main")?;
-            bottom.reviewed_by = vec![me.clone()];
+            bottom.reviews = vec![Review {
+                by: me.clone(),
+                verdict: Verdict::Approved,
+                on: None,
+            }];
             let board = board_for(
                 vec![
                     bottom,

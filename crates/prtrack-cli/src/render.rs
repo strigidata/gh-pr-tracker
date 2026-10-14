@@ -634,7 +634,7 @@ mod tests {
     use prtrack_core::{
         Board, BoardRow, BranchName, CheckName, DraftState, HeadRepository, HeadSha, InvalidValue,
         Login, MergeState, MergeableState, PolicyRules, PrFacts, PrNumber, PrTitle, PrUrl, RepoRef,
-        RequiredChecks, Requirement, Reviewer, StaleReviewHandling,
+        RequiredChecks, Requirement, Review, Reviewer, StaleReviewHandling, Verdict,
     };
 
     /// An object id. Nothing rendered reads it.
@@ -687,7 +687,7 @@ mod tests {
             merge_state: MergeState::Clean,
             requested_reviewers: Vec::new(),
             changes_requested_by: Vec::new(),
-            reviewed_by: Vec::new(),
+            reviews: Vec::new(),
             unresolved_threads: 0,
             comments: 0,
             checks: Vec::new(),
@@ -1793,7 +1793,11 @@ mod tests {
         let rendered = Login::parse("octocat")
             .and_then(|me| {
                 let mut reviewed = open_pr(101, "hubot")?;
-                reviewed.reviewed_by = vec![me.clone()];
+                reviewed.reviews = vec![Review {
+                    by: me.clone(),
+                    verdict: Verdict::Approved,
+                    on: None,
+                }];
                 reviewed.mergeable = MergeableState::Conflicting;
                 Ok(render(
                     vec![reviewed],
