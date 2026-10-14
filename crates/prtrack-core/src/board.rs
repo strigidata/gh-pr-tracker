@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::checks::{classify, Classified};
 use crate::decision::BlockedReason;
-use crate::facts::{BranchName, DraftState, HeadRepository, PrFacts};
+use crate::facts::{BranchName, DraftState, HeadRepository, PrFacts, Verdict};
 use crate::policy::PolicyRules;
 use crate::types::{Login, PrNumber};
 
@@ -247,9 +247,16 @@ impl Section {
         {
             return Self::NeedsYourReview;
         }
-        // Already had your say — approved it, or asked for changes. The next
-        // move is somebody else's, and showing it as reviewable would be asking
-        // you to do a thing you have done.
+        // Had your say, and the author has pushed since: the code you judged
+        // is gone, so the next move is yours again. Exact rather than by the
+        // clock — see `PrFacts::rereview_due` for why a review GitHub did not
+        // place on a commit never counts as pushed past.
+        if facts.rereview_due(viewer).is_some() {
+            return Self::NeedsYourReview;
+        }
+        // Already had your say on the head — approved it, or asked for
+        // changes. The next move is somebody else's, and showing it as
+        // reviewable would be asking you to do a thing you have done.
         if facts.reviews.iter().any(|review| &review.by == viewer) {
             return Self::YouReviewed;
         }
@@ -273,6 +280,9 @@ pub struct BoardRow {
     facts: PrFacts,
     checks: Classified,
     reason: BlockedReason,
+    /// The rule the reason was decided under, kept so the board can put a
+    /// viewer's question about the same facts to the same rule.
+    policy: PolicyRules,
 }
 
 impl BoardRow {
@@ -293,6 +303,7 @@ impl BoardRow {
             facts,
             checks,
             reason,
+            policy: policy.clone(),
         }
     }
 
@@ -334,6 +345,18 @@ impl BoardRow {
     pub fn reviewability(&self) -> Reviewability {
         Reviewability::of(&self.reason, &self.checks)
     }
+
+    /// Why it could not merge once `viewer`'s own change request is answered.
+    ///
+    /// The ladder decided on the facts with the viewer taken out of
+    /// [`PrFacts::changes_requested_by`], under the same rule as
+    /// [`BoardRow::reason`]. Only the viewer is removed: a request somebody
+    /// else made is not answered by a push the viewer has yet to read.
+    fn reason_once_answered(&self, viewer: &Login) -> BlockedReason {
+        let mut facts = self.facts.clone();
+        facts.changes_requested_by.retain(|login| login != viewer);
+        BlockedReason::decide(&facts, &self.policy)
+    }
 }
 
 /// One pull request, and every pull request stacked on top of it.
@@ -346,6 +369,12 @@ pub struct Stack {
     /// Where this row would sit on its own. A stacked row is drawn in its
     /// root's section, and the counts under the board still read this.
     own: Section,
+    /// The viewer's verdict the author has pushed past, where that is what
+    /// put the row in front of them; `None` everywhere else.
+    rereview: Option<Verdict>,
+    /// Why it cannot merge, as the viewer should read it: past their own
+    /// answered change request on a re-review, the row's reason otherwise.
+    reason: BlockedReason,
     above: Vec<Self>,
 }
 
@@ -366,10 +395,15 @@ impl Stack {
         1 + self.above.iter().map(Self::len).sum::<usize>()
     }
 
+    /// How much good opening this row would do the viewer, read off the
+    /// viewer-adjusted reason. The sort key of both review groups.
+    fn reviewability(&self) -> Reviewability {
+        Reviewability::of(&self.reason, &self.row.checks)
+    }
+
     fn walk_into<'a>(&'a self, position: Position, out: &mut Vec<Placed<'a>>) {
         out.push(Placed {
-            row: &self.row,
-            own: self.own,
+            stack: self,
             position,
         });
         let depth = position.depth().saturating_add(1);
@@ -406,8 +440,7 @@ impl Position {
 /// One row as a reader meets it: in pre-order, with how far up a stack it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placed<'a> {
-    row: &'a BoardRow,
-    own: Section,
+    stack: &'a Stack,
     position: Position,
 }
 
@@ -415,7 +448,7 @@ impl<'a> Placed<'a> {
     /// The pull request.
     #[must_use]
     pub const fn row(&self) -> &'a BoardRow {
-        self.row
+        &self.stack.row
     }
 
     /// How many pull requests it is stacked on. Zero for a root.
@@ -431,6 +464,30 @@ impl<'a> Placed<'a> {
             Position::Root => None,
             Position::Stacked { on, .. } => Some(on),
         }
+    }
+
+    /// The verdict the viewer gave before the author pushed again, when that
+    /// is why this row is in front of them.
+    ///
+    /// `None` for a row the viewer has not had a say on, has had a say on at
+    /// the head, or that is not somebody else's open pull request. See
+    /// [`PrFacts::rereview_due`] for when a review counts as pushed past.
+    #[must_use]
+    pub const fn rereview(&self) -> Option<Verdict> {
+        self.stack.rereview
+    }
+
+    /// How much good it would do the viewer to open this row now.
+    ///
+    /// [`BoardRow::reviewability`] as the viewer should read it. On a
+    /// re-review the viewer's own change request is what the push answered,
+    /// so it is set aside and only what else blocks the row counts; without
+    /// that, a re-review would be dimmed and sorted last by the very request
+    /// it asks the viewer to look at again. Identical to
+    /// [`BoardRow::reviewability`] on every other row.
+    #[must_use]
+    pub fn reviewability(&self) -> Reviewability {
+        self.stack.reviewability()
     }
 }
 
@@ -469,7 +526,7 @@ impl Stacks {
 
     /// Every row in pre-order, without its position.
     pub fn rows(&self) -> impl Iterator<Item = &BoardRow> {
-        self.walk().into_iter().map(|placed| placed.row)
+        self.walk().into_iter().map(|placed| placed.row())
     }
 }
 
@@ -479,7 +536,7 @@ impl Stacks {
 /// that a pull request whose base is another's head is drawn above it. A pull
 /// request stacked on nothing is a tree of one. A stacked row is drawn in its
 /// root's section, not its own, so a stack is never split across the board;
-/// the counts ([`Board::awaiting_review`], [`Board::you_have_reviewed`]) still
+/// the counts ([`Board::reviewable_now`], [`Board::you_have_reviewed`]) still
 /// read where each row would sit on its own.
 ///
 /// # Nothing is dropped
@@ -566,7 +623,7 @@ impl Board {
         });
         self.needs_your_review.0.sort_by_key(|stack| {
             (
-                stack.row.reviewability(),
+                stack.reviewability(),
                 stack.row.facts.last_push,
                 stack.row.facts.number.get(),
             )
@@ -592,7 +649,7 @@ impl Board {
         // that has sat longest comes first.
         self.unclaimed.0.sort_by_key(|stack| {
             (
-                stack.row.reviewability(),
+                stack.reviewability(),
                 stack.row.facts.last_push,
                 stack.row.facts.number.get(),
             )
@@ -664,7 +721,7 @@ impl Board {
     ///
     /// A row stacked on such a pull request is drawn here with it, whether or
     /// not the viewer has reviewed that row too; [`Board::you_have_reviewed`]
-    /// and [`Board::awaiting_review`] count each row where it would sit alone.
+    /// and [`Board::reviewable_now`] count each row where it would sit alone.
     ///
     /// GitHub removes a reviewer from the request list the moment they submit,
     /// so without checking who has reviewed, work the viewer approved would be
@@ -688,20 +745,35 @@ impl Board {
         .flat_map(Stacks::walk)
     }
 
-    /// Rows that would be in the review section on their own: asked of the
-    /// viewer, or asked of nobody. Counted by row, not by tree, so a row
-    /// stacked into another section still counts where it belongs.
-    pub fn awaiting_review(&self) -> impl Iterator<Item = &BoardRow> {
+    /// How many rows are worth the viewer opening now: rows that would be in
+    /// the review section on their own — asked of the viewer, asked of nobody,
+    /// or a re-review — whose [`Placed::reviewability`] is above
+    /// [`Reviewability::CiRunning`].
+    ///
+    /// Counted by row, not by tree, so a row stacked into another section
+    /// still counts where it belongs.
+    #[must_use]
+    pub fn reviewable_now(&self) -> usize {
         self.walk()
-            .filter(|placed| matches!(placed.own, Section::NeedsYourReview | Section::Unclaimed))
-            .map(|placed| placed.row)
+            .filter(|placed| {
+                matches!(
+                    placed.stack.own,
+                    Section::NeedsYourReview | Section::Unclaimed
+                )
+            })
+            .filter(|placed| placed.reviewability() < Reviewability::CiRunning)
+            .count()
     }
 
-    /// How many rows the viewer has already reviewed, wherever they are drawn.
+    /// How many rows the viewer has already reviewed at their head, wherever
+    /// they are drawn.
+    ///
+    /// A review the author has pushed past is not counted: that row is a
+    /// re-review, back in [`Board::needs_your_review`].
     #[must_use]
     pub fn you_have_reviewed(&self) -> usize {
         self.walk()
-            .filter(|placed| placed.own == Section::YouReviewed)
+            .filter(|placed| placed.stack.own == Section::YouReviewed)
             .count()
     }
 
@@ -783,16 +855,33 @@ fn grow(
         .filter_map(|&child| grow(child, slots, children, viewer))
         .collect();
     above.sort_by_key(|stack| stack.row.facts.number.get());
+    let own = Section::of(&row.facts, viewer);
+    // Only where the row is the viewer's to review: a stale review on a draft
+    // or on the viewer's own pull request is not a request to look again.
+    let rereview = match own {
+        Section::NeedsYourReview => row.facts.rereview_due(viewer),
+        Section::Yours
+        | Section::YourDrafts
+        | Section::OtherDrafts
+        | Section::Unclaimed
+        | Section::YouReviewed => None,
+    };
+    let reason = match rereview {
+        Some(_) => row.reason_once_answered(viewer),
+        None => row.reason.clone(),
+    };
     Some(Stack {
-        own: Section::of(&row.facts, viewer),
         row,
+        own,
+        rereview,
+        reason,
         above,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Board, BoardRow, Stacks};
+    use super::{Board, BoardRow, Reviewability, Stacks};
     use crate::checks::{Check, CheckState};
     use crate::facts::{
         BranchName, DraftState, HeadRepository, MergeState, MergeableState, PrFacts, PrTitle,
@@ -933,6 +1022,197 @@ mod tests {
         Board::assemble(rows, viewer)
     }
 
+    /// The commit the viewer reviewed, in the re-review tests: not the head.
+    const EARLIER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    /// The head the author pushed afterwards, in the re-review tests.
+    const PUSHED: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// `open_pr` by `monalisa` with its head at [`PUSHED`], green under the
+    /// gate, and one review by `by` on `on` (`None`: GitHub did not say).
+    ///
+    /// A change request is also entered where GitHub keeps it — in
+    /// `changes_requested_by` and the review decision — because that is the
+    /// stale fact a re-review has to see past.
+    fn reviewed(
+        number: u32,
+        by: &Login,
+        verdict: Verdict,
+        on: Option<&str>,
+    ) -> Result<PrFacts, InvalidValue> {
+        let mut pr = open_pr(number, "monalisa")?;
+        pr.head = HeadSha::parse(PUSHED)?;
+        pr.checks = vec![check("Preview CI Gate", "SUCCESS")?];
+        pr.reviews = vec![Review {
+            by: by.clone(),
+            verdict,
+            on: on.map(HeadSha::parse).transpose()?,
+        }];
+        match verdict {
+            Verdict::ChangesRequested => {
+                pr.changes_requested_by = vec![by.clone()];
+                pr.review_decision = Some(ReviewDecision::ChangesRequested);
+            }
+            Verdict::Approved => pr.review_decision = Some(ReviewDecision::Approved),
+        }
+        Ok(pr)
+    }
+
+    /// Where the one pull request on `board` was drawn, and how it reads:
+    /// (needs your review, you reviewed, re-review, placed reviewability,
+    /// reviewable now, you have reviewed).
+    type Reading = (
+        Vec<u32>,
+        Vec<u32>,
+        Option<Verdict>,
+        Option<Reviewability>,
+        usize,
+        usize,
+    );
+
+    fn read(board: &Board) -> Reading {
+        let placed = board.walk().next();
+        (
+            numbers(board.needs_your_review()),
+            numbers(board.you_reviewed()),
+            placed.and_then(|at| at.rereview()),
+            placed.map(|at| at.reviewability()),
+            board.reviewable_now(),
+            board.you_have_reviewed(),
+        )
+    }
+
+    #[test]
+    fn a_change_request_answered_by_a_push_is_back_in_your_review_list() {
+        // GitHub still says CHANGES_REQUESTED, by the viewer. Read naively,
+        // the row is waiting on its author; it is waiting on the viewer, who
+        // asked on a commit that is no longer the head.
+        let reading = Login::parse("octocat").and_then(|me| {
+            let pr = reviewed(101, &me, Verdict::ChangesRequested, Some(EARLIER))?;
+            Ok::<_, InvalidValue>(read(&board_for(vec![pr], &me)))
+        });
+        assert_eq!(
+            reading,
+            Ok((
+                vec![101],
+                vec![],
+                Some(Verdict::ChangesRequested),
+                Some(Reviewability::Ready),
+                1,
+                0
+            ))
+        );
+    }
+
+    #[test]
+    fn an_approval_followed_by_a_push_is_back_in_your_review_list() {
+        let reading = Login::parse("octocat").and_then(|me| {
+            let pr = reviewed(101, &me, Verdict::Approved, Some(EARLIER))?;
+            Ok::<_, InvalidValue>(read(&board_for(vec![pr], &me)))
+        });
+        assert_eq!(
+            reading,
+            Ok((
+                vec![101],
+                vec![],
+                Some(Verdict::Approved),
+                Some(Reviewability::Ready),
+                1,
+                0
+            ))
+        );
+    }
+
+    #[test]
+    fn a_review_on_the_head_stays_where_it_was() {
+        let reading = Login::parse("octocat").and_then(|me| {
+            let pr = reviewed(101, &me, Verdict::ChangesRequested, Some(PUSHED))?;
+            Ok::<_, InvalidValue>(read(&board_for(vec![pr], &me)))
+        });
+        assert_eq!(
+            reading,
+            Ok((
+                vec![],
+                vec![101],
+                None,
+                Some(Reviewability::ChangesRequested),
+                0,
+                1
+            ))
+        );
+    }
+
+    #[test]
+    fn a_review_github_did_not_place_stays_where_it_was() {
+        // No commit is not "some earlier commit": a missing re-review costs
+        // less than a false one.
+        let reading = Login::parse("octocat").and_then(|me| {
+            let pr = reviewed(101, &me, Verdict::ChangesRequested, None)?;
+            Ok::<_, InvalidValue>(read(&board_for(vec![pr], &me)))
+        });
+        assert_eq!(
+            reading,
+            Ok((
+                vec![],
+                vec![101],
+                None,
+                Some(Reviewability::ChangesRequested),
+                0,
+                1
+            ))
+        );
+    }
+
+    #[test]
+    fn somebody_elses_change_request_still_blocks_a_re_review() {
+        // Only the viewer's own request is set aside. `hubot` asked too, and
+        // nothing says the push answered them, so the author still owes a move
+        // and the row is dimmed where it is drawn.
+        let reading = Login::parse("octocat").and_then(|me| {
+            let mut pr = reviewed(101, &me, Verdict::ChangesRequested, Some(EARLIER))?;
+            pr.changes_requested_by.push(Login::parse("hubot")?);
+            Ok::<_, InvalidValue>(read(&board_for(vec![pr], &me)))
+        });
+        assert_eq!(
+            reading,
+            Ok((
+                vec![101],
+                vec![],
+                Some(Verdict::ChangesRequested),
+                Some(Reviewability::ChangesRequested),
+                0,
+                0
+            ))
+        );
+    }
+
+    #[test]
+    fn a_re_review_sorts_as_what_it_is_once_your_request_is_answered() {
+        // Read by the row's own reason the re-review is `ChangesRequested`,
+        // which sorts below a running build. Once the viewer's answered request
+        // is set aside it is green and ready, and comes first. Numbers and
+        // pushes both run the other way, so neither tie-break produces this.
+        let order = Login::parse("octocat").and_then(|me| {
+            let asked = vec![Reviewer::User(me.clone())];
+
+            let mut rereview = reviewed(103, &me, Verdict::ChangesRequested, Some(EARLIER))?;
+            rereview.last_push = at(20);
+
+            let mut building = open_pr(102, "hubot")?;
+            building.requested_reviewers = asked.clone();
+            building.checks = vec![check("Preview CI Gate", "IN_PROGRESS")?];
+            building.last_push = at(10);
+
+            let mut failing = open_pr(101, "hubot")?;
+            failing.requested_reviewers = asked;
+            failing.checks = vec![check("Preview CI Gate", "FAILURE")?];
+            failing.last_push = at(0);
+
+            let board = board_for(vec![failing, building, rereview], &me);
+            Ok::<_, InvalidValue>(numbers(board.needs_your_review()))
+        });
+        assert_eq!(order, Ok(vec![103, 102, 101]));
+    }
+
     #[test]
     fn a_pull_request_on_nothing_is_a_root_at_depth_zero() {
         let placed = Login::parse("octocat").and_then(|me| {
@@ -1038,7 +1318,7 @@ mod tests {
                 numbers(board.you_reviewed()),
                 numbers(board.unclaimed()),
                 board.you_have_reviewed(),
-                board.awaiting_review().count(),
+                board.reviewable_now(),
                 board.total(),
             ))
         });

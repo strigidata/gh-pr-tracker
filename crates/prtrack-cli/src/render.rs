@@ -373,11 +373,7 @@ impl BoardText<'_> {
             .count();
         // Everything the review section shows that is worth opening now, which
         // includes the unclaimed rows appended to it.
-        let reviewable = self
-            .board
-            .awaiting_review()
-            .filter(|row| row.reviewability() < Reviewability::CiRunning)
-            .count();
+        let reviewable = self.board.reviewable_now();
 
         self.palette.paint(
             Style::Dim,
