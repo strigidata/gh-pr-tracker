@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use chrono::{DateTime, Utc};
 use prtrack_core::{
     BlockedReason, BlockingChecks, Board, BoardRow, DraftState, Login, MergeState, MergeableState,
-    Placed, PolicyRules, Requirement, Reviewability, Reviewer, StaleReviewHandling,
+    Placed, PolicyRules, Requirement, Reviewability, Reviewer, StaleReviewHandling, Verdict,
 };
 
 use crate::color::{Palette, Style};
@@ -292,7 +292,10 @@ impl BoardText<'_> {
         let row = placed.row();
         let facts = row.facts();
         let is_draft = facts.draft_state == DraftState::Draft;
-        let unreadable = row.reviewability() >= Reviewability::CiRunning;
+        // The placement's reading, not the row's: on a re-review the viewer's
+        // own change request is what the push answered, and dimming by it
+        // would mute the very row that asks for them again.
+        let unreadable = placed.reviewability() >= Reviewability::CiRunning;
         let palette = if is_draft || unreadable {
             self.palette.dimmed()
         } else {
@@ -314,7 +317,13 @@ impl BoardText<'_> {
             pad_to(&checks_cell(row, self.palette), CI_COLUMN),
             pad_to(&threads_cell(row, self.rules, self.palette), THREADS_COLUMN),
             pad_to(&merge_cell(row, is_draft, palette), MERGE_COLUMN),
-            pad_to(&reason_cell(row.reason(), self.palette), REASON_COLUMN),
+            pad_to(
+                &placed.rereview().map_or_else(
+                    || reason_cell(row.reason(), self.palette),
+                    |verdict| rereview_cell(verdict, self.palette)
+                ),
+                REASON_COLUMN
+            ),
             self.since_push_cell(row, palette),
         );
         if self.show_branch {
@@ -551,6 +560,24 @@ fn reason_cell(reason: &BlockedReason, palette: Palette) -> String {
         ),
         BlockedReason::NobodyAssigned => palette.paint(Style::Blue, "NOBODY ASSIGNED"),
     }
+}
+
+/// The sentence for a row whose author has pushed since the viewer's say.
+///
+/// In place of the row's own reason, which on a change request still names the
+/// viewer: GitHub keeps that request standing across a push, so it would read
+/// as waiting on the author when the next move is the viewer's. Painted like
+/// the other rows waiting on a reviewer.
+///
+/// The reason column is padded, never cut, so each sentence stays inside its
+/// 39 cells. That is why a change request reads "you blocked it" rather than
+/// "you asked for changes", which is six cells too long.
+fn rereview_cell(verdict: Verdict, palette: Palette) -> String {
+    let sentence = match verdict {
+        Verdict::ChangesRequested => "RE-REVIEW: pushed since you blocked it",
+        Verdict::Approved => "RE-REVIEW: pushed since you approved",
+    };
+    palette.paint(Style::Blue, sentence)
 }
 
 /// Joins account names for the changes-requested sentence.
@@ -1809,6 +1836,118 @@ mod tests {
             .find(|line| line.starts_with("#101 "))
             .unwrap_or_default();
         assert!(row.contains("CONFLICT"), "{rendered}");
+    }
+
+    /// The commit octocat reviewed, which the author has since pushed past.
+    const REVIEWED_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// The head after that push.
+    const PUSHED_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// hubot's #101, on which octocat gave `verdict` before hubot pushed again,
+    /// drawn with `palette`. A change request also stands in GitHub's own
+    /// tally, as it does after a push, so the row's own reason still names it.
+    fn pushed_past(verdict: Verdict, palette: Palette) -> String {
+        Login::parse("octocat")
+            .and_then(|me| {
+                let mut answered = open_pr(101, "hubot")?;
+                answered.head = HeadSha::parse(PUSHED_SHA)?;
+                answered.reviews = vec![Review {
+                    by: me.clone(),
+                    verdict,
+                    on: Some(HeadSha::parse(REVIEWED_SHA)?),
+                }];
+                if verdict == Verdict::ChangesRequested {
+                    answered.changes_requested_by = vec![me.clone()];
+                }
+                Ok(render(
+                    vec![answered],
+                    &PolicyRules::unprotected(),
+                    &me,
+                    palette,
+                ))
+            })
+            .unwrap_or_default()
+    }
+
+    /// The summary line of a render.
+    fn summary_of(rendered: &str) -> &str {
+        rendered
+            .lines()
+            .find(|line| line.contains(" open | "))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_change_request_answered_by_a_push_says_re_review() {
+        let rendered = pushed_past(Verdict::ChangesRequested, plain());
+        assert!(rendered.contains("NEED YOUR REVIEW  (1)"), "{rendered}");
+        assert!(!rendered.contains("YOU REVIEWED"), "{rendered}");
+        assert_eq!(
+            reason_column(&rendered, 101),
+            "RE-REVIEW: pushed since you blocked it",
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("changes requested by octocat"),
+            "{rendered}"
+        );
+        // The reason is never cut, so a sentence longer than its column would
+        // shove the age out from under its heading.
+        assert_eq!(age_column(&rendered, 101), "0m", "{rendered}");
+        assert!(
+            summary_of(&rendered).ends_with("| 1 reviewable now"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_approval_followed_by_a_push_says_re_review() {
+        let rendered = pushed_past(Verdict::Approved, plain());
+        assert!(rendered.contains("NEED YOUR REVIEW  (1)"), "{rendered}");
+        assert_eq!(
+            reason_column(&rendered, 101),
+            "RE-REVIEW: pushed since you approved",
+            "{rendered}"
+        );
+        assert_eq!(age_column(&rendered, 101), "0m", "{rendered}");
+        assert!(
+            summary_of(&rendered).ends_with("| 1 reviewable now"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_re_review_is_not_dimmed_by_your_own_request() {
+        // The row's own reason is octocat's change request, which on its own
+        // dims a row. The push answered it, so the identity cells read as one
+        // to act on.
+        let row = row_for_painted(&pushed_past(Verdict::ChangesRequested, painting()), 101);
+        assert!(row.contains("hubot"), "{row:?}");
+        assert!(!row.contains("\u{1b}[2mhubot"), "{row:?}");
+        assert!(!row.contains("\u{1b}[2m#101"), "{row:?}");
+    }
+
+    #[test]
+    fn a_review_on_the_head_is_still_yours_and_not_a_re_review() {
+        let rendered = Login::parse("octocat")
+            .and_then(|me| {
+                let mut current = open_pr(101, "hubot")?;
+                current.reviews = vec![Review {
+                    by: me.clone(),
+                    verdict: Verdict::Approved,
+                    on: Some(HeadSha::parse(SOME_SHA)?),
+                }];
+                Ok(render(
+                    vec![current],
+                    &PolicyRules::unprotected(),
+                    &me,
+                    plain(),
+                ))
+            })
+            .unwrap_or_default();
+        assert!(rendered.contains("YOU REVIEWED  (1)"), "{rendered}");
+        assert!(!rendered.contains("RE-REVIEW"), "{rendered}");
     }
 
     /// The pull requests on the stacked board, in the order a reader sees them:
