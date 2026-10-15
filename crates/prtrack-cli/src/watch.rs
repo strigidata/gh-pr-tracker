@@ -305,13 +305,16 @@ mod tests {
         );
         state.save(&path)?;
         state = WatchState::load(&path)?;
-        assert!(tick(&mut state, &rows, &me).is_empty());
+        assert_eq!(tick(&mut state, &rows, &me), Vec::<Nudged>::new());
         pushed.reviews = vec![Review {
             by: me.clone(),
             verdict: Verdict::ChangesRequested,
             on: Some(pushed.head.clone()),
         }];
-        assert!(tick(&mut state, &judged(vec![pushed], &policy), &me).is_empty());
+        assert_eq!(
+            tick(&mut state, &judged(vec![pushed], &policy), &me),
+            Vec::<Nudged>::new()
+        );
         assert_eq!(
             tick(&mut state, &rows, &me)
                 .iter()
@@ -319,7 +322,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Nudge::RereviewDue]
         );
-        assert!(tick(&mut state, &rows, &me).is_empty());
+        assert_eq!(tick(&mut state, &rows, &me), Vec::<Nudged>::new());
         std::fs::remove_file(path)?;
         Ok(())
     }
