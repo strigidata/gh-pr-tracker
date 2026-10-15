@@ -477,6 +477,13 @@ impl<'a> Placed<'a> {
         self.stack.rereview
     }
 
+    /// Why this row is blocked after setting aside the viewer's answered
+    /// change request. Other reviewers' requests remain in this reason.
+    #[must_use]
+    pub const fn reason(&self) -> &BlockedReason {
+        &self.stack.reason
+    }
+
     /// How much good it would do the viewer to open this row now.
     ///
     /// [`BoardRow::reviewability`] as the viewer should read it. On a
@@ -765,8 +772,8 @@ impl Board {
             .count()
     }
 
-    /// How many rows the viewer has already reviewed at their head, wherever
-    /// they are drawn.
+    /// How many rows have a viewer review not known to have been pushed past,
+    /// wherever they are drawn. Reviews with an unknown commit count too.
     ///
     /// A review the author has pushed past is not counted: that row is a
     /// re-review, back in [`Board::needs_your_review`].

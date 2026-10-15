@@ -273,6 +273,58 @@ mod tests {
     }
 
     #[test]
+    fn legacy_state_baselines_rereview_without_losing_other_events(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let me = Login::parse("octocat")?;
+        let policy = rule()?;
+        let path = std::env::temp_dir().join(format!(
+            "prtrack-legacy-rereview-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"pull_requests":{{"1":{{"reason":"changes-requested","head":"{AN_EARLIER_HEAD}","review_request":"not-asked-of-you","approval":"not-approved","required_checks":"none-failing"}}}}}}"#
+            ),
+        )?;
+        let mut state = WatchState::load(&path)?;
+        state.save(&path)?;
+        state = WatchState::load(&path)?;
+        let mut pushed = open_pr(1, "hubot")?;
+        pushed.reviews = vec![Review {
+            by: me.clone(),
+            verdict: Verdict::ChangesRequested,
+            on: Some(HeadSha::parse(AN_EARLIER_HEAD)?),
+        }];
+        pushed.checks = vec![check("FAILURE")?];
+        let rows = judged(vec![pushed.clone()], &policy);
+        let first = tick(&mut state, &rows, &me);
+        assert_eq!(
+            first.iter().map(|n| n.nudge).collect::<Vec<_>>(),
+            vec![Nudge::RequiredCheckFailed]
+        );
+        state.save(&path)?;
+        state = WatchState::load(&path)?;
+        assert!(tick(&mut state, &rows, &me).is_empty());
+        pushed.reviews = vec![Review {
+            by: me.clone(),
+            verdict: Verdict::ChangesRequested,
+            on: Some(pushed.head.clone()),
+        }];
+        assert!(tick(&mut state, &judged(vec![pushed], &policy), &me).is_empty());
+        assert_eq!(
+            tick(&mut state, &rows, &me)
+                .iter()
+                .map(|n| n.nudge)
+                .collect::<Vec<_>>(),
+            vec![Nudge::RereviewDue]
+        );
+        assert!(tick(&mut state, &rows, &me).is_empty());
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
     fn the_first_poll_records_everything_and_announces_nothing() {
         let outcome = Login::parse("octocat").and_then(|me| {
             let mut ready = open_pr(1, "octocat")?;

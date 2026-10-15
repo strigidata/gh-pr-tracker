@@ -318,10 +318,14 @@ impl BoardText<'_> {
             pad_to(&threads_cell(row, self.rules, self.palette), THREADS_COLUMN),
             pad_to(&merge_cell(row, is_draft, palette), MERGE_COLUMN),
             pad_to(
-                &placed.rereview().map_or_else(
-                    || reason_cell(row.reason(), self.palette),
-                    |verdict| rereview_cell(verdict, self.palette)
-                ),
+                &if matches!(placed.reason(), BlockedReason::ChangesRequested { .. }) {
+                    reason_cell(placed.reason(), self.palette)
+                } else {
+                    placed.rereview().map_or_else(
+                        || reason_cell(row.reason(), self.palette),
+                        |verdict| rereview_cell(verdict, self.palette),
+                    )
+                },
                 REASON_COLUMN
             ),
             self.since_push_cell(row, palette),
@@ -1897,6 +1901,37 @@ mod tests {
         assert_eq!(age_column(&rendered, 101), "0m", "{rendered}");
         assert!(
             summary_of(&rendered).ends_with("| 1 reviewable now"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_re_review_keeps_another_reviewers_change_request_visible() {
+        let rendered = Login::parse("octocat")
+            .and_then(|me| {
+                let other = Login::parse("monalisa")?;
+                let mut pr = open_pr(101, "hubot")?;
+                pr.head = HeadSha::parse(PUSHED_SHA)?;
+                pr.reviews = vec![Review {
+                    by: me.clone(),
+                    verdict: Verdict::ChangesRequested,
+                    on: Some(HeadSha::parse(REVIEWED_SHA)?),
+                }];
+                pr.changes_requested_by = vec![me.clone(), other];
+                Ok::<_, InvalidValue>(render(vec![pr], &PolicyRules::unprotected(), &me, plain()))
+            })
+            .unwrap_or_default();
+        assert!(rendered.contains("NEED YOUR REVIEW  (1)"), "{rendered}");
+        assert_eq!(
+            reason_column(&rendered, 101),
+            "changes requested by monalisa"
+        );
+        assert!(
+            !rendered.contains("changes requested by octocat"),
+            "{rendered}"
+        );
+        assert!(
+            summary_of(&rendered).ends_with("| 0 reviewable now"),
             "{rendered}"
         );
     }

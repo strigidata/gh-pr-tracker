@@ -83,11 +83,9 @@ struct StoredPullRequest {
     review_request: String,
     approval: String,
     required_checks: String,
-    /// Absent from a file written before re-reviews were tracked, which reads
-    /// as not due: the next push after an upgrade then still nudges, where
-    /// refusing the file would have made every pull request a first sighting.
-    #[serde(default)]
-    rereview: String,
+    /// Absence means no baseline exists; the first live poll establishes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rereview: Option<String>,
 }
 
 /// The file.
@@ -257,10 +255,10 @@ fn store(watched: &Watched) -> StoredPullRequest {
         }
         .to_owned(),
         rereview: match watched.rereview() {
-            Rereview::Due => "due",
-            Rereview::NotDue => "not-due",
-        }
-        .to_owned(),
+            Rereview::Unobserved => None,
+            Rereview::Due => Some("due".to_owned()),
+            Rereview::NotDue => Some("not-due".to_owned()),
+        },
     }
 }
 
@@ -281,8 +279,9 @@ fn restore(entry: &StoredPullRequest) -> Result<Watched, StateError> {
         "some-failing" => RequiredCheckHealth::SomeFailing,
         _ => RequiredCheckHealth::NoneFailing,
     };
-    let rereview = match entry.rereview.as_str() {
-        "due" => Rereview::Due,
+    let rereview = match entry.rereview.as_deref() {
+        None => Rereview::Unobserved,
+        Some("due") => Rereview::Due,
         _ => Rereview::NotDue,
     };
     Ok(Watched::restored(
@@ -627,7 +626,7 @@ mod tests {
     fn a_state_file_from_before_re_reviews_were_tracked_still_loads() {
         // Written by a build that did not know the field. Refusing it would
         // turn an upgrade into a first sighting for every pull request; reading
-        // it as not due means the first push after the upgrade still nudges.
+        // it as unobserved quietly establishes a live baseline on the next poll.
         let scratch = Scratch::new("pre-rereview");
         let written = fs::write(
             scratch.file(),
@@ -644,6 +643,6 @@ mod tests {
                 Ok(state.remembered(one).map(Watched::rereview))
             });
 
-        assert_eq!(restored, Ok(Some(Rereview::NotDue)));
+        assert_eq!(restored, Ok(Some(Rereview::Unobserved)));
     }
 }

@@ -1343,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "prtrack-cli"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "prtrack-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "thiserror",

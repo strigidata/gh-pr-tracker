@@ -90,3 +90,16 @@ PRs 101-106. Scratch output only in the repo's `.tmp/`, never `/tmp`.
 
 Each task is test-first, mutation-checked, and gets a spec and a quality
 review before the next depends on it.
+
+## Implementation review corrections
+
+The change-request notice uses `RE-REVIEW: pushed since you blocked it` to fit
+inside the existing reason column. A remaining change request from another
+reviewer takes precedence in that column; the row still returns to the review
+section and its own stale request is removed from the displayed blocker.
+
+A saved state that predates re-review tracking has an uninitialized observation,
+not evidence that no re-review was due. Its first live reading establishes the
+baseline silently while preserving unrelated remembered transitions. Drafts and
+the viewer's own pull requests do not request a re-review interruption. A push
+and an explicit review request observed together produce one review alert.
