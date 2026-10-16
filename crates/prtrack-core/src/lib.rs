@@ -60,11 +60,11 @@ pub use checks::{classify, Check, CheckState, Classified};
 pub use decision::{BlockedReason, FailingCheckCount, NonEmpty, UnresolvedThreadCount};
 pub use facts::{
     BranchName, DraftState, HeadRepository, MergeState, MergeableState, PrFacts, PrTitle, PrUrl,
-    ReviewDecision, Reviewer, TeamSlug,
+    Review, ReviewDecision, Reviewer, TeamSlug, Verdict,
 };
 pub use nudge::{
-    observe, ApprovalState, Nudge, Observation, ReasonKind, RequiredCheckHealth, ReviewRequest,
-    Watched,
+    observe, ApprovalState, Nudge, Observation, ReasonKind, RequiredCheckHealth, Rereview,
+    ReviewRequest, Watched,
 };
 pub use policy::{BlockingChecks, PolicyRules, RequiredChecks, Requirement, StaleReviewHandling};
 pub use types::{CheckName, HeadSha, InvalidValue, Login, PrNumber, RepoRef};

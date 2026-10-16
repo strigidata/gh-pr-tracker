@@ -729,6 +729,37 @@ impl MergeState {
     }
 }
 
+/// What a review said, among the two things that count as having had your say.
+///
+/// Only an approval and a request for changes are verdicts. A dismissed review
+/// is one a push or a maintainer threw out, so the pull request needs looking
+/// at again; a comment is not a verdict, and somebody who asked a question has
+/// not reviewed; a pending review is a draft nobody has submitted. None of
+/// those has a variant, so a [`Review`] cannot carry one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// The reviewer approved.
+    Approved,
+    /// The reviewer asked for changes.
+    ChangesRequested,
+}
+
+/// One reviewer's latest verdict that still stands, and the commit it was made
+/// on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Review {
+    /// Who gave it.
+    pub by: Login,
+    /// What it said.
+    pub verdict: Verdict,
+    /// The commit the review was made on, or `None` where GitHub did not say.
+    ///
+    /// Compared against [`PrFacts::head`] to tell whether the author has
+    /// pushed since. See [`PrFacts::rereview_due`] for why `None` is not read
+    /// as "made on some earlier commit".
+    pub on: Option<HeadSha>,
+}
+
 /// Everything known about one open pull request at one moment.
 ///
 /// This is the input side of every decision the crate makes. It is facts only:
@@ -901,16 +932,20 @@ pub struct PrFacts {
     /// [`review_decision`]: PrFacts::review_decision
     pub changes_requested_by: Vec<Login>,
 
-    /// Everyone whose latest review is on the record, whatever it said.
+    /// Every latest review that still stands, whatever it said, and the commit
+    /// each was made on.
     ///
-    /// Superset of [`changes_requested_by`]: an approval counts too. Read to
-    /// answer one question the request list cannot — *have I already looked at
-    /// this?* GitHub removes a reviewer from `requested_reviewers` the moment
-    /// they submit, so an approved pull request and one nobody was ever asked
-    /// about are indistinguishable without this.
+    /// Its reviewers are a superset of [`changes_requested_by`]: an approval
+    /// counts too. Read to answer two questions the request list cannot —
+    /// *have I already looked at this?*, and *has it changed since I did?*
+    /// GitHub removes a reviewer from `requested_reviewers` the moment they
+    /// submit, so an approved pull request and one nobody was ever asked about
+    /// are indistinguishable without this. The second question is
+    /// [`rereview_due`].
     ///
     /// [`changes_requested_by`]: PrFacts::changes_requested_by
-    pub reviewed_by: Vec<Login>,
+    /// [`rereview_due`]: PrFacts::rereview_due
+    pub reviews: Vec<Review>,
 
     /// How many review threads are still open.
     ///
@@ -955,11 +990,39 @@ pub struct PrFacts {
     pub last_push: DateTime<Utc>,
 }
 
+impl PrFacts {
+    /// Whether the head has moved since `viewer` last had their say, and if so
+    /// what that say was.
+    ///
+    /// `Some` only when the viewer's review names the commit it was made on
+    /// and that commit is no longer [`head`]: the author has pushed since, and
+    /// the next move is the viewer's again. The one predicate the board and the
+    /// watcher both read, so they cannot disagree about it.
+    ///
+    /// `None` when the viewer has not reviewed, when their review is on the
+    /// head, and when GitHub did not say which commit it was on. That last one
+    /// is deliberate: reading an unknown commit as stale would interrupt
+    /// somebody over a push that may never have happened, and a false nudge
+    /// costs more than a missed one. Recordings made before the field was
+    /// asked for carry no commit at all, and must not all turn into
+    /// re-reviews.
+    ///
+    /// [`head`]: PrFacts::head
+    #[must_use]
+    pub fn rereview_due(&self, viewer: &Login) -> Option<Verdict> {
+        self.reviews
+            .iter()
+            .filter(|review| &review.by == viewer)
+            .find(|review| review.on.as_ref().is_some_and(|on| on != &self.head))
+            .map(|review| review.verdict)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BranchName, DraftState, HeadRepository, MergeState, MergeableState, PrFacts, PrTitle,
-        PrUrl, ReviewDecision, Reviewer, TeamSlug,
+        PrUrl, Review, ReviewDecision, Reviewer, TeamSlug, Verdict,
     };
     use crate::checks::{classify, Check, CheckState};
     use crate::policy::{BlockingChecks, PolicyRules, Requirement};
@@ -1048,7 +1111,7 @@ mod tests {
             merge_state: MergeState::Dirty,
             requested_reviewers: vec![Reviewer::Team(TeamSlug::new("ledger-owners"))],
             changes_requested_by: Vec::new(),
-            reviewed_by: Vec::new(),
+            reviews: Vec::new(),
             unresolved_threads: 0,
             comments: 4,
             checks: vec![
@@ -1154,6 +1217,71 @@ mod tests {
             )),
             "nothing required is failing here; the red check is one the merge button ignores"
         );
+    }
+
+    #[test]
+    fn a_rereview_is_due_only_when_the_viewers_review_names_a_commit_that_is_not_the_head() {
+        // The head of `pr_3449`, and a commit before it.
+        const HEAD: &str = "9f2c4e1b7a3d5068c9e4b2a17f36d8095c1e4a7b";
+        const EARLIER: &str = "0123456789abcdef0123456789abcdef01234567";
+
+        /// Who reviewed, what they said, and the commit it was on.
+        type Given = Option<(&'static str, Verdict, Option<&'static str>)>;
+
+        let cases: [(&str, Given, Option<Verdict>); 7] = [
+            ("no review at all", None, None),
+            (
+                "the viewer's approval is on the head",
+                Some(("monalisa", Verdict::Approved, Some(HEAD))),
+                None,
+            ),
+            (
+                "the viewer's request for changes is on the head",
+                Some(("monalisa", Verdict::ChangesRequested, Some(HEAD))),
+                None,
+            ),
+            (
+                "the viewer asked for changes on an earlier commit",
+                Some(("monalisa", Verdict::ChangesRequested, Some(EARLIER))),
+                Some(Verdict::ChangesRequested),
+            ),
+            (
+                "the viewer approved an earlier commit",
+                Some(("monalisa", Verdict::Approved, Some(EARLIER))),
+                Some(Verdict::Approved),
+            ),
+            (
+                "GitHub did not say which commit the viewer reviewed",
+                Some(("monalisa", Verdict::ChangesRequested, None)),
+                None,
+            ),
+            (
+                "somebody else's review is on an earlier commit",
+                Some(("hubot", Verdict::ChangesRequested, Some(EARLIER))),
+                None,
+            ),
+        ];
+
+        for (case, given, expected) in cases {
+            let due = Login::parse("monalisa").and_then(|viewer| {
+                let reviews = given
+                    .map(|(by, verdict, on)| -> Result<Review, InvalidValue> {
+                        Ok(Review {
+                            by: Login::parse(by)?,
+                            verdict,
+                            on: on.map(HeadSha::parse).transpose()?,
+                        })
+                    })
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?;
+                let facts = PrFacts {
+                    reviews,
+                    ..pr_3449()?
+                };
+                Ok(facts.rereview_due(&viewer))
+            });
+            assert_eq!(due, Ok(expected), "{case}");
+        }
     }
 
     #[test]

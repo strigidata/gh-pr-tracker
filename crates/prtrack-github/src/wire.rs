@@ -664,6 +664,21 @@ pub(crate) struct Review {
     pub(crate) author: Option<Actor>,
     /// When, as an ISO 8601 string. Null on a review that was never submitted.
     pub(crate) submitted_at: Option<String>,
+    /// The commit it was made on, which tells whether the author has pushed
+    /// since.
+    ///
+    /// Nullable on GitHub's side. Optional here for that reason and because
+    /// the recorded fixtures predate the field; skipped on the way out so a
+    /// recording without it writes back without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) commit: Option<ReviewCommit>,
+}
+
+/// The commit a review was made on, reduced to its object id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ReviewCommit {
+    /// The commit's object id.
+    pub(crate) oid: String,
 }
 
 /// One review thread on the diff.

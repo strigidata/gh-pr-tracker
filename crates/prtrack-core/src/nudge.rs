@@ -16,7 +16,7 @@
 
 use crate::board::BoardRow;
 use crate::decision::BlockedReason;
-use crate::facts::ReviewDecision;
+use crate::facts::{DraftState, ReviewDecision};
 use crate::policy::{PolicyRules, StaleReviewHandling};
 use crate::types::{HeadSha, Login};
 
@@ -41,6 +41,12 @@ pub enum Nudge {
     ReviewRequestedOfYou,
     /// A push dismissed an approval, under a rule that dismisses them.
     ApprovalDismissedByPush,
+    /// The author pushed after the viewer's standing review — approved or
+    /// changes requested — so the next move is the viewer's again.
+    ///
+    /// GitHub keeps a changes-requested decision across a push, so without
+    /// this the pull request goes on reading as waiting on its author.
+    RereviewDue,
 }
 
 /// Which rung of the ladder a pull request was on, without the payload.
@@ -154,6 +160,26 @@ pub enum RequiredCheckHealth {
     NoneFailing,
 }
 
+/// Whether the author has pushed since the viewer's standing review.
+///
+/// Records whether a previous observation exists, without carrying the
+/// verdict returned by
+/// [`PrFacts::rereview_due`](crate::PrFacts::rereview_due). The nudge is the
+/// same news whichever way the viewer had answered; carrying the verdict
+/// would fire again when a reviewer changes their mind without a push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rereview {
+    /// No observation was recorded, as in state saved before tracking re-reviews.
+    /// The first live reading establishes a baseline without a nudge.
+    Unobserved,
+    /// A ready pull request by somebody else has a standing viewer review
+    /// on a commit that is no longer the head.
+    Due,
+    /// No actionable re-review: draft, self-authored, no standing review,
+    /// a review on the head, or one GitHub gave no commit for.
+    NotDue,
+}
+
 /// What the watcher carries about one pull request from one poll to the next.
 ///
 /// Small on purpose: it is written to disk after every poll, and anything in
@@ -165,6 +191,7 @@ pub struct Watched {
     review_request: ReviewRequest,
     approval: ApprovalState,
     required_checks: RequiredCheckHealth,
+    rereview: Rereview,
 }
 
 impl Watched {
@@ -196,6 +223,14 @@ impl Watched {
                 RequiredCheckHealth::NoneFailing
             } else {
                 RequiredCheckHealth::SomeFailing
+            },
+            rereview: if facts.draft_state == DraftState::ReadyForReview
+                && facts.author.as_ref() != Some(viewer)
+                && facts.rereview_due(viewer).is_some()
+            {
+                Rereview::Due
+            } else {
+                Rereview::NotDue
             },
         }
     }
@@ -237,6 +272,12 @@ impl Watched {
         self.required_checks
     }
 
+    /// Whether the author had pushed since the viewer's standing review.
+    #[must_use]
+    pub const fn rereview(&self) -> Rereview {
+        self.rereview
+    }
+
     /// Rebuilds a remembered state, for a caller reading one back off disk.
     ///
     /// The watcher's state file is this crate's shape written by the shell, so
@@ -249,6 +290,7 @@ impl Watched {
         review_request: ReviewRequest,
         approval: ApprovalState,
         required_checks: RequiredCheckHealth,
+        rereview: Rereview,
     ) -> Self {
         Self {
             reason,
@@ -256,6 +298,7 @@ impl Watched {
             review_request,
             approval,
             required_checks,
+            rereview,
         }
     }
 }
@@ -333,6 +376,12 @@ pub fn observe(
     {
         nudges.push(Nudge::ReviewRequestedOfYou);
     }
+    if before.rereview == Rereview::NotDue
+        && now.rereview == Rereview::Due
+        && !nudges.contains(&Nudge::ReviewRequestedOfYou)
+    {
+        nudges.push(Nudge::RereviewDue);
+    }
     if dismissed_by_push(before, &now, policy) {
         nudges.push(Nudge::ApprovalDismissedByPush);
     }
@@ -361,7 +410,7 @@ mod tests {
     use crate::checks::{Check, CheckState};
     use crate::facts::{
         BranchName, DraftState, HeadRepository, MergeState, MergeableState, PrFacts, PrTitle,
-        PrUrl, ReviewDecision, Reviewer, TeamSlug,
+        PrUrl, Review, ReviewDecision, Reviewer, TeamSlug, Verdict,
     };
     use crate::policy::{BlockingChecks, PolicyRules, Requirement, StaleReviewHandling};
     use crate::types::{CheckName, HeadSha, InvalidValue, Login, PrNumber, RepoRef};
@@ -392,7 +441,7 @@ mod tests {
             merge_state: MergeState::Clean,
             requested_reviewers: Vec::new(),
             changes_requested_by: Vec::new(),
-            reviewed_by: Vec::new(),
+            reviews: Vec::new(),
             unresolved_threads: 0,
             comments: 0,
             checks: Vec::new(),
@@ -692,6 +741,113 @@ mod tests {
         });
 
         assert_eq!(fired, Ok(vec![Vec::new(), Vec::new()]));
+    }
+
+    /// Somebody else's pull request on which the viewer asked for changes at
+    /// [`FIRST_HEAD`], read with its head at `head`.
+    fn reviewed_by_you_at_first_head(me: &Login, head: &str) -> Result<PrFacts, InvalidValue> {
+        let mut theirs = open_pr()?;
+        theirs.author = Some(Login::parse("hubot")?);
+        theirs.head = HeadSha::parse(head)?;
+        theirs.changes_requested_by = vec![me.clone()];
+        theirs.reviews = vec![Review {
+            by: me.clone(),
+            verdict: Verdict::ChangesRequested,
+            on: Some(HeadSha::parse(FIRST_HEAD)?),
+        }];
+        Ok(theirs)
+    }
+
+    #[test]
+    fn draft_rereview_waits_until_ready_and_only_nudges_once() -> Result<(), InvalidValue> {
+        let me = Login::parse("octocat")?;
+        let mut draft = reviewed_by_you_at_first_head(&me, FIRST_HEAD)?;
+        draft.draft_state = DraftState::Draft;
+        let mut pushed = draft.clone();
+        pushed.head = HeadSha::parse(AFTER_A_PUSH)?;
+        let mut ready = pushed.clone();
+        ready.draft_state = DraftState::ReadyForReview;
+        assert_eq!(
+            watch(
+                vec![draft, pushed, ready.clone(), ready],
+                &strict_rule()?,
+                &me
+            ),
+            vec![vec![], vec![], vec![Nudge::RereviewDue], vec![]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn self_rereview_stays_quiet_across_a_push() -> Result<(), InvalidValue> {
+        let me = Login::parse("octocat")?;
+        let mut before = reviewed_by_you_at_first_head(&me, FIRST_HEAD)?;
+        before.author = Some(me.clone());
+        let mut after = before.clone();
+        after.head = HeadSha::parse(AFTER_A_PUSH)?;
+        assert_eq!(
+            watch(vec![before, after.clone(), after], &strict_rule()?, &me),
+            vec![vec![], vec![], vec![]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_and_push_share_one_alert_but_keep_check_failure() -> Result<(), InvalidValue> {
+        let me = Login::parse("octocat")?;
+        let before = reviewed_by_you_at_first_head(&me, FIRST_HEAD)?;
+        let mut after = reviewed_by_you_at_first_head(&me, AFTER_A_PUSH)?;
+        after.requested_reviewers = vec![Reviewer::User(me.clone())];
+        after.checks = vec![check("FAILURE")?];
+        assert_eq!(
+            watch(vec![before, after.clone(), after], &strict_rule()?, &me),
+            vec![
+                vec![],
+                vec![Nudge::RequiredCheckFailed, Nudge::ReviewRequestedOfYou],
+                vec![]
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_push_after_your_review_nudges_once_and_then_stays_quiet() {
+        // Three readings, for the reason the conflict test gives: a before and
+        // an after cannot tell "became due" from "is due". The third reading
+        // is still due -- nobody re-reviews within one poll -- and must be
+        // silent, or this fires every few minutes until somebody looks.
+        let fired = Login::parse("octocat").and_then(|me| {
+            Ok::<_, InvalidValue>(watch(
+                vec![
+                    reviewed_by_you_at_first_head(&me, FIRST_HEAD)?,
+                    reviewed_by_you_at_first_head(&me, AFTER_A_PUSH)?,
+                    reviewed_by_you_at_first_head(&me, AFTER_A_PUSH)?,
+                ],
+                &strict_rule()?,
+                &me,
+            ))
+        });
+
+        assert_eq!(
+            fired,
+            Ok(vec![Vec::new(), vec![Nudge::RereviewDue], Vec::new()])
+        );
+    }
+
+    #[test]
+    fn a_re_review_already_due_on_first_sighting_does_not_nudge() {
+        // The same rule as every other first sighting: the watcher's first
+        // poll sees every stale review at once, and announcing all of them is
+        // a startup burst, not news.
+        let fired = Login::parse("octocat").and_then(|me| {
+            Ok::<_, InvalidValue>(watch(
+                vec![reviewed_by_you_at_first_head(&me, AFTER_A_PUSH)?],
+                &strict_rule()?,
+                &me,
+            ))
+        });
+
+        assert_eq!(fired, Ok(vec![Vec::new()]));
     }
 
     #[test]

@@ -44,6 +44,7 @@ impl Nudged {
             Nudge::RequiredCheckFailed => "has a required check failing",
             Nudge::ReviewRequestedOfYou => "is waiting for your review",
             Nudge::ApprovalDismissedByPush => "lost its approval to a push",
+            Nudge::RereviewDue => "has new commits since your review",
         }
     }
 
@@ -117,7 +118,8 @@ pub struct AlreadyWaiting {
     pub approved_but_conflicting: usize,
     /// Yours, with a check the rule demands going red.
     pub required_check_failing: usize,
-    /// Somebody else's, with your review outstanding.
+    /// Somebody else's, with your review outstanding — asked of you, or pushed
+    /// to since you last reviewed.
     pub awaiting_your_review: usize,
 }
 
@@ -184,7 +186,11 @@ pub fn already_waiting(judged: &[(BoardRow, PolicyRules)], viewer: &Login) -> Al
             .requested_reviewers
             .iter()
             .any(|reviewer| reviewer.login() == Some(viewer))
+            || facts.rereview_due(viewer).is_some()
         {
+            // One condition rather than two counters: a pull request both
+            // asked of the viewer and pushed since their review is one review
+            // to do, not two.
             waiting.awaiting_your_review += 1;
         }
     }
@@ -200,11 +206,13 @@ mod tests {
     use prtrack_core::{
         BlockingChecks, BoardRow, BranchName, Check, CheckName, CheckState, DraftState,
         HeadRepository, HeadSha, InvalidValue, Login, MergeState, MergeableState, Nudge,
-        PolicyRules, PrFacts, PrNumber, PrTitle, PrUrl, RepoRef, Requirement, ReviewDecision,
-        Reviewer, StaleReviewHandling,
+        PolicyRules, PrFacts, PrNumber, PrTitle, PrUrl, RepoRef, Requirement, Review,
+        ReviewDecision, Reviewer, StaleReviewHandling, Verdict,
     };
 
     const A_HEAD: &str = "9f2c4e1b7a3d5068c9e4b2a17f36d8095c1e4a7b";
+    /// A commit the head has since moved past.
+    const AN_EARLIER_HEAD: &str = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
 
     fn at(minutes: i64) -> DateTime<Utc> {
         DateTime::<Utc>::UNIX_EPOCH + TimeDelta::minutes(minutes)
@@ -227,7 +235,7 @@ mod tests {
             merge_state: MergeState::Clean,
             requested_reviewers: Vec::new(),
             changes_requested_by: Vec::new(),
-            reviewed_by: Vec::new(),
+            reviews: Vec::new(),
             unresolved_threads: 0,
             comments: 0,
             checks: Vec::new(),
@@ -262,6 +270,61 @@ mod tests {
         prs.into_iter()
             .map(|facts| (BoardRow::reduce(facts, policy), policy.clone()))
             .collect()
+    }
+
+    #[test]
+    fn legacy_state_baselines_rereview_without_losing_other_events(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let me = Login::parse("octocat")?;
+        let policy = rule()?;
+        let path = std::env::temp_dir().join(format!(
+            "prtrack-legacy-rereview-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"pull_requests":{{"1":{{"reason":"changes-requested","head":"{AN_EARLIER_HEAD}","review_request":"not-asked-of-you","approval":"not-approved","required_checks":"none-failing"}}}}}}"#
+            ),
+        )?;
+        let mut state = WatchState::load(&path)?;
+        state.save(&path)?;
+        state = WatchState::load(&path)?;
+        let mut pushed = open_pr(1, "hubot")?;
+        pushed.reviews = vec![Review {
+            by: me.clone(),
+            verdict: Verdict::ChangesRequested,
+            on: Some(HeadSha::parse(AN_EARLIER_HEAD)?),
+        }];
+        pushed.checks = vec![check("FAILURE")?];
+        let rows = judged(vec![pushed.clone()], &policy);
+        let first = tick(&mut state, &rows, &me);
+        assert_eq!(
+            first.iter().map(|n| n.nudge).collect::<Vec<_>>(),
+            vec![Nudge::RequiredCheckFailed]
+        );
+        state.save(&path)?;
+        state = WatchState::load(&path)?;
+        assert_eq!(tick(&mut state, &rows, &me), Vec::<Nudged>::new());
+        pushed.reviews = vec![Review {
+            by: me.clone(),
+            verdict: Verdict::ChangesRequested,
+            on: Some(pushed.head.clone()),
+        }];
+        assert_eq!(
+            tick(&mut state, &judged(vec![pushed], &policy), &me),
+            Vec::<Nudged>::new()
+        );
+        assert_eq!(
+            tick(&mut state, &rows, &me)
+                .iter()
+                .map(|n| n.nudge)
+                .collect::<Vec<_>>(),
+            vec![Nudge::RereviewDue]
+        );
+        assert_eq!(tick(&mut state, &rows, &me), Vec::<Nudged>::new());
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 
     #[test]
@@ -428,6 +491,37 @@ mod tests {
                     .to_owned()
             ))
         );
+    }
+
+    #[test]
+    fn a_push_since_your_review_is_waiting_on_you_and_counts_once() {
+        // A re-review is a review the viewer owes, the same as a request. The
+        // second pull request is both asked of the viewer and pushed since
+        // their review: it is one thing to do, not two, so it counts once.
+        let counted = Login::parse("octocat").and_then(|me| {
+            let policy = rule()?;
+            let reviewed_earlier = |number: u32| -> Result<PrFacts, InvalidValue> {
+                let mut theirs = open_pr(number, "hubot")?;
+                theirs.checks = vec![check("SUCCESS")?];
+                theirs.changes_requested_by = vec![me.clone()];
+                theirs.reviews = vec![Review {
+                    by: me.clone(),
+                    verdict: Verdict::ChangesRequested,
+                    on: Some(HeadSha::parse(AN_EARLIER_HEAD)?),
+                }];
+                Ok(theirs)
+            };
+
+            let pushed_since = reviewed_earlier(101)?;
+            let mut asked_again = reviewed_earlier(102)?;
+            asked_again.requested_reviewers = vec![Reviewer::User(me.clone())];
+
+            Ok::<_, InvalidValue>(
+                already_waiting(&judged(vec![pushed_since, asked_again], &policy), &me).describe(),
+            )
+        });
+
+        assert_eq!(counted, Ok(Some("2 waiting on your review".to_owned())));
     }
 
     #[test]

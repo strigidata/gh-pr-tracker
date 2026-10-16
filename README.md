@@ -27,7 +27,11 @@ PR         AUTHOR        CI             OPEN.CMT MERGE      WHY IT CANNOT MERGE 
 `#101` conflicts with `main` and is waiting on its author, and `#102` and `#103`
 are stacked on it, so the whole stack is drawn under it rather than scattered.
 A pull request you have already reviewed stays on the board under `YOU
-REVIEWED`. A section with nothing in it is not printed.
+REVIEWED`. When the author pushes new commits after your approval or change
+request, it returns to `NEED YOUR REVIEW`. The reason says `RE-REVIEW` unless
+another reviewer's change request still blocks it. Reviews with an unknown
+commit stay in `YOU REVIEWED` until their freshness can be established.
+A section with nothing in it is not printed.
 
 ## Install
 
@@ -128,7 +132,7 @@ The pull request number is a link. Your terminal probably supports it.
   updating a branch changes not one line of the diff a reviewer would read.
 - **`--watch` notifies on transitions, not conditions.** Became ready to merge,
   approved and then conflicted, a required check went red, a review was
-  requested of you, an approval dismissed by a push. A pull request that has
+  requested of you, new commits since your review, an approval dismissed by a push. A pull request that has
   been broken for a week does not notify you again every five minutes.
 - **It tells you when it cannot interrupt you.** A macOS Focus mode swallows
   notifications silently and the posting API reports success either way; Linux

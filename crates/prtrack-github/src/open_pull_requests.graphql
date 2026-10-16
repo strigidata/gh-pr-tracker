@@ -26,6 +26,10 @@
 # decoration. GitHub reports every *attempt* of a check, so one name arrives
 # several times with different verdicts, and only the newest is current. Without
 # an instant there is no way to tell a superseded failure from a live one.
+#
+# `commit { oid }` on a review is the commit it was made on. Compared with
+# `headRefOid`, it is the only exact way to tell that the author has pushed
+# since a reviewer had their say.
 query OpenPullRequests($owner: String!, $name: String!, $first: Int!, $after: String) {
   rateLimit {
     cost
@@ -101,6 +105,9 @@ query OpenPullRequests($owner: String!, $name: String!, $first: Int!, $after: St
               login
             }
             submittedAt
+            commit {
+              oid
+            }
           }
         }
         reviewThreads(first: 100) {
