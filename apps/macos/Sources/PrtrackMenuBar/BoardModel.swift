@@ -13,8 +13,10 @@ final class BoardModel {
         case failed(String, lastGood: PopoverBoard?, at: Date?)
     }
 
-    /// What the menu bar shows. Unknown is never zero, and an old count is
-    /// never shown as a current one.
+    /// What the menu bar shows. Unknown is never zero, and a count from before
+    /// a failed fetch is never shown as current. A successful count's age is
+    /// not tracked: nothing refreshes until the popover opens, so `.current`
+    /// can be hours old. That waits for polling.
     enum Badge: Equatable {
         case unknown
         case current(Int)
@@ -24,6 +26,12 @@ final class BoardModel {
     private(set) var state: State = .loading
     /// True while a fetch runs, including one over a board already shown.
     private(set) var isRefreshing = false
+
+    /// True before the first fetch has answered, when there is nothing to mark
+    /// as being replaced.
+    var isLoading: Bool {
+        if case .loading = state { true } else { false }
+    }
     let repo: String
 
     /// The one fetch in flight. Owned here, not by a view, so a view going

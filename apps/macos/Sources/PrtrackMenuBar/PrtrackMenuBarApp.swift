@@ -75,8 +75,9 @@ struct PopoverView: View {
                 if case .loaded(_, let at) = model.state {
                     Text("Fetched \(Text(at, style: .relative)) ago")
                 }
-                // An old board is never presented as just fetched.
-                if model.isRefreshing, currentBoard != nil {
+                // Whatever is on screen while a fetch runs, board or failure,
+                // is marked as being replaced. `.loading` says so itself.
+                if model.isRefreshing, !model.isLoading {
                     ProgressView().controlSize(.small)
                     Text("Refreshing...")
                 }

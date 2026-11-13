@@ -347,6 +347,29 @@ mod tests {
     }
 
     #[test]
+    fn an_approval_pushed_past_is_projected_as_an_approval() -> Result<(), InvalidValue> {
+        let viewer = Login::parse("octocat")?;
+        let mut facts = on_branch(102, "monalisa", "topic/ledger", "main")?;
+        facts.review_decision = Some(ReviewDecision::Approved);
+        facts.reviews = vec![Review {
+            by: viewer.clone(),
+            verdict: Verdict::Approved,
+            on: Some(HeadSha::parse(EARLIER)?),
+        }];
+        let board = board_of(vec![facts], &viewer);
+
+        let popover = project(&board, &viewer);
+
+        let projected: Vec<_> = popover
+            .needs_your_review
+            .iter()
+            .map(|row| (row.number, row.rereview))
+            .collect();
+        assert_eq!(projected, [(102, Some(Verdict::Approved))]);
+        Ok(())
+    }
+
+    #[test]
     fn a_stack_is_projected_whole_in_its_roots_section() -> Result<(), InvalidValue> {
         let viewer = Login::parse("octocat")?;
         // Three deep, so the walk's order and every depth past the first are
