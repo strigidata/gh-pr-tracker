@@ -20,6 +20,22 @@ and renders it. Swift owns the wording and Rust owns every judgement.
 > order (`render.rs:118-146`) and the core's `Board::reviewable_now()`, and the
 > badge is that count, never a section's length. Bindgen reads the `.a`
 > directly; no `.dylib` is needed.
+>
+> **What shipped differs from the samples below.** The task text is the plan
+> as written. Where it disagrees with the code, the code is right:
+>
+> - **Task 2:** `Judged` keeps its fields private behind accessors, so its
+>   board cannot disagree with its rows.
+> - **Task 3:** all six sections are projected, `you_reviewed` included. A
+>   count past `u32::MAX` saturates rather than failing, because it is
+>   unreachable (see `count` in `prtrack-ffi`). The row also carries the
+>   re-review verdict.
+> - **Task 5:** the `systemLibrary` path is the `include/` directory, and the
+>   generated target builds in Swift 6 mode, with no `.v5` override. The
+>   badge is unknown, current or stale, never `0` for unknown. A failed state
+>   keeps its last good board's time.
+> - **Task 6:** all six sections were compared, not two. See *Recorded
+>   2026-11-12* under Task 6.
 
 **Tech Stack:** Rust 1.95, `uniffi` 0.32 (async exports on tokio), Swift 6.2
 via SwiftPM, SwiftUI `MenuBarExtra` with the `.window` style, macOS 14+.
@@ -604,10 +620,10 @@ pushing, run the grep from `AGENTS.md`.
   fetch still returned the full board 9 to 11 s later. UniFFI 0.32's Swift
   bindings never call the `rust_future_cancel_*` entry points the header
   exports. The generated poll handler treats `CALL_CANCELLED` as
-  `fatalError("Cancellation not supported yet")`. The model drops a result that
-  arrives after cancellation, so no stale write happens. But an abandoned fetch
-  still spends the rate limit. A product build needs a cancellable handle
-  exported from Rust.
+  `fatalError("Cancellation not supported yet")`. The shipped model therefore
+  owns its one fetch rather than tying it to the view. Closing the popover does
+  not abandon the fetch: its result still lands. A product build that wants to
+  stop a fetch needs a cancellable handle exported from Rust.
 - **Toolchain:** builds with the Command Line Tools only. The generated
   bindings compile in Swift 6 language mode, so no `.v5` override is needed.
   The `systemLibrary` path must be the `include/` directory that holds the

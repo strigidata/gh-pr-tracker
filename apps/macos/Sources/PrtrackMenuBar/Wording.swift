@@ -2,8 +2,9 @@ import PrtrackFFI
 
 // The wording below is kept in sync BY HAND with crates/prtrack-cli/src/render.rs:
 // `reason_cell` (one sentence per rung), `rereview_cell` (one per verdict), and
-// the rule at render.rs:320-328 choosing between them, which `wording(for:)`
-// mirrors. That is a spike limitation: `ReasonKind` carries no payload, so the
+// the rule in render.rs that chooses between them (its
+// `matches!(placed.reason(), BlockedReason::ChangesRequested ..)` branch),
+// which `wording(for:)` mirrors. That is a spike limitation: `ReasonKind` carries no payload, so the
 // reasons are the payload-free forms of each sentence. Neither switch has a
 // `default:`, so a new rung or verdict fails to compile here.
 
