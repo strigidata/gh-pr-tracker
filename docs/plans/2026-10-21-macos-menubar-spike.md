@@ -448,10 +448,13 @@ cp apps/macos/Generated/prtrack_ffiFFI.h apps/macos/Sources/prtrack_ffiFFI/inclu
 cp apps/macos/Generated/prtrack_ffiFFI.modulemap apps/macos/Sources/prtrack_ffiFFI/include/module.modulemap
 ```
 
-The `--library` mode reads metadata from a dynamic library. If the `.dylib` is
-not produced alongside the `.a`, add `"cdylib"` to `crate-type`. Record which
-one was needed. Also add both copied-into paths to `.gitignore`: generated
-code is never committed.
+The `--library` mode reads the metadata straight out of the `.a` (uniffi_bindgen
+0.32 parses `ar` archives), so no `cdylib` is needed. Add both copied-into paths
+to `.gitignore`: generated code is never committed.
+
+*Recorded 2026-11-12:* the `.a` is 30 MB unstripped (31,529,640 bytes, release,
+arm64), most of it the Rust standard library and the dependency tree before the
+linker dead-strips; the app binary is the size that matters.
 
 Run it. Expected: the three generated files exist, and so does
 `target/release/libprtrack_ffi.a`. Record the size of the `.a`.
