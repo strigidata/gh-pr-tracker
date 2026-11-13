@@ -15,9 +15,9 @@
 
 use chrono::{DateTime, Utc};
 use prtrack_core::{
-    BranchName, Check, CheckName, CheckState, DraftState, HeadRepository, HeadSha, Login,
-    MergeState, MergeableState, PolicyRules, PrFacts, PrNumber, PrTitle, PrUrl, RepoRef, Review,
-    ReviewDecision, Reviewer, TeamSlug, Verdict,
+    Board, BoardRow, BranchName, Check, CheckName, CheckState, DraftState, HeadRepository, HeadSha,
+    Login, MergeState, MergeableState, PolicyRules, PrFacts, PrNumber, PrTitle, PrUrl, RepoRef,
+    Review, ReviewDecision, Reviewer, TeamSlug, Verdict,
 };
 
 use crate::client::OpenPullRequests;
@@ -100,6 +100,88 @@ impl RepositoryFacts {
             self.default_branch_rule,
             self.pull_requests,
         )
+    }
+
+    /// Reduces every pull request under the rule that governs it and assembles
+    /// the rows into a board.
+    ///
+    /// Every judgement is `prtrack-core`'s — [`BoardRow::reduce`] per row,
+    /// [`Board::assemble`] over them all. This only composes the two, so that
+    /// each consumer does not repeat the composition and none can pair a row
+    /// with the wrong rule.
+    #[must_use]
+    pub fn judge(self) -> Judged {
+        let rows: Vec<(BoardRow, PolicyRules)> = self
+            .pull_requests
+            .into_iter()
+            .map(|(facts, policy)| (BoardRow::reduce(facts, &policy), policy))
+            .collect();
+        let board = Board::assemble(
+            rows.iter().map(|(row, _)| row.clone()).collect(),
+            &self.viewer,
+        );
+        Judged {
+            viewer: self.viewer,
+            default_branch: self.default_branch,
+            default_branch_rule: self.default_branch_rule,
+            rows,
+            board,
+        }
+    }
+}
+
+/// A repository's pull requests, each reduced under the rule that governs it,
+/// and the board those rows assemble into.
+///
+/// Built only by [`RepositoryFacts::judge`], so the board is always assembled
+/// from exactly these rows; the fields are private so the two cannot be made
+/// to disagree.
+///
+/// Each row keeps the rule that judged it, because the rule cannot be recovered
+/// from a row once it is classified and consumers still need it: whether a pull
+/// request is governed by any rule at all is reported per row, and
+/// [`prtrack_core::observe`] reads the rule when deciding what changed.
+#[derive(Debug, Clone)]
+pub struct Judged {
+    viewer: Login,
+    default_branch: Option<BranchName>,
+    default_branch_rule: PolicyRules,
+    rows: Vec<(BoardRow, PolicyRules)>,
+    board: Board,
+}
+
+impl Judged {
+    /// The account the token authenticates as, whose board this is.
+    #[must_use]
+    pub const fn viewer(&self) -> &Login {
+        &self.viewer
+    }
+
+    /// The repository's default branch; see
+    /// [`RepositoryFacts::default_branch`] for when it is absent.
+    #[must_use]
+    pub const fn default_branch(&self) -> Option<&BranchName> {
+        self.default_branch.as_ref()
+    }
+
+    /// The rule governing the default branch, which is what a policy line
+    /// describes; see [`RepositoryFacts::default_branch_rule`].
+    #[must_use]
+    pub const fn default_branch_rule(&self) -> &PolicyRules {
+        &self.default_branch_rule
+    }
+
+    /// Every pull request's row beside the rule that judged it, in the order
+    /// GitHub returned them.
+    #[must_use]
+    pub fn rows(&self) -> &[(BoardRow, PolicyRules)] {
+        &self.rows
+    }
+
+    /// The rows sorted into the board's sections.
+    #[must_use]
+    pub const fn board(&self) -> &Board {
+        &self.board
     }
 }
 
@@ -515,7 +597,7 @@ mod tests {
     use crate::wire::{self, PAGE_1, PAGE_2, TOTAL_OPEN};
     use prtrack_core::{
         BlockingChecks, Board, BoardRow, BranchName, CheckState, DraftState, HeadRepository,
-        HeadSha, Login, MergeState, MergeableState, RepoRef, Review, Verdict,
+        HeadSha, Login, MergeState, MergeableState, PolicyRules, RepoRef, Review, Verdict,
     };
 
     /// The repository the recordings are of, after redaction.
@@ -1194,15 +1276,11 @@ mod tests {
         // The contract this whole task feeds. If the shapes did not line up the
         // failure would be a compile error, but the counts are worth pinning:
         // every pull request must reach exactly one section.
-        let parts = converted().map(RepositoryFacts::into_parts);
-        assert!(parts.is_some(), "the recording converts");
+        let judged = converted().map(RepositoryFacts::judge);
+        assert!(judged.is_some(), "the recording converts");
 
-        if let Some((viewer, _default_branch, _default_branch_rule, pull_requests)) = parts {
-            let rows: Vec<BoardRow> = pull_requests
-                .into_iter()
-                .map(|(facts, policy)| BoardRow::reduce(facts, &policy))
-                .collect();
-            let board = Board::assemble(rows, &viewer);
+        if let Some(judged) = judged {
+            let board = judged.board();
 
             assert_eq!(board.total(), TOTAL_OPEN);
             assert_eq!(
@@ -1215,5 +1293,62 @@ mod tests {
                 "every pull request lands in exactly one section"
             );
         }
+    }
+
+    #[test]
+    fn judging_reduces_every_pull_request_under_the_rule_that_governs_it() {
+        let facts = converted();
+        assert!(facts.is_some(), "the recording converts");
+        let Some(facts) = facts else { return };
+        let default_rule = facts.default_branch_rule().clone();
+
+        // What makes this fixture able to catch a row judged under the wrong
+        // rule: a pull request into a branch no rule covers, whose row comes
+        // out differently under the default branch's rule. Two rules that
+        // agree on every row would let a `judge` that ignored the per-row rule
+        // pass.
+        let sensitive = facts
+            .pull_requests()
+            .iter()
+            .filter(|(_, policy)| *policy != default_rule)
+            .filter(|(pull_request, policy)| {
+                BoardRow::reduce(pull_request.clone(), policy)
+                    != BoardRow::reduce(pull_request.clone(), &default_rule)
+            })
+            .count();
+        assert!(
+            sensitive > 0,
+            "the recording holds a pull request whose row depends on which rule judges it"
+        );
+
+        let expected: Vec<(BoardRow, PolicyRules)> = facts
+            .pull_requests()
+            .iter()
+            .map(|(pull_request, policy)| {
+                (
+                    BoardRow::reduce(pull_request.clone(), policy),
+                    policy.clone(),
+                )
+            })
+            .collect();
+        let expected_board = Board::assemble(
+            expected.iter().map(|(row, _)| row.clone()).collect(),
+            facts.viewer(),
+        );
+        let viewer = facts.viewer().clone();
+        let default_branch = facts.default_branch().cloned();
+
+        let judged = facts.judge();
+
+        assert_eq!(judged.rows().len(), TOTAL_OPEN, "one row per pull request");
+        assert_eq!(
+            judged.rows(),
+            expected.as_slice(),
+            "each row is reduced under its own rule and keeps that rule beside it"
+        );
+        assert_eq!(judged.board(), &expected_board);
+        assert_eq!(judged.viewer(), &viewer);
+        assert_eq!(judged.default_branch(), default_branch.as_ref());
+        assert_eq!(judged.default_branch_rule(), &default_rule);
     }
 }

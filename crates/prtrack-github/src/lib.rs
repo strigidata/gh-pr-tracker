@@ -82,6 +82,6 @@ mod wire;
 
 pub use client::{Asset, GitHubClient, OpenPullRequests, Release};
 pub use error::{ConversionError, GitHubError, Malformed, NestedList};
-pub use facts::RepositoryFacts;
+pub use facts::{Judged, RepositoryFacts};
 pub use retry::RetryBudget;
 pub use token::{Token, GH_TOKEN, GITHUB_TOKEN};
