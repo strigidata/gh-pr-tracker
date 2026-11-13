@@ -370,6 +370,60 @@ mod tests {
     }
 
     #[test]
+    fn each_row_carries_its_own_title_author_and_link() -> Result<(), InvalidValue> {
+        let viewer = Login::parse("octocat")?;
+        // Distinct titles, so a title taken from the wrong row or field shows.
+        let mut named = on_branch(7, "monalisa", "topic/c1", "main")?;
+        named.title = PrTitle::new("Retire the nightly export");
+        // A deleted account leaves no author, which must stay absent.
+        let mut orphaned = on_branch(8, "hubot", "topic/c2", "main")?;
+        orphaned.title = PrTitle::new("Pin the toolchain");
+        orphaned.author = None;
+        let board = board_of(vec![named, orphaned], &viewer);
+
+        let popover = project(&board, &viewer);
+
+        let mut cells: Vec<_> = [
+            &popover.needs_your_review,
+            &popover.unclaimed,
+            &popover.you_reviewed,
+            &popover.yours,
+            &popover.your_drafts,
+            &popover.other_drafts,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|row| {
+            (
+                row.number,
+                row.title.as_str(),
+                row.author.as_deref(),
+                row.url.as_str(),
+            )
+        })
+        .collect();
+        cells.sort_unstable();
+        assert_eq!(
+            cells,
+            [
+                (
+                    7,
+                    "Retire the nightly export",
+                    Some("monalisa"),
+                    "https://github.com/example-org/example-repo/pull/7"
+                ),
+                (
+                    8,
+                    "Pin the toolchain",
+                    None,
+                    "https://github.com/example-org/example-repo/pull/8"
+                ),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_stack_is_projected_whole_in_its_roots_section() -> Result<(), InvalidValue> {
         let viewer = Login::parse("octocat")?;
         // Three deep, so the walk's order and every depth past the first are
