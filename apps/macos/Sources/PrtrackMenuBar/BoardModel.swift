@@ -7,40 +7,70 @@ import PrtrackFFI
 final class BoardModel {
     enum State {
         case loading
+        /// `at` is when the fetch that produced `board` started.
         case loaded(PopoverBoard, at: Date)
-        /// `at` is when `lastGood` was fetched.
+        /// `at` is when the fetch that produced `lastGood` started.
         case failed(String, lastGood: PopoverBoard?, at: Date?)
     }
 
+    /// What the menu bar shows. Unknown is never zero, and an old count is
+    /// never shown as a current one.
+    enum Badge: Equatable {
+        case unknown
+        case current(Int)
+        case stale(Int)
+    }
+
     private(set) var state: State = .loading
+    /// True while a fetch runs, including one over a board already shown.
+    private(set) var isRefreshing = false
     let repo: String
+
+    /// The one fetch in flight. Owned here, not by a view, so a view going
+    /// away does not abandon it half-way.
+    private var inFlight: Task<Void, Never>?
 
     init(repo: String = ProcessInfo.processInfo.environment["PRTRACK_REPO"] ?? "") {
         self.repo = repo
     }
 
-    /// The count the menu bar shows. Nil means "unknown", never "zero".
-    var badge: Int? {
+    var badge: Badge {
         switch state {
-        case .loading: nil
-        case .loaded(let board, _): Int(board.reviewableNow)
-        case .failed(_, let lastGood, _): lastGood.map { Int($0.reviewableNow) }
+        case .loading: .unknown
+        case .loaded(let board, _): .current(Int(board.reviewableNow))
+        case .failed(_, let lastGood, _): lastGood.map { .stale(Int($0.reviewableNow)) } ?? .unknown
         }
     }
 
+    /// Fetches the board, or joins the fetch already running.
     func refresh() async {
+        if let inFlight {
+            await inFlight.value
+            return
+        }
+        // Inherits the main actor, so it cannot start before `inFlight` is set.
+        let fetch = Task {
+            await self.fetch()
+            self.inFlight = nil
+            self.isRefreshing = false
+        }
+        inFlight = fetch
+        isRefreshing = true
+        await fetch.value
+    }
+
+    // No cancellation checks: nothing cancels this task, which no view owns,
+    // and cancelling it would not stop the Rust future anyway.
+    private func fetch() async {
         guard !repo.isEmpty else {
             state = .failed("PRTRACK_REPO is not set (expected owner/name).", lastGood: nil, at: nil)
             return
         }
+        let started = Date()
         do {
             let board = try await fetchBoard(repo: repo)
-            if Task.isCancelled { return }
-            state = .loaded(board, at: Date())
-        } catch is CancellationError {
-            return
+            state = .loaded(board, at: started)
         } catch {
-            if Task.isCancelled { return }
             // The generated `errorDescription` is `String(reflecting:)`, which
             // prints the Swift case around the text; show the text itself.
             let message =

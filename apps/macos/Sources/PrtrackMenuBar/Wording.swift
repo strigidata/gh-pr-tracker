@@ -1,11 +1,22 @@
 import PrtrackFFI
 
-// The wording below is kept in sync BY HAND with `reason_cell` in
-// crates/prtrack-cli/src/render.rs (the CLI's sentences). That is a spike
-// limitation: `ReasonKind` carries no payload, so these are the payload-free
-// forms of each sentence. The switch has no `default:`, so a new rung fails to
-// compile here.
-func wording(for reason: ReasonKind) -> String {
+// The wording below is kept in sync BY HAND with crates/prtrack-cli/src/render.rs:
+// `reason_cell` (one sentence per rung), `rereview_cell` (one per verdict), and
+// the rule at render.rs:320-328 choosing between them, which `wording(for:)`
+// mirrors. That is a spike limitation: `ReasonKind` carries no payload, so the
+// reasons are the payload-free forms of each sentence. Neither switch has a
+// `default:`, so a new rung or verdict fails to compile here.
+
+/// The reason column's sentence for `row`, chosen as the CLI chooses it: the
+/// reason when it is a change request, otherwise the re-review sentence when
+/// the viewer's say was pushed past, otherwise the reason.
+func wording(for row: PopoverRow) -> String {
+    if case .changesRequested = row.reason { return wording(for: row.reason) }
+    if let verdict = row.rereview { return wording(for: verdict) }
+    return wording(for: row.reason)
+}
+
+private func wording(for reason: ReasonKind) -> String {
     switch reason {
     case .draft: "draft - not ready"
     case .changesRequested: "changes requested"
@@ -20,5 +31,12 @@ func wording(for reason: ReasonKind) -> String {
     case .mergeabilityNotKnown: "mergeability not known"
     case .waitingForReview: "waiting for review"
     case .nobodyAssigned: "NOBODY ASSIGNED"
+    }
+}
+
+private func wording(for verdict: Verdict) -> String {
+    switch verdict {
+    case .changesRequested: "RE-REVIEW: pushed since you blocked it"
+    case .approved: "RE-REVIEW: pushed since you approved"
     }
 }
