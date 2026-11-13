@@ -80,28 +80,6 @@ impl RepositoryFacts {
         &self.pull_requests
     }
 
-    /// The same, owned, for handing to `BoardRow::reduce` without cloning.
-    ///
-    /// Carries the repository-level facts too, because a renderer needs them
-    /// beside the rows and reading them through the accessors would borrow a
-    /// value this consumes.
-    #[must_use]
-    pub fn into_parts(
-        self,
-    ) -> (
-        Login,
-        Option<BranchName>,
-        PolicyRules,
-        Vec<(PrFacts, PolicyRules)>,
-    ) {
-        (
-            self.viewer,
-            self.default_branch,
-            self.default_branch_rule,
-            self.pull_requests,
-        )
-    }
-
     /// Reduces every pull request under the rule that governs it and assembles
     /// the rows into a board.
     ///
