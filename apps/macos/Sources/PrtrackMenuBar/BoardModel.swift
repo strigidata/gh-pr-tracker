@@ -10,7 +10,34 @@ final class BoardModel {
         /// `at` is when the fetch that produced `board` started.
         case loaded(PopoverBoard, at: Date)
         /// `at` is when the fetch that produced `lastGood` started.
-        case failed(String, lastGood: PopoverBoard?, at: Date?)
+        case failed(Failure, lastGood: PopoverBoard?, at: Date?)
+    }
+
+    /// Why the board could not be refreshed.
+    struct Failure {
+        /// What to do about it, when this app knows; said above `message`.
+        let hint: String?
+        /// What failed, and every cause beneath it.
+        let message: String
+
+        init(hint: String?, message: String) {
+            self.hint = hint
+            self.message = message
+        }
+
+        init(_ error: FetchError) {
+            // The generated `errorDescription` is `String(reflecting:)`, which
+            // prints the Swift case around the text; show the text itself.
+            // No `default:`, so a case Rust adds fails to compile here.
+            let message =
+                switch error {
+                case .NoToken(let message), .Unauthorized(let message),
+                    .RateLimited(let message), .RepositoryUnavailable(let message),
+                    .Network(let message), .Unreadable(let message):
+                    message
+                }
+            self.init(hint: failureHint(for: error), message: message)
+        }
     }
 
     /// What the menu bar shows. Unknown is never zero, and a count from before
@@ -71,29 +98,31 @@ final class BoardModel {
     // and cancelling it would not stop the Rust future anyway.
     private func fetch() async {
         guard !repo.isEmpty else {
-            state = .failed("PRTRACK_REPO is not set (expected owner/name).", lastGood: nil, at: nil)
+            let failure = Failure(hint: nil, message: "PRTRACK_REPO is not set (expected owner/name).")
+            state = .failed(failure, lastGood: nil, at: nil)
             return
         }
         let started = Date()
         do {
             let board = try await fetchBoard(repo: repo)
             state = .loaded(board, at: started)
+        } catch let error as FetchError {
+            fail(Failure(error))
         } catch {
-            // The generated `errorDescription` is `String(reflecting:)`, which
-            // prints the Swift case around the text; show the text itself.
-            let message =
-                switch error {
-                case FetchError.Failed(let message): message
-                default: error.localizedDescription
-                }
-            switch state {
-            case .loaded(let board, let at):
-                state = .failed(message, lastGood: board, at: at)
-            case .failed(_, let lastGood, let at):
-                state = .failed(message, lastGood: lastGood, at: at)
-            case .loading:
-                state = .failed(message, lastGood: nil, at: nil)
-            }
+            // Not one of Rust's answers: a failure in the generated glue.
+            fail(Failure(hint: nil, message: error.localizedDescription))
+        }
+    }
+
+    /// Shows `failure`, keeping whatever board was last fetched.
+    private func fail(_ failure: Failure) {
+        switch state {
+        case .loaded(let board, let at):
+            state = .failed(failure, lastGood: board, at: at)
+        case .failed(_, let lastGood, let at):
+            state = .failed(failure, lastGood: lastGood, at: at)
+        case .loading:
+            state = .failed(failure, lastGood: nil, at: nil)
         }
     }
 }

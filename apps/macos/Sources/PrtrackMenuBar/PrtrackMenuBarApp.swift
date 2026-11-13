@@ -101,11 +101,12 @@ struct PopoverView: View {
             Text("Loading...").foregroundStyle(.secondary)
         case .loaded(let board, _):
             boardView(board, ifEmpty: "Nothing open: the fetch succeeded and the board is empty.")
-        case .failed(let message, let lastGood, let at):
+        case .failed(let failure, let lastGood, let at):
             VStack(alignment: .leading, spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Could not refresh").bold()
-                    Text(message)
+                    if let hint = failure.hint { Text(hint) }
+                    Text(failure.message)
                     if let at {
                         Text("Showing the board fetched \(Text(at, style: .relative)) ago")
                     }

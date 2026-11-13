@@ -160,9 +160,11 @@ async fn a_server_error_is_a_failure_and_never_an_empty_board() -> TestResult {
 
     let fetched = fetch_board_with(&client, REPO).await;
 
+    // A 500 the client gave up retrying: classified by the status beneath the
+    // `GaveUp`, which is one the next attempt might get past.
     assert!(
-        matches!(&fetched, Err(FetchError::Failed { .. })),
-        "a 500 must be a failure, got {fetched:?}"
+        matches!(&fetched, Err(FetchError::Network { .. })),
+        "a 500 must be a network failure, got {fetched:?}"
     );
     let message = fetched.err().map(|error| error.to_string());
     // The status is the cause beneath the top-level error, so this fails if
@@ -178,6 +180,64 @@ async fn a_server_error_is_a_failure_and_never_an_empty_board() -> TestResult {
             .as_deref()
             .is_some_and(|text| !text.contains(SECRET)),
         "a failure never carries the token: {message:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rejected_token_is_unauthorized() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let client = client_for(&server)?;
+
+    let fetched = fetch_board_with(&client, REPO).await;
+
+    assert!(
+        matches!(&fetched, Err(FetchError::Unauthorized { .. })),
+        "a 401 must say the token was rejected, got {fetched:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_repository_that_is_not_owner_slash_name_is_refused_before_asking() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ok(PAGE_1))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let client = client_for(&server)?;
+
+    let fetched = fetch_board_with(&client, "example-repo").await;
+
+    assert!(
+        matches!(&fetched, Err(FetchError::RepositoryUnavailable { .. })),
+        "a name with no owner must be refused, got {fetched:?}"
+    );
+    // `expect(0)` is checked when the server drops, so drop it here, inside
+    // the test, rather than after the result is already returned.
+    drop(server);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_server_that_cannot_be_reached_is_a_network_failure() -> TestResult {
+    // A port that was free a moment ago and is closed now: connecting is
+    // refused at once, which is a transport failure rather than an answer.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let client = GitHubClient::new(&Token::parse(SECRET)?)?
+        .with_endpoint(&format!("http://{closed}/graphql"))?
+        .with_retry_budget(RetryBudget::new(NonZeroU32::MIN, Duration::ZERO));
+
+    let fetched = fetch_board_with(&client, REPO).await;
+
+    assert!(
+        matches!(&fetched, Err(FetchError::Network { .. })),
+        "a refused connection must be a network failure, got {fetched:?}"
     );
     Ok(())
 }

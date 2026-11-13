@@ -41,3 +41,19 @@ private func wording(for verdict: Verdict) -> String {
     case .approved: "RE-REVIEW: pushed since you approved"
     }
 }
+
+// The hints below have no twin in the CLI, which says what to do through its
+// exit code and its error chain. No `default:`, so a case Rust adds to
+// `FetchError` fails to compile here.
+
+/// What to do about `error`, said above its message.
+func failureHint(for error: FetchError) -> String {
+    switch error {
+    case .NoToken: "Set GH_TOKEN or GITHUB_TOKEN before launching."
+    case .Unauthorized: "GitHub rejected the token."
+    case .RateLimited: "GitHub's rate limit is exhausted; try again later."
+    case .RepositoryUnavailable: "Check PRTRACK_REPO: it is not owner/name, or this token cannot see it."
+    case .Network: "GitHub could not be reached; try again."
+    case .Unreadable: "GitHub's answer could not be read."
+    }
+}

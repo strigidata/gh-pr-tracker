@@ -22,8 +22,8 @@
 
 use std::error::Error;
 
-use prtrack_core::{Board, Login, Placed, ReasonKind, RepoRef, Stacks, Verdict};
-use prtrack_github::{GitHubClient, RepositoryFacts};
+use prtrack_core::{Board, InvalidValue, Login, Placed, ReasonKind, RepoRef, Stacks, Verdict};
+use prtrack_github::{ConversionError, GitHubClient, GitHubError, RepositoryFacts};
 
 uniffi::setup_scaffolding!();
 
@@ -129,26 +129,93 @@ pub struct PopoverBoard {
 }
 
 /// Why there is no board. Never an empty one.
-#[derive(Debug, thiserror::Error, uniffi::Error)]
+///
+/// Grouped by what the person reading it should do, not by where it arose:
+/// fix the token, fix the repository name, wait, or try again. Every variant
+/// carries the same `message`: the failure and every cause beneath it, joined
+/// by `": "`. It carries no token, because no error in the chain prints one.
+///
+/// `#[non_exhaustive]` binds Rust callers only. The Swift `UniFFI` generates is
+/// the same with or without it, and Swift's switches over it stay exhaustive,
+/// because the library and its bindings ship together.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
+#[non_exhaustive]
 pub enum FetchError {
-    /// The fetch, or reading what came back, failed.
+    /// Neither `GH_TOKEN` nor `GITHUB_TOKEN` holds a token that can be sent.
     #[error("{message}")]
-    Failed {
-        /// The failure and every cause beneath it, joined by `": "`. Carries
-        /// no token: no error in the chain prints one.
+    NoToken {
+        /// The failure and every cause beneath it.
         message: String,
     },
+    /// GitHub refused the token: HTTP 401, or a 403 that is not a spent rate
+    /// limit. Retrying with the same token will not help.
+    #[error("{message}")]
+    Unauthorized {
+        /// The failure and every cause beneath it.
+        message: String,
+    },
+    /// The rate limit is spent. Nothing will succeed until it resets.
+    #[error("{message}")]
+    RateLimited {
+        /// The failure and every cause beneath it.
+        message: String,
+    },
+    /// The repository is not `owner/name`, or does not exist, or this token
+    /// cannot see it: GitHub answers the last two identically on purpose.
+    #[error("{message}")]
+    RepositoryUnavailable {
+        /// The failure and every cause beneath it.
+        message: String,
+    },
+    /// GitHub could not be reached, or answered with an HTTP status there is no
+    /// other reading for. The one worth trying again.
+    #[error("{message}")]
+    Network {
+        /// The failure and every cause beneath it.
+        message: String,
+    },
+    /// GitHub answered, and the answer could not be read or represented.
+    #[error("{message}")]
+    Unreadable {
+        /// The failure and every cause beneath it.
+        message: String,
+    },
+}
+
+impl FetchError {
+    /// A transport failure, grouped by [`grouped`] and worded by its whole
+    /// chain.
+    fn from_github(error: &GitHubError) -> Self {
+        grouped(error, chain(error))
+    }
+
+    /// A page that arrived and holds a value the domain cannot represent.
+    ///
+    /// Every [`ConversionError`] lands here, so this does not match on it:
+    /// whichever value was refused, fetching again fetches the same one.
+    fn from_conversion(error: &ConversionError) -> Self {
+        Self::Unreadable {
+            message: chain(error),
+        }
+    }
+
+    /// A repository name that is not `owner/name`, refused before any request.
+    fn from_repo(error: &InvalidValue) -> Self {
+        Self::RepositoryUnavailable {
+            message: chain(error),
+        }
+    }
 }
 
 /// Fetches `repo`'s board with the token in `GH_TOKEN` or `GITHUB_TOKEN`.
 ///
 /// # Errors
 ///
-/// [`FetchError::Failed`] when there is no usable token, `repo` is not
-/// `owner/name`, GitHub cannot be read, or what it sent cannot be represented.
+/// [`FetchError::NoToken`] when there is no usable token, and otherwise as
+/// [`fetch_board_with`].
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn fetch_board(repo: String) -> Result<PopoverBoard, FetchError> {
-    let client = GitHubClient::from_env().map_err(|error| failed(&error))?;
+    let client = GitHubClient::from_env().map_err(|error| FetchError::from_github(&error))?;
     fetch_board_with(&client, &repo).await
 }
 
@@ -159,18 +226,22 @@ pub async fn fetch_board(repo: String) -> Result<PopoverBoard, FetchError> {
 ///
 /// # Errors
 ///
-/// As [`fetch_board`], less the token.
+/// [`FetchError::RepositoryUnavailable`] when `repo` is not `owner/name`,
+/// before any request is sent, or GitHub will not show it;
+/// [`FetchError::Unauthorized`] or [`FetchError::RateLimited`] when GitHub
+/// refuses; [`FetchError::Network`] when it cannot be reached or fails; and
+/// [`FetchError::Unreadable`] when what it sent cannot be read.
 pub async fn fetch_board_with(
     client: &GitHubClient,
     repo: &str,
 ) -> Result<PopoverBoard, FetchError> {
-    let repo = RepoRef::parse(repo).map_err(|error| failed(&error))?;
+    let repo = RepoRef::parse(repo).map_err(|error| FetchError::from_repo(&error))?;
     let open = client
         .fetch_open_pull_requests(&repo)
         .await
-        .map_err(|error| failed(&error))?;
+        .map_err(|error| FetchError::from_github(&error))?;
     let judged = RepositoryFacts::try_from(open)
-        .map_err(|error| failed(&error))?
+        .map_err(|error| FetchError::from_conversion(&error))?
         .judge();
     Ok(project(judged.board(), judged.viewer()))
 }
@@ -224,23 +295,221 @@ fn count(rows: usize) -> u32 {
 }
 
 /// `error` and every cause beneath it, as one line.
-fn failed(error: &(dyn Error + 'static)) -> FetchError {
-    let message = std::iter::successors(Some(error), |&error| error.source())
+fn chain(error: &(dyn Error + 'static)) -> String {
+    std::iter::successors(Some(error), |&error| error.source())
         .map(ToString::to_string)
         .collect::<Vec<_>>()
-        .join(": ");
-    FetchError::Failed { message }
+        .join(": ")
+}
+
+/// The variant `error` belongs in, carrying `message`.
+///
+/// Classified by what the last attempt failed with: a
+/// [`GitHubError::GaveUp`] is looked through, however deeply nested, because
+/// it says how long the client tried and not what went wrong. The app waits
+/// out a spent rate limit differently from a flaky network, so a rate limit
+/// the client gave up on must still read as one.
+///
+/// # The twin of `prtrack-cli`'s `exit.rs`
+///
+/// `Exit::of` in `crates/prtrack-cli/src/exit.rs` makes the same split for
+/// the CLI's exit codes, and this crate cannot depend on that one, so the
+/// mapping is restated here. They must agree wherever they overlap:
+/// `NoToken` and `Unauthorized` together are its `Auth`;
+/// `RepositoryUnavailable` is its `Usage`, `UnusableEndpoint` included; and
+/// `RateLimited`, `Network` and `Unreadable` split its `Api`. One difference
+/// is deliberate: `Exit::of` files every `GaveUp` under `Api` without looking
+/// inside. The two still agree today, because the client only gives up on
+/// failures it retried, and every one of those is `Api` there.
+///
+/// # A new variant does not fail this build
+///
+/// [`GitHubError`] is `#[non_exhaustive]` and defined in another crate, so
+/// the language requires a wildcard here, and the lint that would flag a
+/// variant it swallows (`non_exhaustive_omitted_patterns`) is unstable. Every
+/// variant this build knows is named, and the wildcard shares the arm with
+/// `Network` for the reason `exit.rs` gives: a retry wastes a request, where
+/// any other reading sends somebody to fix something that is fine.
+fn grouped(error: &GitHubError, message: String) -> FetchError {
+    match error {
+        GitHubError::GaveUp { source, .. } => grouped(source, message),
+        GitHubError::MissingToken | GitHubError::UnusableToken => FetchError::NoToken { message },
+        GitHubError::Unauthorized | GitHubError::Forbidden => FetchError::Unauthorized { message },
+        GitHubError::RateLimited => FetchError::RateLimited { message },
+        GitHubError::RepositoryUnavailable { .. } | GitHubError::UnusableEndpoint => {
+            FetchError::RepositoryUnavailable { message }
+        }
+        GitHubError::Decode(_)
+        | GitHubError::Malformed(_)
+        | GitHubError::GraphQl { .. }
+        | GitHubError::TooManyPages { .. } => FetchError::Unreadable { message },
+        GitHubError::Transport(_) | GitHubError::UnexpectedStatus { .. } | _ => {
+            FetchError::Network { message }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{project, PopoverRow};
+    use super::{grouped, project, FetchError, PopoverRow};
     use chrono::{DateTime, Utc};
     use prtrack_core::{
         Board, BoardRow, BranchName, Check, CheckName, CheckState, DraftState, HeadRepository,
         HeadSha, InvalidValue, Login, MergeState, MergeableState, Placed, PolicyRules, PrFacts,
         PrNumber, PrTitle, PrUrl, ReasonKind, RepoRef, Review, ReviewDecision, Reviewer, Verdict,
     };
+    use prtrack_github::{ConversionError, GitHubError, Malformed};
+
+    /// `source` wrapped in one [`GitHubError::GaveUp`].
+    fn gave_up(source: GitHubError) -> GitHubError {
+        GitHubError::GaveUp {
+            attempts: 3,
+            source: Box::new(source),
+        }
+    }
+
+    /// Every [`GitHubError`] variant but `Transport`, beside the variant the
+    /// app is handed for it.
+    ///
+    /// `Transport` carries a `reqwest::Error`, which nothing outside `reqwest`
+    /// can build; `tests/fetch_board.rs` reaches it through a refused
+    /// connection instead.
+    fn every_github_error() -> Result<Vec<(GitHubError, FetchError)>, Box<dyn std::error::Error>> {
+        let empty = String::new;
+        let decode = serde_json::from_str::<serde_json::Value>("{")
+            .err()
+            .ok_or("an unclosed object is not JSON")?;
+        Ok(vec![
+            (
+                GitHubError::MissingToken,
+                FetchError::NoToken { message: empty() },
+            ),
+            (
+                GitHubError::UnusableToken,
+                FetchError::NoToken { message: empty() },
+            ),
+            (
+                GitHubError::Unauthorized,
+                FetchError::Unauthorized { message: empty() },
+            ),
+            (
+                GitHubError::Forbidden,
+                FetchError::Unauthorized { message: empty() },
+            ),
+            (
+                GitHubError::RateLimited,
+                FetchError::RateLimited { message: empty() },
+            ),
+            (
+                GitHubError::RepositoryUnavailable {
+                    repo: RepoRef::parse("example-org/example-repo")?,
+                },
+                FetchError::RepositoryUnavailable { message: empty() },
+            ),
+            // `exit.rs` files this beside an unseen repository, as a usage
+            // error: something the person at the keyboard must change.
+            (
+                GitHubError::UnusableEndpoint,
+                FetchError::RepositoryUnavailable { message: empty() },
+            ),
+            (
+                GitHubError::UnexpectedStatus { status: 418 },
+                FetchError::Network { message: empty() },
+            ),
+            (
+                GitHubError::Decode(decode),
+                FetchError::Unreadable { message: empty() },
+            ),
+            (
+                GitHubError::Malformed(Malformed::NoPageInfo),
+                FetchError::Unreadable { message: empty() },
+            ),
+            (
+                GitHubError::GraphQl {
+                    messages: vec!["Field 'nope' doesn't exist".to_owned()],
+                },
+                FetchError::Unreadable { message: empty() },
+            ),
+            (
+                GitHubError::TooManyPages { pages: 101 },
+                FetchError::Unreadable { message: empty() },
+            ),
+            // `GaveUp` says how long the client tried, not what failed: the
+            // app is told what the last attempt failed with.
+            (
+                gave_up(GitHubError::RateLimited),
+                FetchError::RateLimited { message: empty() },
+            ),
+            (
+                gave_up(gave_up(GitHubError::RateLimited)),
+                FetchError::RateLimited { message: empty() },
+            ),
+            (
+                gave_up(GitHubError::UnexpectedStatus { status: 502 }),
+                FetchError::Network { message: empty() },
+            ),
+            (
+                gave_up(GitHubError::Malformed(Malformed::NoNodes)),
+                FetchError::Unreadable { message: empty() },
+            ),
+        ])
+    }
+
+    #[test]
+    fn each_github_failure_is_grouped_by_what_the_reader_should_do(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for (error, expected) in every_github_error()? {
+            assert_eq!(grouped(&error, String::new()), expected, "{error:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_failure_given_up_on_keeps_the_whole_chain_in_its_message() {
+        let error = FetchError::from_github(&gave_up(GitHubError::RateLimited));
+
+        // Classified by the root, worded by the whole chain: the message
+        // still says the client gave up, and why.
+        assert_eq!(
+            error,
+            FetchError::RateLimited {
+                message: format!(
+                    "{}: {}",
+                    gave_up(GitHubError::RateLimited),
+                    GitHubError::RateLimited
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn an_answer_that_cannot_be_represented_is_unreadable() {
+        let error = FetchError::from_conversion(&ConversionError::NoCommit { number: 7 });
+
+        assert_eq!(
+            error,
+            FetchError::Unreadable {
+                message: ConversionError::NoCommit { number: 7 }.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_repository_that_is_not_owner_slash_name_is_unavailable() -> Result<(), &'static str> {
+        let refused = RepoRef::parse("example-repo")
+            .err()
+            .ok_or("a name with no owner is refused")?;
+
+        let error = FetchError::from_repo(&refused);
+
+        assert_eq!(
+            error,
+            FetchError::RepositoryUnavailable {
+                message: refused.to_string(),
+            }
+        );
+        Ok(())
+    }
 
     /// The commit the viewer reviewed: no longer the head.
     const EARLIER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
