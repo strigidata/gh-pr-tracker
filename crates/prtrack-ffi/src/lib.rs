@@ -16,7 +16,7 @@
 
 use std::error::Error;
 
-use prtrack_core::{Board, Login, Placed, ReasonKind, RepoRef, Stacks};
+use prtrack_core::{Board, Login, Placed, ReasonKind, RepoRef, Stacks, Verdict};
 use prtrack_github::{GitHubClient, RepositoryFacts};
 
 uniffi::setup_scaffolding!();
@@ -42,6 +42,16 @@ pub enum ReasonKind {
     NobodyAssigned,
 }
 
+/// `prtrack_core::Verdict`, declared to `UniFFI` rather than copied.
+///
+/// The derive matches every variant, so a verdict added to the core fails
+/// this crate's build until it is named here too.
+#[uniffi::remote(Enum)]
+pub enum Verdict {
+    Approved,
+    ChangesRequested,
+}
+
 /// One row of the popover.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct PopoverRow {
@@ -57,6 +67,12 @@ pub struct PopoverRow {
     /// never `BoardRow::reason`. On a re-review the two differ, and only the
     /// first sets aside the viewer's own change request the push answered.
     pub reason: ReasonKind,
+    /// The viewer's own say the author has pushed past, if any:
+    /// `Placed::rereview`. The CLI's reason column shows `reason` when it is
+    /// [`ReasonKind::ChangesRequested`], otherwise the re-review sentence for
+    /// this verdict when there is one, otherwise `reason`; a shell drawing
+    /// `reason` alone tells a re-review it is waiting on nobody.
+    pub rereview: Option<Verdict>,
     /// How many pull requests it is stacked on: 0 for a stack's root, 1 for
     /// what is stacked on that, and so on.
     pub depth: u32,
@@ -182,6 +198,7 @@ fn row(placed: &Placed<'_>) -> PopoverRow {
         author: facts.author.as_ref().map(|login| login.as_str().to_owned()),
         url: facts.url.as_str().to_owned(),
         reason: ReasonKind::of(placed.reason()),
+        rereview: placed.rereview(),
         depth: count(placed.depth()),
     }
 }
@@ -320,11 +337,11 @@ mod tests {
         let projected: Vec<_> = popover
             .needs_your_review
             .iter()
-            .map(|row| (row.number, row.reason))
+            .map(|row| (row.number, row.reason, row.rereview))
             .collect();
         assert_eq!(
             projected,
-            Vec::from_iter(viewers.map(|reason| (101, reason)))
+            Vec::from_iter(viewers.map(|reason| (101, reason, Some(Verdict::ChangesRequested))))
         );
         Ok(())
     }
@@ -362,6 +379,16 @@ mod tests {
         assert_eq!(
             popover.reviewable_now, 1,
             "the review request counts where it would sit alone"
+        );
+        let rereviews: Vec<_> = [&popover.yours, &popover.you_reviewed]
+            .into_iter()
+            .flatten()
+            .map(|row| (row.number, row.rereview))
+            .collect();
+        assert_eq!(
+            rereviews,
+            [(1, None), (2, None), (3, None), (10, None), (11, None)],
+            "an approval at the head, and no review at all, are not re-reviews"
         );
         Ok(())
     }
