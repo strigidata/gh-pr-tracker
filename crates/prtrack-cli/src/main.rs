@@ -12,6 +12,8 @@
 //! the error chain, goes to stderr, so `prtrack board --format json | jq` works
 //! whether or not the run went well.
 
+#![forbid(unsafe_code)]
+
 use std::io::IsTerminal as _;
 use std::process::ExitCode;
 

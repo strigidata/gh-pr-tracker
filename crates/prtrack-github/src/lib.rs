@@ -69,6 +69,8 @@
 //! # }
 //! ```
 
+#![forbid(unsafe_code)]
+
 mod client;
 mod error;
 mod facts;
