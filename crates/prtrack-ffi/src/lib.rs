@@ -1,10 +1,12 @@
 //! The boundary the macOS app links.
 //!
 //! A shell, like `prtrack-cli`: it fetches through `prtrack-github`, lets
-//! `prtrack-core` judge, and projects the result into the two sections the
-//! popover shows. Wording belongs to the Swift side; every decision belongs to
-//! the core. Nothing here ranks, filters or re-classifies a row, and nothing
-//! may depend on this crate.
+//! `prtrack-core` judge, and projects all six of the board's sections, and the
+//! core's count of what is reviewable now, into records Swift can read.
+//! Wording belongs to the Swift side; every decision belongs to the core.
+//! Nothing here ranks, filters, re-classifies or re-counts a row: every row on
+//! the board arrives in exactly one section, in the order the core drew it.
+//! Nothing may depend on this crate.
 //!
 //! No `#![forbid(unsafe_code)]` here, unlike every other crate root: the
 //! scaffolding `uniffi::setup_scaffolding!` and the `uniffi` derives generate
@@ -60,17 +62,47 @@ pub struct PopoverRow {
     pub depth: u32,
 }
 
-/// What the popover shows: who you are blocking, then your own work.
+/// The whole board, section by section in the order the CLI draws them.
+///
+/// Each section holds the rows *drawn* there: every stack rooted in it, each
+/// root followed by what is stacked on it, in pre-order. A stacked row is
+/// drawn in its root's section rather than its own, so a section's rows are
+/// not all rows that would sit there alone, and its length is not a count of
+/// anything the viewer owes. [`PopoverBoard::reviewable_now`] is.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct PopoverBoard {
     /// The account the token authenticates as, whose board this is.
     pub viewer: String,
-    /// Somebody else's work waiting on the viewer, in the core's order.
+    /// The rows drawn in the review section: stacks rooted on somebody else's
+    /// work the viewer was asked to review, or must look at again since a
+    /// push, with every row stacked on those roots. Most reviewable first.
     pub needs_your_review: Vec<PopoverRow>,
-    /// The viewer's own open work, in the core's order.
+    /// The rows drawn under the review section: stacks rooted on somebody
+    /// else's open work nobody asked the viewer about and the viewer has not
+    /// reviewed, with every row stacked on those roots. Most reviewable first.
+    pub unclaimed: Vec<PopoverRow>,
+    /// The rows drawn in the reviewed section: stacks rooted on somebody else's
+    /// work the viewer already approved or asked changes on, with every row
+    /// stacked on those roots — including a review request of the viewer's
+    /// that sits on one. By the root's number.
+    pub you_reviewed: Vec<PopoverRow>,
+    /// The rows drawn in the viewer's own section: stacks rooted on the
+    /// viewer's open, non-draft work, with every row stacked on those roots.
+    /// Most urgent first.
     pub yours: Vec<PopoverRow>,
-    /// Every open pull request the board was built from, including the
-    /// sections the popover does not draw.
+    /// The rows drawn in the viewer's drafts: stacks rooted on the viewer's
+    /// own drafts, with every row stacked on those roots. Newest push first.
+    pub your_drafts: Vec<PopoverRow>,
+    /// The rows drawn in the other drafts: stacks rooted on somebody else's
+    /// draft, with every row stacked on those roots. Newest push first.
+    pub other_drafts: Vec<PopoverRow>,
+    /// How many rows are worth the viewer opening now, counting each row where
+    /// it would sit alone rather than where it is drawn. This is the badge.
+    /// No section's length is: a review request stacked on work the viewer
+    /// already reviewed is drawn in `you_reviewed` and still counted here.
+    pub reviewable_now: u32,
+    /// Every open pull request the board was built from: the rows of all six
+    /// sections together.
     pub total: u32,
 }
 
@@ -121,12 +153,17 @@ pub async fn fetch_board_with(
     Ok(project(judged.board(), judged.viewer()))
 }
 
-/// The two sections the popover draws, in the core's order.
+/// Every section of `board`, and the core's counts, as Swift reads them.
 fn project(board: &Board, viewer: &Login) -> PopoverBoard {
     PopoverBoard {
         viewer: viewer.as_str().to_owned(),
         needs_your_review: section(board.needs_your_review()),
+        unclaimed: section(board.unclaimed()),
+        you_reviewed: section(board.you_reviewed()),
         yours: section(board.yours()),
+        your_drafts: section(board.your_drafts()),
+        other_drafts: section(board.other_drafts()),
+        reviewable_now: count(board.reviewable_now()),
         total: count(board.total()),
     }
 }
@@ -154,10 +191,11 @@ fn row(placed: &Placed<'_>) -> PopoverRow {
 /// Saturating rather than fallible, because overflow is unreachable and a
 /// guard that cannot fire would claim a protection that is not there. Both
 /// numbers are bounded by the rows on the board: a depth is less than the rows
-/// in its tree, and [`Board::total`] is the rows handed in. Through
-/// [`fetch_board_with`] those rows are one fetch's pull requests, which the
-/// client caps at a hundred pages of at most a hundred — under `u32::MAX` by
-/// five orders of magnitude.
+/// in its tree, and [`Board::total`] and [`Board::reviewable_now`] are at most
+/// the rows handed in. Through [`fetch_board_with`] those rows are one fetch's
+/// pull requests: at most 100 pages, each at GitHub's 100-per-page maximum.
+/// The client caps the pages; GitHub caps the rows on each. That is under
+/// `u32::MAX` by five orders of magnitude.
 fn count(rows: usize) -> u32 {
     u32::try_from(rows).unwrap_or(u32::MAX)
 }
@@ -173,12 +211,12 @@ fn failed(error: &(dyn Error + 'static)) -> FetchError {
 
 #[cfg(test)]
 mod tests {
-    use super::project;
+    use super::{project, PopoverRow};
     use chrono::{DateTime, Utc};
     use prtrack_core::{
         Board, BoardRow, BranchName, Check, CheckName, CheckState, DraftState, HeadRepository,
         HeadSha, InvalidValue, Login, MergeState, MergeableState, Placed, PolicyRules, PrFacts,
-        PrNumber, PrTitle, PrUrl, ReasonKind, RepoRef, Review, ReviewDecision, Verdict,
+        PrNumber, PrTitle, PrUrl, ReasonKind, RepoRef, Review, ReviewDecision, Reviewer, Verdict,
     };
 
     /// The commit the viewer reviewed: no longer the head.
@@ -186,35 +224,37 @@ mod tests {
     /// The head the author pushed afterwards.
     const PUSHED: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-    /// `monalisa`'s open pull request, green, on which `viewer` asked for
-    /// changes at [`EARLIER`] before the author pushed [`PUSHED`].
+    /// `author`'s open, green pull request from `head_ref` in this repository
+    /// into `base_ref`, with nobody asked and nothing reviewed, at [`PUSHED`].
     ///
-    /// The change request is entered everywhere GitHub keeps it — the review,
-    /// `changes_requested_by` and the review decision — because that stale fact
-    /// is exactly what the row's own reason still reports and the viewer's
-    /// reading sets aside.
-    fn pushed_past_your_change_request(viewer: &Login) -> Result<PrFacts, InvalidValue> {
+    /// The head is [`HeadRepository::ThisOne`] so that another pull request
+    /// aimed at `head_ref` stacks on it; the recorded fixtures cannot, because
+    /// they carry no `isCrossRepository` and every head there is unstated.
+    fn on_branch(
+        number: u32,
+        author: &str,
+        head_ref: &str,
+        base_ref: &str,
+    ) -> Result<PrFacts, InvalidValue> {
         Ok(PrFacts {
             repo: RepoRef::parse("example-org/example-repo")?,
-            number: PrNumber::new(101)?,
-            url: PrUrl::new("https://github.com/example-org/example-repo/pull/101"),
+            number: PrNumber::new(number)?,
+            url: PrUrl::new(&format!(
+                "https://github.com/example-org/example-repo/pull/{number}"
+            )),
             title: PrTitle::new("Split the ledger writer"),
-            author: Some(Login::parse("monalisa")?),
+            author: Some(Login::parse(author)?),
             draft_state: DraftState::ReadyForReview,
             head: HeadSha::parse(PUSHED)?,
-            head_ref: BranchName::new("topic/ledger"),
+            head_ref: BranchName::new(head_ref),
             head_repository: HeadRepository::ThisOne,
-            base_ref: BranchName::new("main"),
-            review_decision: Some(ReviewDecision::ChangesRequested),
+            base_ref: BranchName::new(base_ref),
+            review_decision: None,
             mergeable: MergeableState::Mergeable,
             merge_state: MergeState::Clean,
             requested_reviewers: Vec::new(),
-            changes_requested_by: vec![viewer.clone()],
-            reviews: vec![Review {
-                by: viewer.clone(),
-                verdict: Verdict::ChangesRequested,
-                on: Some(HeadSha::parse(EARLIER)?),
-            }],
+            changes_requested_by: Vec::new(),
+            reviews: Vec::new(),
             unresolved_threads: 0,
             comments: 0,
             checks: vec![Check::new(
@@ -226,14 +266,43 @@ mod tests {
         })
     }
 
+    /// `monalisa`'s open pull request, green, on which `viewer` asked for
+    /// changes at [`EARLIER`] before the author pushed [`PUSHED`].
+    ///
+    /// The change request is entered everywhere GitHub keeps it — the review,
+    /// `changes_requested_by` and the review decision — because that stale fact
+    /// is exactly what the row's own reason still reports and the viewer's
+    /// reading sets aside.
+    fn pushed_past_your_change_request(viewer: &Login) -> Result<PrFacts, InvalidValue> {
+        let mut facts = on_branch(101, "monalisa", "topic/ledger", "main")?;
+        facts.review_decision = Some(ReviewDecision::ChangesRequested);
+        facts.changes_requested_by = vec![viewer.clone()];
+        facts.reviews = vec![Review {
+            by: viewer.clone(),
+            verdict: Verdict::ChangesRequested,
+            on: Some(HeadSha::parse(EARLIER)?),
+        }];
+        Ok(facts)
+    }
+
+    /// A board of every pull request in `facts`, under no branch rule.
+    fn board_of(facts: Vec<PrFacts>, viewer: &Login) -> Board {
+        let rows = facts
+            .into_iter()
+            .map(|facts| BoardRow::reduce(facts, &PolicyRules::unprotected()))
+            .collect();
+        Board::assemble(rows, viewer)
+    }
+
+    /// Each projected row's number and depth, in the order it arrived.
+    fn placed(rows: &[PopoverRow]) -> Vec<(u32, u32)> {
+        rows.iter().map(|row| (row.number, row.depth)).collect()
+    }
+
     #[test]
     fn a_re_review_is_projected_with_the_reason_the_viewer_reads() -> Result<(), InvalidValue> {
         let viewer = Login::parse("octocat")?;
-        let facts = pushed_past_your_change_request(&viewer)?;
-        let board = Board::assemble(
-            vec![BoardRow::reduce(facts, &PolicyRules::unprotected())],
-            &viewer,
-        );
+        let board = board_of(vec![pushed_past_your_change_request(&viewer)?], &viewer);
         let walked = board.needs_your_review().walk();
         let placed = walked.first();
         assert_eq!(
@@ -256,6 +325,43 @@ mod tests {
         assert_eq!(
             projected,
             Vec::from_iter(viewers.map(|reason| (101, reason)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_stack_is_projected_whole_in_its_roots_section() -> Result<(), InvalidValue> {
+        let viewer = Login::parse("octocat")?;
+        // Three deep, so the walk's order and every depth past the first are
+        // both observable.
+        let root = on_branch(1, "octocat", "topic/a1", "main")?;
+        let child = on_branch(2, "octocat", "topic/a2", "topic/a1")?;
+        let grandchild = on_branch(3, "octocat", "topic/a3", "topic/a2")?;
+        // Approved by the viewer at its head, so it is drawn in `you_reviewed`.
+        let mut approved = on_branch(10, "monalisa", "topic/b1", "main")?;
+        approved.reviews = vec![Review {
+            by: viewer.clone(),
+            verdict: Verdict::Approved,
+            on: Some(HeadSha::parse(PUSHED)?),
+        }];
+        // Asked of the viewer, so on its own it would be in the review section;
+        // stacked on the approved one, it is drawn there instead.
+        let mut asked = on_branch(11, "hubot", "topic/b2", "topic/b1")?;
+        asked.requested_reviewers = vec![Reviewer::User(viewer.clone())];
+        let board = board_of(vec![grandchild, asked, root, approved, child], &viewer);
+
+        let popover = project(&board, &viewer);
+
+        assert_eq!(placed(&popover.yours), [(1, 0), (2, 1), (3, 2)]);
+        assert_eq!(placed(&popover.you_reviewed), [(10, 0), (11, 1)]);
+        assert_eq!(
+            placed(&popover.needs_your_review),
+            [],
+            "the review request is drawn under its root, not on its own"
+        );
+        assert_eq!(
+            popover.reviewable_now, 1,
+            "the review request counts where it would sit alone"
         );
         Ok(())
     }
