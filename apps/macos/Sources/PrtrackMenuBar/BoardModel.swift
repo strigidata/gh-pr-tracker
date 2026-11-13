@@ -41,7 +41,13 @@ final class BoardModel {
             return
         } catch {
             if Task.isCancelled { return }
-            let message = error.localizedDescription
+            // The generated `errorDescription` is `String(reflecting:)`, which
+            // prints the Swift case around the text; show the text itself.
+            let message =
+                switch error {
+                case FetchError.Failed(let message): message
+                default: error.localizedDescription
+                }
             switch state {
             case .loaded(let board, let at):
                 state = .failed(message, lastGood: board, at: at)
