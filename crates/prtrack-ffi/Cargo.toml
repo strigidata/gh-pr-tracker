@@ -6,8 +6,11 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# `staticlib` is what the SwiftPM app links; `lib` is what this crate's own
-# tests, and `uniffi-bindgen generate --library`, read the metadata from.
+# `staticlib` is what the SwiftPM app links, and what bindings are generated
+# from: uniffi_bindgen 0.32's library mode reads an `ar` archive through goblin,
+# so `uniffi-bindgen generate --library target/release/libprtrack_ffi.a` works.
+# `lib` is there only so the integration tests under `tests/` can link the
+# crate.
 [lib]
 crate-type = ["staticlib", "lib"]
 
@@ -22,13 +25,13 @@ bindgen = ["uniffi/cli"]
 prtrack-core = { path = "../prtrack-core" }
 prtrack-github = { path = "../prtrack-github" }
 thiserror = { workspace = true }
-tokio = { workspace = true }
 uniffi = { version = "0.32", features = ["tokio"] }
 
 [dev-dependencies]
 chrono = { workspace = true }
-wiremock = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
+wiremock = { workspace = true }
 
 [lints]
 workspace = true

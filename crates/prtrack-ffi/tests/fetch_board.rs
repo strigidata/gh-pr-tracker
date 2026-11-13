@@ -31,18 +31,30 @@ const REPO: &str = "example-org/example-repo";
 /// the error text.
 const SECRET: &str = "ghp_0123456789abcdefSECRETzzzz";
 
-/// What a page request carries when it asks for the first page. Compact, as
-/// `reqwest` serialises it.
-const FIRST_PAGE: &[u8] = br#""after":null"#;
-
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// Whether `request` asks for the first page rather than one after a cursor.
+/// The `variables.after` cursor a page request carries: `Null` when it asks
+/// for the first page, whether GitHub's client sent `null` or left the key
+/// out, and `None` when the body is not JSON at all, so such a request matches
+/// neither page and the test fails rather than being handed one.
+fn after(request: &Request) -> Option<serde_json::Value> {
+    let body = serde_json::from_slice::<serde_json::Value>(&request.body).ok()?;
+    Some(
+        body.get("variables")
+            .and_then(|variables| variables.get("after"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// Whether `request` asks for the first page.
 fn asks_for_the_first_page(request: &Request) -> bool {
-    request
-        .body
-        .windows(FIRST_PAGE.len())
-        .any(|window| window == FIRST_PAGE)
+    after(request).is_some_and(|cursor| cursor.is_null())
+}
+
+/// Whether `request` asks for a page after a cursor.
+fn asks_for_a_later_page(request: &Request) -> bool {
+    after(request).is_some_and(|cursor| !cursor.is_null())
 }
 
 /// A 200 carrying `body` as JSON, the way GitHub's GraphQL endpoint answers.
@@ -63,7 +75,7 @@ async fn recorded_server() -> MockServer {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(|request: &Request| !asks_for_the_first_page(request))
+        .and(asks_for_a_later_page)
         .respond_with(ok(PAGE_2))
         .mount(&server)
         .await;
@@ -93,7 +105,7 @@ fn projected(rows: &[PopoverRow]) -> Vec<u32> {
 }
 
 #[tokio::test]
-async fn both_sections_arrive_in_the_order_the_core_drew_them() -> TestResult {
+async fn every_section_arrives_in_the_order_the_core_drew_it() -> TestResult {
     let server = recorded_server().await;
     let client = client_for(&server)?;
 
@@ -101,28 +113,39 @@ async fn both_sections_arrive_in_the_order_the_core_drew_them() -> TestResult {
         .fetch_open_pull_requests(&RepoRef::parse(REPO)?)
         .await?;
     let judged = RepositoryFacts::try_from(open)?.judge();
-    let expected_review = walked(judged.board().needs_your_review());
-    let expected_yours = walked(judged.board().yours());
+    let board = judged.board();
     // An empty section matches any order, so the comparison below would pass
-    // against a projection that drops or shuffles everything.
+    // against a projection that drops or shuffles everything. Two sections
+    // the recording does fill are enough to rule that out; a section it
+    // leaves empty is covered by the synthetic board in `lib.rs`.
     assert!(
-        !expected_review.is_empty(),
+        !walked(board.needs_your_review()).is_empty(),
         "the recording has rows to review"
     );
     assert!(
-        !expected_yours.is_empty(),
+        !walked(board.yours()).is_empty(),
         "the recording has the viewer's own rows"
     );
 
     let popover = fetch_board_with(&client, REPO).await?;
 
-    assert_eq!(projected(&popover.needs_your_review), expected_review);
-    assert_eq!(projected(&popover.yours), expected_yours);
+    let sections = [
+        (&popover.needs_your_review, board.needs_your_review()),
+        (&popover.unclaimed, board.unclaimed()),
+        (&popover.you_reviewed, board.you_reviewed()),
+        (&popover.yours, board.yours()),
+        (&popover.your_drafts, board.your_drafts()),
+        (&popover.other_drafts, board.other_drafts()),
+    ];
+    for (rows, section) in sections {
+        assert_eq!(projected(rows), walked(section));
+    }
     assert_eq!(popover.viewer, judged.viewer().as_str());
     assert_eq!(
-        usize::try_from(popover.total).ok(),
-        Some(judged.board().total())
+        usize::try_from(popover.reviewable_now).ok(),
+        Some(board.reviewable_now())
     );
+    assert_eq!(usize::try_from(popover.total).ok(), Some(board.total()));
     Ok(())
 }
 
@@ -142,11 +165,19 @@ async fn a_server_error_is_a_failure_and_never_an_empty_board() -> TestResult {
         "a 500 must be a failure, got {fetched:?}"
     );
     let message = fetched.err().map(|error| error.to_string());
+    // The status is the cause beneath the top-level error, so this fails if
+    // the message stops at the first link of the chain.
+    assert!(
+        message.as_deref().is_some_and(|text| text.contains("500")),
+        "a failure carries its cause: {message:?}"
+    );
+    // This crate never holds the token, so this guards `prtrack-github`'s
+    // error text: nothing in the chain it hands back may print the token.
     assert!(
         message
             .as_deref()
-            .is_some_and(|text| !text.is_empty() && !text.contains(SECRET)),
-        "a failure says what failed, without the token: {message:?}"
+            .is_some_and(|text| !text.contains(SECRET)),
+        "a failure never carries the token: {message:?}"
     );
     Ok(())
 }

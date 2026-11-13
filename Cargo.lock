@@ -1533,6 +1533,7 @@ dependencies = [
  "chrono",
  "prtrack-core",
  "prtrack-github",
+ "serde_json",
  "thiserror",
  "tokio",
  "uniffi",
