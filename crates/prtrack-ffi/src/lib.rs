@@ -306,9 +306,11 @@ fn chain(error: &(dyn Error + 'static)) -> String {
 ///
 /// Classified by what the last attempt failed with: a
 /// [`GitHubError::GaveUp`] is looked through, however deeply nested, because
-/// it says how long the client tried and not what went wrong. The app waits
-/// out a spent rate limit differently from a flaky network, so a rate limit
-/// the client gave up on must still read as one.
+/// it says how long the client tried and not what went wrong. Today the
+/// client wraps only failures it retries, such as a transport error, a 5xx or
+/// a malformed page; a rate limit is returned unwrapped. The recursion keeps a
+/// rate limit reading as one if that ever changes, because the app waits it
+/// out differently from a flaky network.
 ///
 /// # The twin of `prtrack-cli`'s `exit.rs`
 ///
