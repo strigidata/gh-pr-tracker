@@ -29,7 +29,10 @@ and renders it. Swift owns the wording and Rust owns every judgement.
 > - **Task 3:** all six sections are projected, `you_reviewed` included. A
 >   count past `u32::MAX` saturates rather than failing, because it is
 >   unreachable (see `count` in `prtrack-ffi`). The row also carries the
->   re-review verdict.
+>   re-review verdict. `FetchError` has six typed variants instead of one:
+>   `NoToken`, `Unauthorized`, `RateLimited`, `RepositoryUnavailable`,
+>   `Network` and `Unreadable`. They agree with the CLI's exit codes in
+>   `exit.rs`.
 > - **Task 5:** the `systemLibrary` path is the `include/` directory, and the
 >   generated target builds in Swift 6 mode, with no `.v5` override. The
 >   badge is unknown, current or stale, never `0` for unknown. A failed state
@@ -614,8 +617,9 @@ pushing, run the grep from `AGENTS.md`.
   and the totals agree. One stack there is 7 deep.
 - **Bad token: a failure, never an empty board.** The app gets
   `GitHub rejected the token`, the same text the CLI prints before exiting 3.
-  Swift cannot tell that this is an auth failure, though: `FetchError` has one
-  case.
+  At first Swift could not tell that this was an auth failure, because
+  `FetchError` had a single case. It now has typed variants (see Task 3 in the
+  amendment above).
 - **Cancellation: does not reach Rust.** A Swift task cancelled 0.15 s into a
   fetch still returned the full board 9 to 11 s later. UniFFI 0.32's Swift
   bindings never call the `rust_future_cancel_*` entry points the header
