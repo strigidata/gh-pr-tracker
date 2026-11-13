@@ -8,6 +8,12 @@
 //! the board arrives in exactly one section, in the order the core drew it.
 //! Nothing may depend on this crate.
 //!
+//! The static library and the Swift bindings generated from it are built and
+//! shipped together, by `scripts/build-macos-spike.sh`. So a rung added to the
+//! core's ladder is a compile error in Swift's exhaustive switches, never a
+//! case an older app meets at run time. Bindings from a different build of this
+//! library fail `UniFFI`'s checksum at the first call.
+//!
 //! No `#![forbid(unsafe_code)]` here, unlike every other crate root: the
 //! scaffolding `uniffi::setup_scaffolding!` and the `uniffi` derives generate
 //! is `unsafe` FFI glue, and a forbid at the root would refuse it. Nothing
