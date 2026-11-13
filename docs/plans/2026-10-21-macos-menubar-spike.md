@@ -13,6 +13,14 @@ the existing core functions, and projects the result into the two sections the
 popover shows. A SwiftPM package under `apps/macos/` links the static library
 and renders it. Swift owns the wording and Rust owns every judgement.
 
+> **Amended 2026-11-12, after Task 3's review.** Projecting only two sections
+> dropped review requests: the core draws a stacked row in its *root's* section,
+> so a request stacked on a pull request the viewer already reviewed sits in
+> `you_reviewed`. `PopoverBoard` now carries all six sections in the CLI's render
+> order (`render.rs:118-146`) and the core's `Board::reviewable_now()`, and the
+> badge is that count, never a section's length. Bindgen reads the `.a`
+> directly; no `.dylib` is needed.
+
 **Tech Stack:** Rust 1.95, `uniffi` 0.32 (async exports on tokio), Swift 6.2
 via SwiftPM, SwiftUI `MenuBarExtra` with the `.window` style, macOS 14+.
 
@@ -431,7 +439,7 @@ cd "$(dirname "$0")/.."
 
 cargo build --release --locked -p prtrack-ffi
 cargo run --release --locked -p prtrack-ffi --features bindgen --bin uniffi-bindgen -- \
-  generate --library target/release/libprtrack_ffi.dylib \
+  generate --library target/release/libprtrack_ffi.a \
   --language swift --out-dir apps/macos/Generated
 
 mkdir -p apps/macos/Sources/PrtrackFFI apps/macos/Sources/prtrack_ffiFFI/include
@@ -513,7 +521,7 @@ final class BoardModel {
     init(repo: String) { self.repo = repo }
 
     var badge: Int {
-        if case let .loaded(board, _) = state { return board.needsYourReview.count }
+        if case let .loaded(board, _) = state { return Int(board.reviewableNow) }
         return 0
     }
 
