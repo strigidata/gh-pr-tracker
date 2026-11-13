@@ -590,6 +590,35 @@ the cancellation answer.
 from that run goes into the repository, the PR or a commit message. Before
 pushing, run the grep from `AGENTS.md`.
 
+### Recorded 2026-11-12
+
+- **Parity with the CLI: matches.** I compared a throwaway Swift program calling
+  `fetchBoard` with `prtrack board --format json` on a public repository with
+  57 open pull requests. All six sections hold the same rows in the same order,
+  and the totals agree. One stack there is 7 deep.
+- **Bad token: a failure, never an empty board.** The app gets
+  `GitHub rejected the token`, the same text the CLI prints before exiting 3.
+  Swift cannot tell that this is an auth failure, though: `FetchError` has one
+  case.
+- **Cancellation: does not reach Rust.** A Swift task cancelled 0.15 s into a
+  fetch still returned the full board 9 to 11 s later. UniFFI 0.32's Swift
+  bindings never call the `rust_future_cancel_*` entry points the header
+  exports. The generated poll handler treats `CALL_CANCELLED` as
+  `fatalError("Cancellation not supported yet")`. The model drops a result that
+  arrives after cancellation, so no stale write happens. But an abandoned fetch
+  still spends the rate limit. A product build needs a cancellable handle
+  exported from Rust.
+- **Toolchain:** builds with the Command Line Tools only. The generated
+  bindings compile in Swift 6 language mode, so no `.v5` override is needed.
+  The `systemLibrary` path must be the `include/` directory that holds the
+  module map.
+- **Sizes:** the release app binary is 5.1 MB, or 3.8 MB stripped. The `.a`
+  is 30 MB before dead-stripping.
+- **Open:** the app link prints 21 `ld` warnings that ring's C objects were
+  built for macOS 27 against the app's 14 floor. Exporting
+  `MACOSX_DEPLOYMENT_TARGET=14.0` rebuilt ring's own archive at 14.0. The copy
+  bundled into `libprtrack_ffi.a` still reads 27.0, for a reason not yet found.
+
 ## Task 7: Definition of done
 
 1. `/code-review`.
