@@ -1,0 +1,34 @@
+[package]
+name = "prtrack-ffi"
+version = "0.0.0"
+description = "The UniFFI boundary the macOS app links. A shell: nothing depends on it."
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# `staticlib` is what the SwiftPM app links; `lib` is what this crate's own
+# tests, and `uniffi-bindgen generate --library`, read the metadata from.
+[lib]
+crate-type = ["staticlib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+prtrack-core = { path = "../prtrack-core" }
+prtrack-github = { path = "../prtrack-github" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uniffi = { version = "0.32", features = ["tokio"] }
+
+[dev-dependencies]
+chrono = { workspace = true }
+wiremock = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
