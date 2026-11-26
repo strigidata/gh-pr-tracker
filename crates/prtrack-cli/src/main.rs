@@ -12,6 +12,8 @@
 //! the error chain, goes to stderr, so `prtrack board --format json | jq` works
 //! whether or not the run went well.
 
+#![forbid(unsafe_code)]
+
 use std::io::IsTerminal as _;
 use std::process::ExitCode;
 
@@ -227,18 +229,11 @@ async fn watch_forever(
     loop {
         match read_repository(&client, args).await {
             Ok((facts, update_notice)) => {
-                let (viewer, default_branch, default_rule, pairs) = facts.into_parts();
-                let judged: Vec<(BoardRow, PolicyRules)> = pairs
-                    .into_iter()
-                    .map(|(facts, policy)| (BoardRow::reduce(facts, &policy), policy))
-                    .collect();
-                let board =
-                    Board::assemble(judged.iter().map(|(row, _)| row.clone()).collect(), &viewer);
+                let judged = facts.judge();
 
-                match default_branch
-                    .as_ref()
-                    .map(|branch| board_text(args, &board, branch, &default_rule))
-                {
+                match judged.default_branch().map(|branch| {
+                    board_text(args, judged.board(), branch, judged.default_branch_rule())
+                }) {
                     Some(rendered) => {
                         screen.redraw(&format!("{rendered}{}", footer.render(palette(args))));
                         showing_placeholder = false;
@@ -247,19 +242,19 @@ async fn watch_forever(
                     // a board to repaint, so fall back to writing it out.
                     None => write_board(
                         args,
-                        &board,
-                        &judged,
-                        default_branch.as_ref(),
-                        &default_rule,
+                        judged.board(),
+                        judged.rows(),
+                        judged.default_branch(),
+                        judged.default_branch_rule(),
                     ),
                 }
 
                 if first_poll {
-                    announce_first_poll(&judged, &viewer);
+                    announce_first_poll(judged.rows(), judged.viewer());
                     first_poll = false;
                 }
 
-                for nudged in tick(&mut state, &judged, &viewer) {
+                for nudged in tick(&mut state, judged.rows(), judged.viewer()) {
                     let line = deliver(&nudged, stderr_palette, !interactive);
                     if interactive {
                         footer.saw(line);
@@ -514,23 +509,14 @@ fn state_path(args: &BoardArgs) -> Result<std::path::PathBuf, Trouble> {
 /// Fetches a repository's open pull requests and writes the board.
 fn board(args: &BoardArgs) -> Result<Exit, Trouble> {
     let (facts, update_notice) = fetch(args)?;
-    let (viewer, default_branch, default_rule, pairs) = facts.into_parts();
-
-    // Each row keeps the rule that judged it: the JSON reports `governed` and
-    // reproduces the oracle's sort keys, and neither can be recovered from a
-    // row once it is classified.
-    let judged: Vec<(BoardRow, PolicyRules)> = pairs
-        .into_iter()
-        .map(|(facts, policy)| (BoardRow::reduce(facts, &policy), policy))
-        .collect();
-    let board = Board::assemble(judged.iter().map(|(row, _)| row.clone()).collect(), &viewer);
+    let judged = facts.judge();
 
     write_board(
         args,
-        &board,
-        &judged,
-        default_branch.as_ref(),
-        &default_rule,
+        judged.board(),
+        judged.rows(),
+        judged.default_branch(),
+        judged.default_branch_rule(),
     );
 
     // Under the board, so it is the last thing read rather than the first. On
@@ -539,7 +525,7 @@ fn board(args: &BoardArgs) -> Result<Exit, Trouble> {
         eprintln!("{notice}");
     }
 
-    Ok(outcome(&board, &viewer))
+    Ok(outcome(judged.board(), judged.viewer()))
 }
 
 /// Replaces this binary with the newest published release.

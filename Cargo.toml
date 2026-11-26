@@ -28,7 +28,12 @@ unicode-width = "0.2"
 wiremock = "0.6"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `unsafe_code` is forbidden in each crate root (`#![forbid(unsafe_code)]`), not
+# here. `prtrack-ffi` carries the `unsafe` glue UniFFI generates, and a crate
+# that sets `lints.workspace = true` cannot override a single entry, so a
+# workspace-wide forbid would cost that crate every other lint in this table.
+# The price is that a new crate root -- an integration test, a `build.rs`, a
+# second binary -- is not covered until it says `#![forbid(unsafe_code)]` itself.
 missing_docs = "warn"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
